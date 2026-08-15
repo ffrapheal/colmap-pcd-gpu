@@ -83,6 +83,20 @@ void BundleAdjustmentController::Run() {
 
   BundleAdjustmentOptions ba_options = *options_.bundle_adjustment;
   ba_options.solver_options.minimizer_progress_to_stdout = true;
+  const IncrementalMapperOptions& mapper_options = *options_.mapper;
+  ba_options.ba_backend = mapper_options.ba_backend;
+  ba_options.ba_fallback_to_ceres = mapper_options.ba_fallback_to_ceres;
+  ba_options.ba_snapshot_dir = mapper_options.ba_snapshot_dir;
+  ba_options.ba_snapshot_capture = mapper_options.ba_snapshot_capture;
+  ba_options.ba_snapshot_registered_images =
+      mapper_options.ba_snapshot_registered_images;
+  ba_options.ba_compare_dir = mapper_options.ba_compare_dir;
+  ba_options.ba_cuda_device = mapper_options.ba_cuda_device;
+  ba_options.ba_cuda_schur_mode = mapper_options.ba_cuda_schur_mode;
+  ba_options.ba_lidar_residual = mapper_options.ba_lidar_residual;
+  ba_options.ba_refinement_index = 0;
+  ba_options.ba_trigger_image_id =
+      reg_image_ids.empty() ? 0 : reg_image_ids.back();
   
   BundleAdjustmentIterationCallback iteration_callback(this);
   ba_options.solver_options.callbacks.push_back(&iteration_callback);
@@ -95,7 +109,6 @@ void BundleAdjustmentController::Run() {
 
   if (ba_options.if_add_lidar_constraint){
     ClearLidarPoints();
-    IncrementalMapperOptions mapper_options = *options_.mapper;
     std::string path = mapper_options.lidar_pointcloud_path;
     LoadPointcloud(path, mapper_options.PcdProjector());
     std::unordered_set<point3D_t> reg_point3D_ids = reconstruction_->Point3DIds();

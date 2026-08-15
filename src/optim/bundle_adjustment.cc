@@ -31,6 +31,7 @@
 
 #include "optim/bundle_adjustment.h"
 
+#include <atomic>
 #include <iomanip>
 
 #ifdef OPENMP_ENABLED
@@ -43,6 +44,9 @@
 #include "util/misc.h"
 #include "util/threading.h"
 #include "util/timer.h"
+#ifdef GPU_BA_ENABLED
+#include "gpu_ba/snapshot_recorder.h"
+#endif
 
 namespace colmap {
 
@@ -69,6 +73,17 @@ ceres::LossFunction* BundleAdjustmentOptions::CreateLossFunction() const {
 
 bool BundleAdjustmentOptions::Check() const {
   CHECK_OPTION_GE(loss_function_scale, 0);
+  CHECK(ba_backend == "ceres_cpu" || ba_backend == "custom_cpu" ||
+        ba_backend == "custom_cuda" || ba_backend == "compare");
+  CHECK(ba_snapshot_capture == "none" || ba_snapshot_capture == "local" ||
+        ba_snapshot_capture == "global" || ba_snapshot_capture == "whole" ||
+        ba_snapshot_capture == "all");
+  CHECK(ba_cuda_schur_mode == "deterministic" ||
+        ba_cuda_schur_mode == "atomic" ||
+        ba_cuda_schur_mode == "block_reduce");
+  CHECK(ba_lidar_residual == "legacy_exact" ||
+        ba_lidar_residual == "legacy_guarded" ||
+        ba_lidar_residual == "signed");
   return true;
 }
 
@@ -226,6 +241,16 @@ const std::vector<int>& BundleAdjustmentConfig::ConstantTvec(
   return constant_tvecs_.at(image_id);
 }
 
+const std::unordered_map<point3D_t, double>&
+BundleAdjustmentConfig::LidarSearchRanges() const {
+  return lidar_search_ranges_;
+}
+
+void BundleAdjustmentConfig::SetLidarSearchRange(
+    const point3D_t point3D_id, double search_range) {
+  lidar_search_ranges_[point3D_id] = search_range;
+}
+
 void BundleAdjustmentConfig::AddVariablePoint(const point3D_t point3D_id) {
   CHECK(!HasConstantPoint(point3D_id));
   variable_point3D_ids_.insert(point3D_id);
@@ -304,6 +329,7 @@ void BundleAdjustmentConfig::MatchVariablePoint2LidarPoint(Reconstruction* recon
 void BundleAdjustmentConfig::MatchClosestLidarPoint(Reconstruction* reconstruction, 
                                                     const point3D_t& point3D_id, 
                                                     double& max_search_range){
+  SetLidarSearchRange(point3D_id, max_search_range);
   Point3D& point3D = reconstruction->Point3D(point3D_id);
   Eigen::Vector3d pt_xyz = point3D.XYZ();
   Eigen::Vector6d lidar_pt;
@@ -372,6 +398,8 @@ BundleAdjuster::BundleAdjuster(const BundleAdjustmentOptions& options,
   CHECK(options_.Check());
 }
 
+BundleAdjuster::~BundleAdjuster() = default;
+
 void BundleAdjuster::SetOptimazePhrase(const OptimazePhrase& phrase) {
   optimize_phrase_ = phrase;
 }
@@ -380,7 +408,44 @@ bool BundleAdjuster::Solve(Reconstruction* reconstruction) {
   CHECK_NOTNULL(reconstruction);
   CHECK(!problem_) << "Cannot use the same BundleAdjuster multiple times";
 
+  if (options_.ba_backend != "ceres_cpu") {
+    if (!options_.ba_fallback_to_ceres) {
+      LOG(ERROR) << "BA backend " << options_.ba_backend
+                 << " is not implemented at the current phase and fallback is disabled";
+      return false;
+    }
+    LOG(WARNING) << "BA backend " << options_.ba_backend
+                 << " is not implemented at the current phase; using ceres_cpu fallback";
+  }
+
   problem_ = std::make_unique<ceres::Problem>();
+
+  static std::atomic<uint64_t> next_ba_call_index{0};
+  const uint64_t ba_call_index = ++next_ba_call_index;
+
+#ifdef GPU_BA_ENABLED
+  gpu_ba::BaKind ba_kind = gpu_ba::BaKind::kGlobal;
+  if (optimize_phrase_ == OptimazePhrase::Local) {
+    ba_kind = gpu_ba::BaKind::kLocal;
+  } else if (optimize_phrase_ == OptimazePhrase::WholeMap) {
+    ba_kind = gpu_ba::BaKind::kWhole;
+  }
+  std::string capture_error;
+  const bool capture_snapshot = gpu_ba::ShouldCaptureSnapshot(
+      options_.ba_snapshot_capture, options_.ba_snapshot_registered_images,
+      ba_kind, reconstruction->NumRegImages(), &capture_error);
+  if (!capture_error.empty()) {
+    LOG(ERROR) << capture_error;
+    return false;
+  }
+  if (capture_snapshot) {
+    if (options_.ba_snapshot_dir.empty()) {
+      LOG(ERROR) << "ba_snapshot_dir is required when snapshot capture is enabled";
+      return false;
+    }
+    snapshot_recorder_.reset(new gpu_ba::SnapshotRecorder());
+  }
+#endif
 
   ceres::LossFunction* loss_function = options_.CreateLossFunction();
   if(options_.if_add_lidar_constraint && optimize_phrase_ == OptimazePhrase::Local) {
@@ -398,6 +463,13 @@ bool BundleAdjuster::Solve(Reconstruction* reconstruction) {
   if (problem_->NumResiduals() == 0) {
     return false;
   }
+
+#ifdef GPU_BA_ENABLED
+  if (snapshot_recorder_ != nullptr &&
+      !CaptureSnapshotIfRequested(reconstruction, ba_call_index)) {
+    return false;
+  }
+#endif
 
   ceres::Solver::Options solver_options = options_.solver_options;
   const bool has_sparse =
@@ -453,6 +525,32 @@ bool BundleAdjuster::Solve(Reconstruction* reconstruction) {
 const ceres::Solver::Summary& BundleAdjuster::Summary() const {
   return summary_;
 }
+
+#ifdef GPU_BA_ENABLED
+bool BundleAdjuster::CaptureSnapshotIfRequested(
+    Reconstruction* reconstruction, uint64_t ba_call_index) {
+  gpu_ba::BaKind ba_kind = gpu_ba::BaKind::kGlobal;
+  if (optimize_phrase_ == OptimazePhrase::Local) {
+    ba_kind = gpu_ba::BaKind::kLocal;
+  } else if (optimize_phrase_ == OptimazePhrase::WholeMap) {
+    ba_kind = gpu_ba::BaKind::kWhole;
+  }
+  gpu_ba::SnapshotWriteResult result;
+  std::string error;
+  if (!snapshot_recorder_->FinalizeAndWrite(
+          options_, config_, *reconstruction, *problem_, ba_kind,
+          ba_call_index, &result, &error)) {
+    LOG(ERROR) << "GPU BA snapshot capture failed: " << error;
+    return false;
+  }
+  std::cout << "GPU BA snapshot: " << result.prefix_path << std::endl
+            << "  payload_sha256: " << result.integrity.payload_sha256
+            << std::endl
+            << "  manifest_sha256: " << result.integrity.manifest_sha256
+            << std::endl;
+  return true;
+}
+#endif
 
 void BundleAdjuster::SetUp(Reconstruction* reconstruction,
                            ceres::LossFunction* loss_function) {
@@ -564,7 +662,9 @@ void BundleAdjuster::AddImageInSphereToProblem(const image_t image_id,
 
   // Add residuals to bundle adjustment problem.
   size_t num_observations = 0;
-  for (const Point2D& point2D : image.Points2D()) {
+  for (point2D_t point2D_idx = 0; point2D_idx < image.NumPoints2D();
+       ++point2D_idx) {
+    const Point2D& point2D = image.Point2D(point2D_idx);
     if (!point2D.HasPoint3D()) {
       continue;
     }
@@ -593,6 +693,19 @@ void BundleAdjuster::AddImageInSphereToProblem(const image_t image_id,
 #undef CAMERA_MODEL_CASE
       }
 
+#ifdef GPU_BA_ENABLED
+      if (snapshot_recorder_ != nullptr) {
+        snapshot_recorder_->RecordVisualResidual(
+            image_id, point2D_idx, point2D.Point3DId(),
+            {{point2D.X(), point2D.Y()}}, true);
+        snapshot_recorder_->RecordParameterBlock(
+            gpu_ba::ParameterKind::kPoint3D, point2D.Point3DId(),
+            point3D.XYZ().data());
+        snapshot_recorder_->RecordParameterBlock(
+            gpu_ba::ParameterKind::kCamera, image.CameraId(),
+            camera_params_data);
+      }
+#endif
       problem_->AddResidualBlock(cost_function, loss_function,
                                  point3D.XYZ().data(), camera_params_data);
     } 
@@ -609,6 +722,23 @@ void BundleAdjuster::AddImageInSphereToProblem(const image_t image_id,
 #undef CAMERA_MODEL_CASE
       }
 
+#ifdef GPU_BA_ENABLED
+      if (snapshot_recorder_ != nullptr) {
+        snapshot_recorder_->RecordVisualResidual(
+            image_id, point2D_idx, point2D.Point3DId(),
+            {{point2D.X(), point2D.Y()}}, false);
+        snapshot_recorder_->RecordParameterBlock(
+            gpu_ba::ParameterKind::kQuaternion, image_id, qvec_data);
+        snapshot_recorder_->RecordParameterBlock(
+            gpu_ba::ParameterKind::kTranslation, image_id, tvec_data);
+        snapshot_recorder_->RecordParameterBlock(
+            gpu_ba::ParameterKind::kPoint3D, point2D.Point3DId(),
+            point3D.XYZ().data());
+        snapshot_recorder_->RecordParameterBlock(
+            gpu_ba::ParameterKind::kCamera, image.CameraId(),
+            camera_params_data);
+      }
+#endif
       problem_->AddResidualBlock(cost_function, loss_function, qvec_data,
                                  tvec_data, point3D.XYZ().data(),
                                  camera_params_data);
@@ -648,7 +778,9 @@ void BundleAdjuster::AddImageToProblem(const image_t image_id,
 
   // Add residuals to bundle adjustment problem.
   size_t num_observations = 0;
-  for (const Point2D& point2D : image.Points2D()) {
+  for (point2D_t point2D_idx = 0; point2D_idx < image.NumPoints2D();
+       ++point2D_idx) {
+    const Point2D& point2D = image.Point2D(point2D_idx);
     if (!point2D.HasPoint3D()) {
       continue;
     }
@@ -672,6 +804,19 @@ void BundleAdjuster::AddImageToProblem(const image_t image_id,
 #undef CAMERA_MODEL_CASE
       }
 
+#ifdef GPU_BA_ENABLED
+      if (snapshot_recorder_ != nullptr) {
+        snapshot_recorder_->RecordVisualResidual(
+            image_id, point2D_idx, point2D.Point3DId(),
+            {{point2D.X(), point2D.Y()}}, true);
+        snapshot_recorder_->RecordParameterBlock(
+            gpu_ba::ParameterKind::kPoint3D, point2D.Point3DId(),
+            point3D.XYZ().data());
+        snapshot_recorder_->RecordParameterBlock(
+            gpu_ba::ParameterKind::kCamera, image.CameraId(),
+            camera_params_data);
+      }
+#endif
       problem_->AddResidualBlock(cost_function, loss_function,
                                  point3D.XYZ().data(), camera_params_data);
     } 
@@ -688,6 +833,23 @@ void BundleAdjuster::AddImageToProblem(const image_t image_id,
 #undef CAMERA_MODEL_CASE
       }
 
+#ifdef GPU_BA_ENABLED
+      if (snapshot_recorder_ != nullptr) {
+        snapshot_recorder_->RecordVisualResidual(
+            image_id, point2D_idx, point2D.Point3DId(),
+            {{point2D.X(), point2D.Y()}}, false);
+        snapshot_recorder_->RecordParameterBlock(
+            gpu_ba::ParameterKind::kQuaternion, image_id, qvec_data);
+        snapshot_recorder_->RecordParameterBlock(
+            gpu_ba::ParameterKind::kTranslation, image_id, tvec_data);
+        snapshot_recorder_->RecordParameterBlock(
+            gpu_ba::ParameterKind::kPoint3D, point2D.Point3DId(),
+            point3D.XYZ().data());
+        snapshot_recorder_->RecordParameterBlock(
+            gpu_ba::ParameterKind::kCamera, image.CameraId(),
+            camera_params_data);
+      }
+#endif
       problem_->AddResidualBlock(cost_function, loss_function, qvec_data,
                                  tvec_data, point3D.XYZ().data(),
                                  camera_params_data);
@@ -757,6 +919,19 @@ void BundleAdjuster::AddPointToProblem(const point3D_t point3D_id,
 
 #undef CAMERA_MODEL_CASE
     }
+#ifdef GPU_BA_ENABLED
+    if (snapshot_recorder_ != nullptr) {
+      snapshot_recorder_->RecordVisualResidual(
+          track_el.image_id, track_el.point2D_idx, point3D_id,
+          {{point2D.X(), point2D.Y()}}, true);
+      snapshot_recorder_->RecordParameterBlock(
+          gpu_ba::ParameterKind::kPoint3D, point3D_id,
+          point3D.XYZ().data());
+      snapshot_recorder_->RecordParameterBlock(
+          gpu_ba::ParameterKind::kCamera, image.CameraId(),
+          camera.ParamsData());
+    }
+#endif
     problem_->AddResidualBlock(cost_function, loss_function,
                                point3D.XYZ().data(), camera.ParamsData());
   }
@@ -792,6 +967,21 @@ void BundleAdjuster::AddLidarToProblem(const point3D_t point3D_id,
     ceres::CostFunction* cost_function = nullptr;
     cost_function =BundleAdjustmentLidarCostFunction::Create( 
             abcd,w); 
+#ifdef GPU_BA_ENABLED
+    if (snapshot_recorder_ != nullptr) {
+      const Eigen::Vector3d lidar_xyz = ptr->second.LidarXYZ();
+      std::array<double, 3> xyz{{lidar_xyz[0], lidar_xyz[1], lidar_xyz[2]}};
+      std::array<double, 4> plane{{abcd[0], abcd[1], abcd[2], abcd[3]}};
+      const auto range = config_.LidarSearchRanges().find(point3D_id);
+      const bool has_range = range != config_.LidarSearchRanges().end();
+      snapshot_recorder_->RecordLidarResidual(
+          point3D_id, static_cast<uint8_t>(type), xyz, plane, w, has_range,
+          has_range ? range->second : 0.0);
+      snapshot_recorder_->RecordParameterBlock(
+          gpu_ba::ParameterKind::kPoint3D, point3D_id,
+          point3D.XYZ().data());
+    }
+#endif
     problem_->AddResidualBlock(cost_function, loss_function, point3D.XYZ().data());
   }
   

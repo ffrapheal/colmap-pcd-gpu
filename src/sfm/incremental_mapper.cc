@@ -1081,6 +1081,7 @@ bool IncrementalMapper::AdjustGlobalBundleByLidar(
       if (max_search_range <= options.kdtree_min_search_range) {
         max_search_range = options.kdtree_min_search_range;
       }
+      ba_config.SetLidarSearchRange(point3D_id, max_search_range);
       Eigen::Vector3d pt_xyz = point3D.XYZ();
       Eigen::Vector6d lidar_pt;
       if (lidar_pointcloud_process_->SearchNearestNeiborByKdtree(pt_xyz,lidar_pt)) {

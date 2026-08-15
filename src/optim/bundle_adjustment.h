@@ -33,6 +33,8 @@
 #define COLMAP_SRC_OPTIM_BUNDLE_ADJUSTMENT_H_
 
 #include <memory>
+#include <cstdint>
+#include <string>
 #include <unordered_set>
 #include <fstream>
 #include <Eigen/Core>
@@ -48,8 +50,25 @@
 
 namespace colmap {
 
+namespace gpu_ba {
+class SnapshotRecorder;
+}
+
 //参数的结构，包括损失函数类型，
 struct BundleAdjustmentOptions {
+  // GPU BA backend and snapshot controls. The default preserves legacy Ceres.
+  std::string ba_backend = "ceres_cpu";
+  bool ba_fallback_to_ceres = true;
+  std::string ba_snapshot_dir;
+  std::string ba_snapshot_capture = "none";
+  std::string ba_snapshot_registered_images = "2,6,20,50,270";
+  std::string ba_compare_dir;
+  int ba_cuda_device = 0;
+  std::string ba_cuda_schur_mode = "deterministic";
+  std::string ba_lidar_residual = "legacy_exact";
+  uint64_t ba_refinement_index = 0;
+  image_t ba_trigger_image_id = 0;
+
   // Lidar poiny cloud file path
   std::string lidar_pointcloud_path;
   // If use existed lidar point cloud map to assist mapping
@@ -166,6 +185,7 @@ class BundleAdjustmentConfig {
   void MatchVariablePoint2LidarPoint(Reconstruction* reconstruction,const point3D_t point3D_id);
   void MatchClosestLidarPoint(Reconstruction* reconstruction,const point3D_t& point3D_id, double& max_search_range);
   void SetLidarPoint(const point3D_t point3D_id, const std::vector<double>& lidar_pt);
+  void SetLidarSearchRange(const point3D_t point3D_id, double search_range);
 
 
   // Add / remove points from the configuration. Note that points can either
@@ -183,6 +203,7 @@ class BundleAdjustmentConfig {
   const std::unordered_set<point3D_t>& VariablePoints() const;
   const std::unordered_set<point3D_t>& ConstantPoints() const;
   const std::vector<int>& ConstantTvec(const image_t image_id) const;
+  const std::unordered_map<point3D_t, double>& LidarSearchRanges() const;
 
   // images that have done lidar point cloud projection
   // key: image_id, value : map (key: point3d_id, value: lidar point coordinate and normal vector)
@@ -198,6 +219,7 @@ class BundleAdjustmentConfig {
   std::unordered_set<point3D_t> constant_point3D_ids_;
   std::unordered_set<image_t> constant_poses_;
   std::unordered_map<image_t, std::vector<int>> constant_tvecs_;
+  std::unordered_map<point3D_t, double> lidar_search_ranges_;
 
 };
 
@@ -208,6 +230,7 @@ class BundleAdjuster {
   enum class OptimazePhrase{Local, Global, WholeMap};
   BundleAdjuster(const BundleAdjustmentOptions& options,//
                  const BundleAdjustmentConfig& config);//
+  ~BundleAdjuster();
 
   void SetOptimazePhrase(const OptimazePhrase& phrase);
 
@@ -241,17 +264,24 @@ class BundleAdjuster {
   void AddLidarToProblem(const point3D_t point3D_id,
                          Reconstruction* reconstruction,
                          ceres::LossFunction* loss_function);
+#ifdef GPU_BA_ENABLED
+  bool CaptureSnapshotIfRequested(Reconstruction* reconstruction,
+                                  uint64_t ba_call_index);
+#endif
  protected:
   void ParameterizeCameras(Reconstruction* reconstruction);
   void ParameterizePoints(Reconstruction* reconstruction);
 
-  OptimazePhrase optimize_phrase_;
+  OptimazePhrase optimize_phrase_ = OptimazePhrase::Global;
   const BundleAdjustmentOptions options_;
   BundleAdjustmentConfig config_;
   std::unique_ptr<ceres::Problem> problem_;
   ceres::Solver::Summary summary_;
   std::unordered_set<camera_t> camera_ids_;
   std::unordered_map<point3D_t, size_t> point3D_num_observations_;
+#ifdef GPU_BA_ENABLED
+  std::unique_ptr<gpu_ba::SnapshotRecorder> snapshot_recorder_;
+#endif
 };
 
 // Bundle adjustment using PBA (GPU or CPU). Less flexible and accurate than

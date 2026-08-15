@@ -37,6 +37,9 @@
 #include "exe/mvs.h"
 #include "exe/sfm.h"
 #include "exe/vocab_tree.h"
+#ifdef GPU_BA_ENABLED
+#include "exe/gpu_ba.h"
+#endif
 #include "util/version.h"
 
 namespace {
@@ -100,6 +103,9 @@ int main(int argc, char** argv) {
 
   std::vector<std::pair<std::string, command_func_t>> commands;
   commands.emplace_back("gui", &RunGraphicalUserInterface);//
+#ifdef GPU_BA_ENABLED
+  commands.emplace_back("gpu_ba_replay", &RunGpuBaReplay);
+#endif
   commands.emplace_back("automatic_reconstructor", &RunAutomaticReconstructor);
   commands.emplace_back("bundle_adjuster", &RunBundleAdjuster);
   commands.emplace_back("color_extractor", &RunColorExtractor);

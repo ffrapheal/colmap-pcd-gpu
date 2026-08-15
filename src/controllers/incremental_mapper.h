@@ -42,6 +42,17 @@ namespace colmap {
 
 struct IncrementalMapperOptions {
  public:
+  // Bundle-adjustment backend and deterministic snapshot/replay controls.
+  std::string ba_backend = "ceres_cpu";
+  bool ba_fallback_to_ceres = true;
+  std::string ba_snapshot_dir;
+  std::string ba_snapshot_capture = "none";
+  std::string ba_snapshot_registered_images = "2,6,20,50,270";
+  std::string ba_compare_dir;
+  int ba_cuda_device = 0;
+  std::string ba_cuda_schur_mode = "deterministic";
+  std::string ba_lidar_residual = "legacy_exact";
+
   // Fix pose of the first image for some times
   int first_image_fixed_frames = 8;
   // Minimize proj times for each image before Icp

@@ -57,6 +57,8 @@ option(SIMD_ENABLED "Whether to enable SIMD optimizations" ON)
 option(OPENMP_ENABLED "Whether to enable OpenMP parallelization" ON)
 option(IPO_ENABLED "Whether to enable interprocedural optimization" ON)
 option(CUDA_ENABLED "Whether to enable CUDA, if available" OFF)
+option(GPU_BA_ENABLED "Whether to enable the custom GPU BA framework" OFF)
+option(GPU_BA_TESTS_ENABLED "Whether to build only GPU BA tests" OFF)
 option(GUI_ENABLED "Whether to enable the graphical UI" ON)
 option(OPENGL_ENABLED "Whether to enable OpenGL, if available" ON)
 option(TESTS_ENABLED "Whether to build test binaries" OFF)
@@ -69,8 +71,11 @@ option(TEST_LIDAR_ENABLED "Whether to enable test images real-time display" ON)
 
 add_definitions(-DQT_NO_KEYWORDS)
 
-if(TESTS_ENABLED)
+if(TESTS_ENABLED OR GPU_BA_TESTS_ENABLED)
     enable_testing()
+endif()
+if(GPU_BA_TESTS_ENABLED AND NOT GPU_BA_ENABLED)
+    message(FATAL_ERROR "GPU_BA_TESTS_ENABLED requires GPU_BA_ENABLED")
 endif()
 if(BOOST_STATIC)
     set(Boost_USE_STATIC_LIBS ON)
@@ -90,6 +95,11 @@ if(OPENMP_ENABLED)
 endif()
 
 find_package(Ceres REQUIRED)
+
+if(GPU_BA_ENABLED)
+    find_package(OpenSSL REQUIRED)
+    add_definitions("-DGPU_BA_ENABLED")
+endif()
 
 find_package(Boost REQUIRED COMPONENTS
              program_options
@@ -364,6 +374,9 @@ set(COLMAP_INCLUDE_DIRS
     ${GLEW_INCLUDE_DIRS}
     ${SQLite3_INCLUDE_DIRS}
 )
+if(GPU_BA_ENABLED)
+    list(APPEND COLMAP_INCLUDE_DIRS ${OPENSSL_INCLUDE_DIR})
+endif()
 
 set(COLMAP_LINK_DIRS
     ${Boost_LIBRARY_DIRS}
@@ -384,6 +397,9 @@ set(COLMAP_EXTERNAL_LIBRARIES
     ${OPENGL_LIBRARIES}
     ${SQLite3_LIBRARIES}
 )
+if(GPU_BA_ENABLED)
+    list(APPEND COLMAP_EXTERNAL_LIBRARIES OpenSSL::Crypto)
+endif()
 
 if(OPENMP_FOUND)
     list(APPEND COLMAP_EXTERNAL_LIBRARIES ${OpenMP_libomp_LIBRARY})

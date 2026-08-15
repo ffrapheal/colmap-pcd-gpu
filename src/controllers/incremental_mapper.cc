@@ -36,6 +36,20 @@
 namespace colmap {
 namespace {
 
+void ConfigureGpuBaOptions(const IncrementalMapperOptions& source,
+                           BundleAdjustmentOptions* target) {
+  target->ba_backend = source.ba_backend;
+  target->ba_fallback_to_ceres = source.ba_fallback_to_ceres;
+  target->ba_snapshot_dir = source.ba_snapshot_dir;
+  target->ba_snapshot_capture = source.ba_snapshot_capture;
+  target->ba_snapshot_registered_images =
+      source.ba_snapshot_registered_images;
+  target->ba_compare_dir = source.ba_compare_dir;
+  target->ba_cuda_device = source.ba_cuda_device;
+  target->ba_cuda_schur_mode = source.ba_cuda_schur_mode;
+  target->ba_lidar_residual = source.ba_lidar_residual;
+}
+
 size_t TriangulateImage(const IncrementalMapperOptions& options,
                         const Image& image, IncrementalMapper* mapper) {
   std::cout << "  => Continued observations: " << image.NumPoints3D()
@@ -47,10 +61,15 @@ size_t TriangulateImage(const IncrementalMapperOptions& options,
 }
 
 void AdjustGlobalBundle(const IncrementalMapperOptions& options,
-                        IncrementalMapper* mapper) {
+                        IncrementalMapper* mapper,
+                        uint64_t refinement_index) {
   BundleAdjustmentOptions custom_ba_options = options.GlobalBundleAdjustment();
 
   const size_t num_reg_images = mapper->GetReconstruction().NumRegImages();
+  custom_ba_options.ba_refinement_index = refinement_index;
+  const auto& reg_image_ids = mapper->GetReconstruction().RegImageIds();
+  custom_ba_options.ba_trigger_image_id =
+      reg_image_ids.empty() ? 0 : reg_image_ids.back();
 
   // Use stricter convergence criteria for first registered images.
   const size_t kMinNumRegImagesForFastBA = 10;
@@ -84,6 +103,8 @@ void IterativeLocalRefinement(const IncrementalMapperOptions& options,
   // mapper->ClearLidarPoints();
   auto ba_options = options.LocalBundleAdjustment();
   for (int i = 0; i < options.ba_local_max_refinements; ++i) {
+    ba_options.ba_refinement_index = static_cast<uint64_t>(i);
+    ba_options.ba_trigger_image_id = image_id;
     const auto report = mapper->AdjustLocalBundle(
         options.Mapper(), ba_options, options.Triangulation(), image_id,
         mapper->GetModifiedPoints3D());
@@ -124,7 +145,7 @@ void IterativeGlobalRefinement(const IncrementalMapperOptions& options,
     const size_t num_observations =
         mapper->GetReconstruction().ComputeNumObservations();
     size_t num_changed_observations = 0;
-    AdjustGlobalBundle(options, mapper);
+    AdjustGlobalBundle(options, mapper, static_cast<uint64_t>(i));
     num_changed_observations += CompleteAndMergeTracks(options, mapper);
     num_changed_observations += FilterPoints(options, mapper);
     const double changed =
@@ -240,6 +261,7 @@ IncrementalTriangulator::Options IncrementalMapperOptions::Triangulation()
 BundleAdjustmentOptions IncrementalMapperOptions::LocalBundleAdjustment()
     const {
   BundleAdjustmentOptions options;
+  ConfigureGpuBaOptions(*this, &options);
   // lidar related params
   options.if_add_lidar_constraint = if_add_lidar_constraint;
   options.lidar_pointcloud_path = lidar_pointcloud_path;
@@ -296,6 +318,7 @@ lidar::PcdProjectionOptions IncrementalMapperOptions::PcdProjector()
 BundleAdjustmentOptions IncrementalMapperOptions::GlobalBundleAdjustment()
     const {
   BundleAdjustmentOptions options;
+  ConfigureGpuBaOptions(*this, &options);
   options.if_add_lidar_constraint = if_add_lidar_constraint;
   options.if_add_lidar_corresponding = if_add_lidar_corresponding;
   options.proj_lidar_constraint_weight = proj_lidar_constraint_weight;
@@ -555,7 +578,7 @@ void IncrementalMapperController::Reconstruct(
         break;
       }
 
-      AdjustGlobalBundle(*options_, &mapper);
+      AdjustGlobalBundle(*options_, &mapper, 0);
 
       FilterPoints(*options_, &mapper);
       FilterImages(*options_, &mapper);

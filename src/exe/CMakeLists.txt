@@ -33,6 +33,11 @@ set(FOLDER_NAME "exe")
 if(IS_MSVC)
     add_compile_options("/bigobj")
 endif()
+set(GPU_BA_EXE_SOURCES)
+if(GPU_BA_ENABLED)
+    list(APPEND GPU_BA_EXE_SOURCES gpu_ba.cc)
+endif()
+
 COLMAP_ADD_EXECUTABLE(colmap_exe
     colmap.cc
     database.cc
@@ -42,10 +47,14 @@ COLMAP_ADD_EXECUTABLE(colmap_exe
     model.cc
     mvs.cc
     sfm.cc
-    vocab_tree.cc)
+    vocab_tree.cc
+    ${GPU_BA_EXE_SOURCES})
 set_target_properties(colmap_exe PROPERTIES OUTPUT_NAME colmap)
 
 COLMAP_ADD_SOURCES(
     feature.h feature.cc
     sfm.h sfm.cc
 )
+if(GPU_BA_ENABLED)
+    COLMAP_ADD_SOURCES(gpu_ba.h gpu_ba.cc)
+endif()
