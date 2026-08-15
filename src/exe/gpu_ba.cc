@@ -9,6 +9,7 @@
 #include <string>
 
 #include "gpu_ba/snapshot.h"
+#include "gpu_ba/validation.h"
 #include "util/misc.h"
 #include "util/option_manager.h"
 
@@ -111,6 +112,21 @@ int RunGpuBaReplay(int argc, char** argv) {
       snapshot.points.begin(), snapshot.points.end(),
       [](const gpu_ba::PointSnapshot& point) { return point.constant; });
 
+  gpu_ba::LinearizationValidationOptions validation_options;
+  gpu_ba::LinearizationValidationResult validation_result;
+  const bool run_linearization_validation =
+      mode == "fixed_linearization" && backend == "compare";
+  if (run_linearization_validation &&
+      !gpu_ba::ValidateResidualsAndJacobians(
+          snapshot, validation_options, &validation_result, &error)) {
+    std::cerr << "ERROR: Residual/Jacobian validation could not run: "
+              << error << std::endl;
+    return EXIT_FAILURE;
+  }
+  const bool replay_pass =
+      deep_copy_valid &&
+      (!run_linearization_validation || validation_result.pass);
+
   CreateDirIfNotExists(output_path, true);
   const std::string report_path = JoinPaths(
       output_path, snapshot.metadata.snapshot_id + "-" + backend + "-" + mode +
@@ -137,7 +153,11 @@ int RunGpuBaReplay(int argc, char** argv) {
          << ",\n"
          << "  \"trigger_image_id\": " << snapshot.metadata.trigger_image_id
          << ",\n"
-         << "  \"implementation_status\": \"schema_replay_only_phase_2\",\n"
+         << "  \"implementation_status\": \""
+         << (run_linearization_validation
+                 ? "residual_jacobian_validation_phase_3"
+                 : "schema_replay_only_phase_2")
+         << "\",\n"
          << "  \"deep_copy_valid\": "
          << (deep_copy_valid ? "true" : "false") << ",\n"
          << "  \"counts\": {\"cameras\": " << snapshot.cameras.size()
@@ -163,8 +183,13 @@ int RunGpuBaReplay(int argc, char** argv) {
          << "  \"canonical_order_sha256\": \""
          << read_result.integrity.canonical_order_sha256 << "\",\n"
          << "  \"lidar_correspondence_sha256\": \""
-         << read_result.integrity.lidar_correspondence_sha256 << "\",\n"
-         << "  \"pass\": " << (deep_copy_valid ? "true" : "false") << "\n"
+         << read_result.integrity.lidar_correspondence_sha256 << "\",\n";
+  if (run_linearization_validation) {
+    report << gpu_ba::LinearizationValidationJson(
+                  validation_result, validation_options, 2)
+           << ",\n";
+  }
+  report << "  \"pass\": " << (replay_pass ? "true" : "false") << "\n"
          << "}\n";
   report.close();
   if (!report) {
@@ -183,7 +208,7 @@ int RunGpuBaReplay(int argc, char** argv) {
               << std::endl;
     return EXIT_FAILURE;
   }
-  return deep_copy_valid ? EXIT_SUCCESS : EXIT_FAILURE;
+  return replay_pass ? EXIT_SUCCESS : EXIT_FAILURE;
 }
 
 }  // namespace colmap
