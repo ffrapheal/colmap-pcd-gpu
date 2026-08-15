@@ -297,6 +297,11 @@ BundleAdjustmentOptions IncrementalMapperOptions::GlobalBundleAdjustment()
     const {
   BundleAdjustmentOptions options;
   options.if_add_lidar_constraint = if_add_lidar_constraint;
+  options.if_add_lidar_corresponding = if_add_lidar_corresponding;
+  options.proj_lidar_constraint_weight = proj_lidar_constraint_weight;
+  options.icp_lidar_constraint_weight = icp_lidar_constraint_weight;
+  options.icp_ground_lidar_constraint_weight =
+      icp_ground_lidar_constraint_weight;
   options.solver_options.function_tolerance = ba_global_function_tolerance;
   options.solver_options.gradient_tolerance = 1.0;
   options.solver_options.parameter_tolerance = 0.0;

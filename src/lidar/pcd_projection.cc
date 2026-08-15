@@ -237,6 +237,7 @@ void PcdProj::ImageMapProj(LImage& img, ImageMapType& image_map, const Camera& c
             Eigen::Vector3f pt_w = pt.getVector3fMap();
             // Write out point cloud file
             if (options_.if_save_lidar_frame) {
+                std::lock_guard<std::mutex> lock(proj_mutex_);
                 ofs << pt_w(2)<<" "<<-pt_w(0)<<" "<<-pt_w(1)<<std::endl;
             }
 
@@ -305,28 +306,26 @@ void PcdProj::ImageMapProj(LImage& img, ImageMapType& image_map, const Camera& c
 
                 if(options_.if_save_depth_image){
                     // The distance of the lidar point from the center of the camera
+                    std::lock_guard<std::mutex> lock(proj_mutex_);
                     auto iter = img.dist_map.find(uv);
                     if (iter != img.dist_map.end()){
                         iter->second = std::min(iter->second,dist);
                     } else {
-                        proj_mutex_.lock();
                         img.dist_map.insert({uv,dist});
-                        proj_mutex_.unlock();
                     }
 
                 } 
                 
                 if (img.feature_points.find(uv)==img.feature_points.end()) continue;
                 // The distance of the lidar point from the center of the camera
+                std::lock_guard<std::mutex> lock(proj_mutex_);
                 auto iter = img.feature_pts_map.find(uv);
                 if (iter!= img.feature_pts_map.end()){
                     if (iter->second.second > dist){
                         iter->second = std::make_pair(pt,dist);
                     } else {continue;}
                 } else {
-                    proj_mutex_.lock();
                     img.feature_pts_map.insert({uv,std::make_pair(pt,dist)});
-                    proj_mutex_.unlock();
                 }
                 
             }
