@@ -8,6 +8,7 @@
 #include <sstream>
 #include <string>
 
+#include "gpu_ba/fixed_linearization.h"
 #include "gpu_ba/snapshot.h"
 #include "gpu_ba/validation.h"
 #include "util/misc.h"
@@ -114,6 +115,9 @@ int RunGpuBaReplay(int argc, char** argv) {
 
   gpu_ba::LinearizationValidationOptions validation_options;
   gpu_ba::LinearizationValidationResult validation_result;
+  gpu_ba::FixedLinearizationOptions fixed_options;
+  fixed_options.lambda = lambda;
+  gpu_ba::FixedLinearizationResult fixed_result;
   const bool run_linearization_validation =
       mode == "fixed_linearization" && backend == "compare";
   if (run_linearization_validation &&
@@ -123,9 +127,18 @@ int RunGpuBaReplay(int argc, char** argv) {
               << error << std::endl;
     return EXIT_FAILURE;
   }
+  const bool run_fixed_linearization = run_linearization_validation;
+  if (run_fixed_linearization &&
+      !gpu_ba::RunFixedLinearizationComparison(
+          snapshot, fixed_options, &fixed_result, &error)) {
+    std::cerr << "ERROR: Fixed linearization could not run: " << error
+              << std::endl;
+    return EXIT_FAILURE;
+  }
   const bool replay_pass =
       deep_copy_valid &&
-      (!run_linearization_validation || validation_result.pass);
+      (!run_linearization_validation || validation_result.pass) &&
+      (!run_fixed_linearization || fixed_result.pass);
 
   CreateDirIfNotExists(output_path, true);
   const std::string report_path = JoinPaths(
@@ -155,7 +168,7 @@ int RunGpuBaReplay(int argc, char** argv) {
          << ",\n"
          << "  \"implementation_status\": \""
          << (run_linearization_validation
-                 ? "residual_jacobian_validation_phase_3"
+                 ? "canonical_fixed_linearization_phase_4"
                  : "schema_replay_only_phase_2")
          << "\",\n"
          << "  \"deep_copy_valid\": "
@@ -187,6 +200,10 @@ int RunGpuBaReplay(int argc, char** argv) {
   if (run_linearization_validation) {
     report << gpu_ba::LinearizationValidationJson(
                   validation_result, validation_options, 2)
+           << ",\n";
+  }
+  if (run_fixed_linearization) {
+    report << gpu_ba::FixedLinearizationJson(fixed_result, fixed_options, 2)
            << ",\n";
   }
   report << "  \"pass\": " << (replay_pass ? "true" : "false") << "\n"

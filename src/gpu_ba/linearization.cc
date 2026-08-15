@@ -139,19 +139,36 @@ bool EvaluateOpenCVVisual(const std::array<double, 4>& quaternion,
   // Exact polynomial used by ceres::UnitQuaternionRotatePoint. This is not
   // the homogeneous non-unit quaternion formula; its ambient derivative is
   // therefore intentionally taken from this expansion.
-  const double r00 = 1.0 - 2.0 * (y * y + z * z);
-  const double r01 = 2.0 * (x * y - w * z);
-  const double r02 = 2.0 * (w * y + x * z);
-  const double r10 = 2.0 * (w * z + x * y);
-  const double r11 = 1.0 - 2.0 * (x * x + z * z);
-  const double r12 = 2.0 * (y * z - w * x);
-  const double r20 = 2.0 * (x * z - w * y);
-  const double r21 = 2.0 * (w * x + y * z);
-  const double r22 = 1.0 - 2.0 * (x * x + y * y);
+  // Preserve the exact operation order in ceres::UnitQuaternionRotatePoint.
+  // This matters after many J^T r terms cancel near a converged state.
+  const double t2 = w * x;
+  const double t3 = w * y;
+  const double t4 = w * z;
+  const double t5 = -x * x;
+  const double t6 = x * y;
+  const double t7 = x * z;
+  const double t8 = -y * y;
+  const double t9 = y * z;
+  const double t1 = -z * z;
+  const double r00 = 2.0 * (t8 + t1) + 1.0;
+  const double r01 = 2.0 * (t6 - t4);
+  const double r02 = 2.0 * (t3 + t7);
+  const double r10 = 2.0 * (t4 + t6);
+  const double r11 = 2.0 * (t5 + t1) + 1.0;
+  const double r12 = 2.0 * (t9 - t2);
+  const double r20 = 2.0 * (t7 - t3);
+  const double r21 = 2.0 * (t2 + t9);
+  const double r22 = 2.0 * (t5 + t8) + 1.0;
 
-  const double X = r00 * px + r01 * py + r02 * pz + translation[0];
-  const double Y = r10 * px + r11 * py + r12 * pz + translation[1];
-  const double Z = r20 * px + r21 * py + r22 * pz + translation[2];
+  const double X =
+      2.0 * ((t8 + t1) * px + (t6 - t4) * py + (t3 + t7) * pz) +
+      px + translation[0];
+  const double Y =
+      2.0 * ((t4 + t6) * px + (t5 + t1) * py + (t9 - t2) * pz) +
+      py + translation[1];
+  const double Z =
+      2.0 * ((t7 - t3) * px + (t2 + t9) * py + (t5 + t8) * pz) +
+      pz + translation[2];
   evaluation->camera_point = {{X, Y, Z}};
   if (!std::isfinite(Z) || std::abs(Z) <= std::numeric_limits<double>::min()) {
     return false;
@@ -163,7 +180,6 @@ bool EvaluateOpenCVVisual(const std::array<double, 4>& quaternion,
   const double uv = u * v;
   const double v2 = v * v;
   const double r2 = u2 + v2;
-  const double r4 = r2 * r2;
   const double fx = camera[0];
   const double fy = camera[1];
   const double cx = camera[2];
@@ -172,25 +188,26 @@ bool EvaluateOpenCVVisual(const std::array<double, 4>& quaternion,
   const double k2 = camera[5];
   const double p1 = camera[6];
   const double p2 = camera[7];
-  const double radial = k1 * r2 + k2 * r4;
-  const double scale = 1.0 + radial;
-  const double distorted_u =
-      u * scale + 2.0 * p1 * uv + p2 * (r2 + 2.0 * u2);
-  const double distorted_v =
-      v * scale + 2.0 * p2 * uv + p1 * (r2 + 2.0 * v2);
+  const double radial = k1 * r2 + k2 * r2 * r2;
+  const double du =
+      u * radial + 2.0 * p1 * uv + p2 * (r2 + 2.0 * u2);
+  const double dv =
+      v * radial + 2.0 * p2 * uv + p1 * (r2 + 2.0 * v2);
+  const double distorted_u = u + du;
+  const double distorted_v = v + dv;
   evaluation->residual = {{fx * distorted_u + cx - observation[0],
                            fy * distorted_v + cy - observation[1]}};
 
   const double radial_u = 2.0 * u * (k1 + 2.0 * k2 * r2);
   const double radial_v = 2.0 * v * (k1 + 2.0 * k2 * r2);
   const double ddu_du =
-      scale + u * radial_u + 2.0 * p1 * v + 6.0 * p2 * u;
+      1.0 + radial + u * radial_u + 2.0 * p1 * v + 6.0 * p2 * u;
   const double ddu_dv =
       u * radial_v + 2.0 * p1 * u + 2.0 * p2 * v;
   const double ddv_du =
       v * radial_u + 2.0 * p2 * v + 2.0 * p1 * u;
   const double ddv_dv =
-      scale + v * radial_v + 2.0 * p2 * u + 6.0 * p1 * v;
+      1.0 + radial + v * radial_v + 2.0 * p2 * u + 6.0 * p1 * v;
   const double inverse_z = 1.0 / Z;
   const double normalized_jacobian[6] = {
       inverse_z, 0.0, -u * inverse_z,
@@ -249,10 +266,10 @@ bool EvaluateOpenCVVisual(const std::array<double, 4>& quaternion,
 
   evaluation->camera_jacobian = {{
       distorted_u, 0.0, 1.0, 0.0,
-      fx * u * r2, fx * u * r4, fx * 2.0 * uv,
+      fx * u * r2, fx * u * r2 * r2, fx * 2.0 * uv,
       fx * (r2 + 2.0 * u2),
       0.0, distorted_v, 0.0, 1.0,
-      fy * v * r2, fy * v * r4, fy * (r2 + 2.0 * v2),
+      fy * v * r2, fy * v * r2 * r2, fy * (r2 + 2.0 * v2),
       fy * 2.0 * uv}};
 
   evaluation->finite =

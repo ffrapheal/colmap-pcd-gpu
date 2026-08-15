@@ -66,6 +66,16 @@ if (GUI_ENABLED)
     add_subdirectory(ui)
 endif()
 
+if(GPU_BA_ENABLED)
+    # Ceres Jet arithmetic evaluates scalar multiply/add operations
+    # separately. Keep the CPU analytic reference on the same contraction
+    # boundary so near-zero J^T r checks measure formulas rather than host FMA
+    # contraction. CUDA FP64 uses its separate phase-6 tolerance.
+    set_source_files_properties(
+        "${CMAKE_CURRENT_SOURCE_DIR}/gpu_ba/linearization.cc"
+        PROPERTIES COMPILE_FLAGS "-ffp-contract=off")
+endif()
+
 COLMAP_ADD_LIBRARY(colmap ${COLMAP_SOURCES})
 
 if(CUDA_ENABLED)
