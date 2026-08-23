@@ -39,6 +39,7 @@
 #include "controllers/bundle_adjustment.h"
 #include "controllers/hierarchical_mapper.h"
 #include "exe/gui.h"
+#include "sfm/nonba_profiler.h"
 #include "util/misc.h"
 #include "util/opengl_utils.h"
 #include "util/option_manager.h"
@@ -236,8 +237,12 @@ int RunMapper(int argc, char** argv) {
             const auto& reconstruction =
                 reconstruction_manager.Get(prev_num_reconstructions);
             CreateDirIfNotExists(reconstruction_path);
+            NonBaStageScope write_model(
+                mapper.NonBaProfiler(), NonBaStageId::kWriteModel,
+                reconstruction.NumPoints3D());
             reconstruction.Write(reconstruction_path);
             options.Write(JoinPaths(reconstruction_path, "project.ini"));
+            write_model.SetOutputItems(reconstruction.NumPoints3D());
             prev_num_reconstructions = reconstruction_manager.Size();
           }
         });
@@ -247,8 +252,14 @@ int RunMapper(int argc, char** argv) {
   mapper.Wait();
 
   if (mapper.HasFailed()) {
-    std::cerr << "ERROR: incremental mapper stopped after bundle-adjustment failure"
-              << std::endl;
+    if (mapper.HasNonBaProfileFailed()) {
+      std::cerr << "ERROR: incremental mapper non-BA profiling failed"
+                << std::endl;
+    } else {
+      std::cerr
+          << "ERROR: incremental mapper stopped after bundle-adjustment failure"
+          << std::endl;
+    }
     return EXIT_FAILURE;
   }
 

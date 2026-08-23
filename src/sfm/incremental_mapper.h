@@ -43,6 +43,8 @@
 
 namespace colmap {
 
+class NonBaStageSink;
+
 // Class that provides all functionality for the incremental reconstruction
 // procedure. Example usage:
 //
@@ -166,6 +168,8 @@ class IncrementalMapper {
   // Create incremental mapper. The database cache must live for the entire
   // life-time of the incremental mapper.
   explicit IncrementalMapper(const DatabaseCache* database_cache);
+  IncrementalMapper(const DatabaseCache* database_cache,
+                    NonBaStageSink* non_ba_profiler);
 
   // Load existed initial pose guess
   void LoadExistedImagePoses(std::map<uint32_t, std::vector<double>>& poses);
@@ -258,6 +262,8 @@ class IncrementalMapper {
 
   const Reconstruction& GetReconstruction() const;
 
+  NonBaStageSink* NonBaProfiler() const { return non_ba_profiler_; }
+
   // Number of images that are registered in at least on reconstruction.
   size_t NumTotalRegImages() const;
 
@@ -271,7 +277,7 @@ class IncrementalMapper {
   // Clear the collection of changed 3D points.
   void ClearModifiedPoints3D();
   void ClearLidarPoints();
-  void LoadPointcloud(std::string& pointcloud_path, 
+  bool LoadPointcloud(std::string& pointcloud_path,
                       const lidar::PcdProjectionOptions& pp_options);
 #ifdef GPU_BA_CUDA_ENABLED
   gpu_ba::CudaHostProblemStoreMode CudaHostStoreModeForTesting() const;
@@ -316,6 +322,9 @@ class IncrementalMapper {
 
   // Class that holds all necessary data from database in memory.
   const DatabaseCache* database_cache_;
+
+  // Nullable runtime profiler. A null pointer is the complete off path.
+  NonBaStageSink* non_ba_profiler_;
 
   // Class that holds data of the reconstruction.
   Reconstruction* reconstruction_;

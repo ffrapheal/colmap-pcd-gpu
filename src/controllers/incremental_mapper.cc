@@ -35,6 +35,7 @@
 #include "gpu_ba/custom_cuda.h"
 #endif
 
+#include "sfm/nonba_profiler.h"
 #include "util/misc.h"
 
 namespace colmap {
@@ -75,10 +76,14 @@ void ConfigureGpuBaOptions(const IncrementalMapperOptions& source,
 
 size_t TriangulateImage(const IncrementalMapperOptions& options,
                         const Image& image, IncrementalMapper* mapper) {
+  NonBaStageScope stage(mapper->NonBaProfiler(),
+                        NonBaStageId::kTriangulateImage,
+                        image.NumObservations());
   std::cout << "  => Continued observations: " << image.NumPoints3D()
             << std::endl;
   const size_t num_tris =
       mapper->TriangulateImage(options.Triangulation(), image.ImageId());
+  stage.SetOutputItems(num_tris);
   std::cout << "  => Added observations: " << num_tris << std::endl;
   return num_tris;
 }
@@ -86,6 +91,9 @@ size_t TriangulateImage(const IncrementalMapperOptions& options,
 bool AdjustGlobalBundle(const IncrementalMapperOptions& options,
                         IncrementalMapper* mapper,
                         uint64_t refinement_index) {
+  NonBaStageScope stage(mapper->NonBaProfiler(),
+                        NonBaStageId::kGlobalAdjustment,
+                        mapper->GetReconstruction().NumRegImages());
   BundleAdjustmentOptions custom_ba_options = options.GlobalBundleAdjustment();
 
   const size_t num_reg_images = mapper->GetReconstruction().NumRegImages();
@@ -105,25 +113,32 @@ bool AdjustGlobalBundle(const IncrementalMapperOptions& options,
   }
 
   PrintHeading1("Global bundle adjustment");
+  bool success = false;
   if (options.if_add_lidar_constraint) {
-    return mapper->AdjustGlobalBundleByLidar(options.Mapper(), custom_ba_options);
+    success =
+        mapper->AdjustGlobalBundleByLidar(options.Mapper(), custom_ba_options);
   } else {
     if (options.ba_global_use_pba && !options.fix_existing_images &&
         num_reg_images >= kMinNumRegImagesForFastBA &&
         ParallelBundleAdjuster::IsSupported(custom_ba_options,
                                             mapper->GetReconstruction())) {
-      return mapper->AdjustParallelGlobalBundle(
+      success = mapper->AdjustParallelGlobalBundle(
           custom_ba_options, options.ParallelGlobalBundleAdjustment());
     } else {
-      return mapper->AdjustGlobalBundle(options.Mapper(), custom_ba_options);
+      success = mapper->AdjustGlobalBundle(options.Mapper(), custom_ba_options);
     }
   }
-  return false;
+  stage.SetOutputItems(success ? 1 : 0);
+  return success;
 }
 
 bool IterativeLocalRefinement(const IncrementalMapperOptions& options,
                               const image_t image_id,
                               IncrementalMapper* mapper) {
+  NonBaStageScope stage(mapper->NonBaProfiler(),
+                        NonBaStageId::kLocalRefinement,
+                        mapper->GetModifiedPoints3D().size());
+  size_t adjusted_observations = 0;
   // mapper->ClearLidarPoints();
   auto ba_options = options.LocalBundleAdjustment();
   for (int i = 0; i < options.ba_local_max_refinements; ++i) {
@@ -133,6 +148,9 @@ bool IterativeLocalRefinement(const IncrementalMapperOptions& options,
         options.Mapper(), ba_options, options.Triangulation(), image_id,
         mapper->GetModifiedPoints3D());
     if (!report.success) return false;
+    if (mapper->NonBaProfiler() != nullptr) {
+      adjusted_observations += report.num_adjusted_observations;
+    }
     std::cout << "  => Merged observations: " << report.num_merged_observations
               << std::endl;
     std::cout << "  => Completed observations: "
@@ -156,15 +174,57 @@ bool IterativeLocalRefinement(const IncrementalMapperOptions& options,
         BundleAdjustmentOptions::LossFunctionType::TRIVIAL;
   }
   mapper->ClearModifiedPoints3D();
+  stage.SetOutputItems(adjusted_observations);
   return true;
 }
 
 bool IterativeGlobalRefinement(const IncrementalMapperOptions& options,
                                IncrementalMapper* mapper) {
+  NonBaStageScope stage(mapper->NonBaProfiler(),
+                        NonBaStageId::kGlobalRefinement,
+                        [&mapper]() {
+                          return mapper->GetReconstruction()
+                              .ComputeNumObservations();
+                        });
+  size_t total_changed_observations = 0;
   PrintHeading1("Retriangulation");
-  CompleteAndMergeTracks(options, mapper);
-  std::cout << "  => Retriangulated observations: "
-            << mapper->Retriangulate(options.Triangulation()) << std::endl;
+  {
+    NonBaStageScope complete(mapper->NonBaProfiler(),
+                             NonBaStageId::kGlobalPreComplete,
+                             mapper->GetReconstruction().NumPoints3D());
+    const size_t completed = mapper->CompleteTracks(options.Triangulation());
+    complete.SetOutputItems(completed);
+    if (mapper->NonBaProfiler() != nullptr) {
+      total_changed_observations += completed;
+    }
+    std::cout << "  => Completed observations: " << completed << std::endl;
+  }
+  {
+    NonBaStageScope merge(mapper->NonBaProfiler(),
+                          NonBaStageId::kGlobalPreMerge,
+                          mapper->GetReconstruction().NumPoints3D());
+    const size_t merged = mapper->MergeTracks(options.Triangulation());
+    merge.SetOutputItems(merged);
+    if (mapper->NonBaProfiler() != nullptr) {
+      total_changed_observations += merged;
+    }
+    std::cout << "  => Merged observations: " << merged << std::endl;
+  }
+  {
+    NonBaStageScope retriangulate(
+        mapper->NonBaProfiler(), NonBaStageId::kGlobalRetriangulate,
+        [&mapper]() {
+          return mapper->GetReconstruction().ComputeNumObservations();
+        });
+    const size_t retriangulated =
+        mapper->Retriangulate(options.Triangulation());
+    retriangulate.SetOutputItems(retriangulated);
+    if (mapper->NonBaProfiler() != nullptr) {
+      total_changed_observations += retriangulated;
+    }
+    std::cout << "  => Retriangulated observations: " << retriangulated
+              << std::endl;
+  }
 
   for (int i = 0; i < options.ba_global_max_refinements; ++i) {
     const size_t num_observations =
@@ -173,8 +233,37 @@ bool IterativeGlobalRefinement(const IncrementalMapperOptions& options,
     if (!AdjustGlobalBundle(options, mapper, static_cast<uint64_t>(i))) {
       return false;
     }
-    num_changed_observations += CompleteAndMergeTracks(options, mapper);
-    num_changed_observations += FilterPoints(options, mapper);
+    {
+      NonBaStageScope complete(mapper->NonBaProfiler(),
+                               NonBaStageId::kGlobalPostComplete,
+                               mapper->GetReconstruction().NumPoints3D());
+      const size_t completed = mapper->CompleteTracks(options.Triangulation());
+      complete.SetOutputItems(completed);
+      num_changed_observations += completed;
+      std::cout << "  => Completed observations: " << completed << std::endl;
+    }
+    {
+      NonBaStageScope merge(mapper->NonBaProfiler(),
+                            NonBaStageId::kGlobalPostMerge,
+                            mapper->GetReconstruction().NumPoints3D());
+      const size_t merged = mapper->MergeTracks(options.Triangulation());
+      merge.SetOutputItems(merged);
+      num_changed_observations += merged;
+      std::cout << "  => Merged observations: " << merged << std::endl;
+    }
+    {
+      NonBaStageScope filter_all(
+          mapper->NonBaProfiler(), NonBaStageId::kGlobalFilterAll,
+          [&mapper]() {
+            return mapper->GetReconstruction().ComputeNumObservations();
+          });
+      const size_t filtered = FilterPoints(options, mapper);
+      filter_all.SetOutputItems(filtered);
+      num_changed_observations += filtered;
+    }
+    if (mapper->NonBaProfiler() != nullptr) {
+      total_changed_observations += num_changed_observations;
+    }
     const double changed =
         num_observations == 0
             ? 0
@@ -186,18 +275,28 @@ bool IterativeGlobalRefinement(const IncrementalMapperOptions& options,
     }
   }
 
-  FilterImages(options, mapper);
+  {
+    NonBaStageScope filter_images(
+        mapper->NonBaProfiler(), NonBaStageId::kGlobalFilterImages,
+        mapper->GetReconstruction().NumRegImages());
+    const size_t filtered_images = FilterImages(options, mapper);
+    filter_images.SetOutputItems(filtered_images);
+  }
+  stage.SetOutputItems(total_changed_observations);
   return true;
 }
 
-void ExtractColors(const std::string& image_path, const image_t image_id,
+bool ExtractColors(const std::string& image_path, const image_t image_id,
                    Reconstruction* reconstruction) {
-  if (!reconstruction->ExtractColorsForImage(image_id, image_path)) {
+  const bool success =
+      reconstruction->ExtractColorsForImage(image_id, image_path);
+  if (!success) {
     std::cout << StringPrintf("WARNING: Could not read image %s at path %s.",
                               reconstruction->Image(image_id).Name().c_str(),
                               image_path.c_str())
               << std::endl;
   }
+  return success;
 }
 
 void WriteSnapshot(const Reconstruction& reconstruction,
@@ -429,7 +528,34 @@ IncrementalMapperController::IncrementalMapperController(
 }
 
 void IncrementalMapperController::Run() {
+  if (options_->non_ba_profile) {
+    if (options_->non_ba_profile_path.empty()) {
+      LOG(ERROR) << "Mapper.non_ba_profile_path must be non-empty when "
+                    "Mapper.non_ba_profile is enabled";
+      non_ba_profile_failed_.store(true);
+      return;
+    }
 
+    NonBaStageProfiler profiler;
+    non_ba_profiler_ = &profiler;
+    {
+      NonBaStageScope root_scope(
+          non_ba_profiler_, NonBaStageId::kMapperRoot, 1);
+      RunImpl();
+      root_scope.SetOutputItems(reconstruction_manager_->Size());
+    }
+    if (!profiler.WriteJson(options_->non_ba_profile_path)) {
+      LOG(ERROR) << "Failed to write non-BA profile JSON to "
+                 << options_->non_ba_profile_path;
+      non_ba_profile_failed_.store(true);
+    }
+    non_ba_profiler_ = nullptr;
+  } else {
+    RunImpl();
+  }
+}
+
+void IncrementalMapperController::RunImpl() {
   if (!LoadDatabase()) {
     return;
   }
@@ -466,8 +592,13 @@ void IncrementalMapperController::Run() {
   GetTimer().PrintMinutes();
 #ifdef GPU_BA_CUDA_ENABLED
   if (options_->ba_backend == "custom_cuda") {
+    NonBaStageScope shutdown(
+        non_ba_profiler_, NonBaStageId::kCudaRuntimeShutdown, 1);
     std::string shutdown_error;
-    if (!gpu_ba::ShutdownCudaRuntimePool(&shutdown_error)) {
+    const bool shutdown_success =
+        gpu_ba::ShutdownCudaRuntimePool(&shutdown_error);
+    shutdown.SetOutputItems(shutdown_success ? 1 : 0);
+    if (!shutdown_success) {
       LOG(ERROR) << "custom CUDA RuntimePool shutdown failed: "
                  << shutdown_error;
     }
@@ -476,6 +607,10 @@ void IncrementalMapperController::Run() {
 }
 
 bool IncrementalMapperController::LoadDatabase() {
+
+  NonBaStageScope stage(non_ba_profiler_,
+                        NonBaStageId::kDatabaseCorrespondenceLoad,
+                        options_->image_names.size());
 
   // Make sure images of the given reconstruction are also included when
   // manually specifying images for the reconstrunstruction procedure.
@@ -508,6 +643,7 @@ bool IncrementalMapperController::LoadDatabase() {
     return false;
   }
 
+  stage.SetOutputItems(database_cache_.NumImages());
   return true;
 }
 
@@ -525,7 +661,7 @@ void IncrementalMapperController::Reconstruct(
   // Main loop
   //////////////////////////////////////////////////////////////////////////////
 
-  IncrementalMapper mapper(&database_cache_);
+  IncrementalMapper mapper(&database_cache_, non_ba_profiler_);
 #ifdef GPU_BA_CUDA_ENABLED
   gpu_ba::CudaHostProblemStoreMode host_store_mode =
       gpu_ba::CudaHostProblemStoreMode::kDisabled;
@@ -536,9 +672,20 @@ void IncrementalMapperController::Reconstruct(
     mapper.LoadExistedImagePoses(image_poses_);
   }
 
-  if (options_->if_add_lidar_constraint || options_->if_add_lidar_corresponding){
+  if (options_->if_add_lidar_constraint ||
+      options_->if_add_lidar_corresponding) {
     std::string path = options_->lidar_pointcloud_path;
-    mapper.LoadPointcloud(path, options_->PcdProjector());
+    NonBaStageScope lidar_load(
+        non_ba_profiler_, NonBaStageId::kLidarLoad, path.empty() ? 0 : 1);
+    bool lidar_loaded = false;
+    {
+      NonBaStageScope owner_bucket(
+          non_ba_profiler_, NonBaStageId::kLidarPlyLoadTransformAndIndex,
+          path.empty() ? 0 : 1);
+      lidar_loaded = mapper.LoadPointcloud(path, options_->PcdProjector());
+      owner_bucket.SetOutputItems(lidar_loaded ? 1 : 0);
+    }
+    lidar_load.SetOutputItems(lidar_loaded ? 1 : 0);
   }
 
   // Is there a sub-model before we start the reconstruction? I.e. the user
@@ -606,13 +753,18 @@ void IncrementalMapperController::Reconstruct(
       // input: IncrementalMapper::Options init_mapper_options
       // input: initial image pair
       bool reg_init_success;
-      if (options_->if_add_lidar_constraint){
-        reg_init_success = mapper.RegisterInitialImagePairByDepthProj(
-          init_mapper_options, image_id1, image_id2);
-      } else {
-        reg_init_success = mapper.RegisterInitialImagePair(
-            init_mapper_options, image_id1, image_id2);
-      } 
+      {
+        NonBaStageScope initial_pair(
+            non_ba_profiler_, NonBaStageId::kInitialPair, 2);
+        if (options_->if_add_lidar_constraint) {
+          reg_init_success = mapper.RegisterInitialImagePairByDepthProj(
+              init_mapper_options, image_id1, image_id2);
+        } else {
+          reg_init_success = mapper.RegisterInitialImagePair(
+              init_mapper_options, image_id1, image_id2);
+        }
+        initial_pair.SetOutputItems(reg_init_success ? 2 : 0);
+      }
           
       if (!reg_init_success) {
         std::cout << "  => Initialization failed - possible solutions:"
@@ -650,7 +802,11 @@ void IncrementalMapperController::Reconstruct(
       }
 
       if (options_->extract_colors) {
-        ExtractColors(image_path_, image_id1, &reconstruction);
+        NonBaStageScope extract_colors(
+            non_ba_profiler_, NonBaStageId::kExtractColors, 1);
+        const bool extracted =
+            ExtractColors(image_path_, image_id1, &reconstruction);
+        extract_colors.SetOutputItems(extracted ? 1 : 0);
       }
     }
     // After the initial image pair is registered, 
@@ -675,8 +831,14 @@ void IncrementalMapperController::Reconstruct(
 
       reg_next_success = false;
 
-      const std::vector<image_t> next_images =
-          mapper.FindNextImages(options_->Mapper());
+      std::vector<image_t> next_images;
+      {
+        NonBaStageScope find_next(
+            non_ba_profiler_, NonBaStageId::kFindNextImages,
+            reconstruction.NumImages() - reconstruction.NumRegImages());
+        next_images = mapper.FindNextImages(options_->Mapper());
+        find_next.SetOutputItems(next_images.size());
+      }
 
       if (next_images.empty()) {
         break;
@@ -693,8 +855,14 @@ void IncrementalMapperController::Reconstruct(
                                   next_image.NumObservations())
                   << std::endl;
 
-        reg_next_success =
-            mapper.RegisterNextImage(options_->Mapper(), next_image_id);
+        {
+          NonBaStageScope register_next(
+              non_ba_profiler_, NonBaStageId::kRegisterNextImage,
+              next_image.NumObservations());
+          reg_next_success =
+              mapper.RegisterNextImage(options_->Mapper(), next_image_id);
+          register_next.SetOutputItems(reg_next_success ? 1 : 0);
+        }
 
         if (reg_next_success) {
           mapper.ClearLidarPoints();
@@ -722,7 +890,11 @@ void IncrementalMapperController::Reconstruct(
           }
 
           if (options_->extract_colors) {
-            ExtractColors(image_path_, next_image_id, &reconstruction);
+            NonBaStageScope extract_colors(
+                non_ba_profiler_, NonBaStageId::kExtractColors, 1);
+            const bool extracted =
+                ExtractColors(image_path_, next_image_id, &reconstruction);
+            extract_colors.SetOutputItems(extracted ? 1 : 0);
           }
 
           if (options_->snapshot_images_freq > 0 &&

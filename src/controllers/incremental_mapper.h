@@ -66,6 +66,11 @@ struct IncrementalMapperOptions {
   std::string ba_lidar_residual = "legacy_exact";
   std::string ba_telemetry_path;
 
+  // Optional non-BA stage profiling. The default off path leaves the profiler
+  // pointer null and performs no allocation, clock read, lock, or file write.
+  bool non_ba_profile = false;
+  std::string non_ba_profile_path;
+
   // Fix pose of the first image for some times
   int first_image_fixed_frames = 8;
   // Minimize proj times for each image before Icp
@@ -271,10 +276,18 @@ class IncrementalMapperController : public Thread {
                               ReconstructionManager* reconstruction_manager);
 
   int OriginImagesNum();
-  bool HasFailed() const { return ba_failed_.load(); }
+  bool HasFailed() const {
+    return ba_failed_.load() || non_ba_profile_failed_.load();
+  }
+  bool HasNonBaProfileFailed() const {
+    return non_ba_profile_failed_.load();
+  }
+  NonBaStageSink* NonBaProfiler() const { return non_ba_profiler_; }
   DatabaseCache database_cache_;//数据都在这里面存着
+
  private:
   void Run();
+  void RunImpl();
   bool LoadDatabase();
   bool LoadPose();
   void Reconstruct(const IncrementalMapper::Options& init_mapper_options);
@@ -286,6 +299,8 @@ class IncrementalMapperController : public Thread {
   //Tx, Ty, Tz, qw, qx, qy, qz
   std::map<uint32_t, std::vector<double>> image_poses_;
   std::atomic<bool> ba_failed_{false};
+  std::atomic<bool> non_ba_profile_failed_{false};
+  NonBaStageSink* non_ba_profiler_ = nullptr;
 };
 
 // Globally filter points and images in mapper.

@@ -42,6 +42,7 @@
 #include "gpu_ba/host_ba_graph.h"
 #endif
 #include "estimators/pose.h"
+#include "sfm/nonba_profiler.h"
 #include "util/bitmap.h"
 #include "util/misc.h"
 
@@ -126,7 +127,12 @@ bool IncrementalMapper::Options::Check() const {
 }
 
 IncrementalMapper::IncrementalMapper(const DatabaseCache* database_cache)
+    : IncrementalMapper(database_cache, nullptr) {}
+
+IncrementalMapper::IncrementalMapper(const DatabaseCache* database_cache,
+                                     NonBaStageSink* non_ba_profiler)
     : database_cache_(database_cache),
+      non_ba_profiler_(non_ba_profiler),
       reconstruction_(nullptr),
       triangulator_(nullptr),
       num_total_reg_images_(0),
@@ -293,18 +299,20 @@ IncrementalMapper::CudaHostStoreBindingForTesting() const {
 }
 #endif
 
-void IncrementalMapper::LoadPointcloud(std::string& pointcloud_path, 
-                                       const lidar::PcdProjectionOptions& pp_options){
+bool IncrementalMapper::LoadPointcloud(
+    std::string& pointcloud_path,
+    const lidar::PcdProjectionOptions& pp_options) {
   if (pointcloud_path == ""){
     std::cout << "Pose file path undefined." << std::endl;
     std::cout << std::endl;
   }                                    
   lidar_pointcloud_process_.reset(new lidar::PointCloudProcess(pointcloud_path));
-  if (!lidar_pointcloud_process_->Initialize(pp_options)){
+  const bool initialized = lidar_pointcloud_process_->Initialize(pp_options);
+  if (!initialized) {
     std::cout<< "Error reading point cloud." << std::endl;
     std::cout << std::endl;
-
   }
+  return initialized;
 }
 bool IncrementalMapper::FindInitialImagePair(const Options& options,
                                              image_t* image_id1,
@@ -594,7 +602,22 @@ bool IncrementalMapper::RegisterInitialImagePairByDepthProj(const Options& optio
     image2_point2ds.push_back(point2D_2.XY());
   }
   
-  lidar_pointcloud_process_->pcd_proj_->SetNewImage(image1,camera1,image1_point2ds,image1_pt_xyzs);
+  {
+    NonBaStageScope projection(
+        non_ba_profiler_, NonBaStageId::kInitialLidarProjection,
+        image1_point2ds.size());
+    lidar_pointcloud_process_->pcd_proj_->SetNewImage(
+        image1, camera1, image1_point2ds, image1_pt_xyzs);
+    size_t projected_matches = 0;
+    if (non_ba_profiler_ != nullptr) {
+      for (const auto& point2D : image1_point2ds) {
+        if (point2D.second) {
+          ++projected_matches;
+        }
+      }
+    }
+    projection.SetOutputItems(projected_matches);
+  }
   std::vector<Eigen::Vector2d> tri_points2D; 
   std::vector<Eigen::Vector3d> tri_points3D; 
   std::vector<point2D_t> image1_idxs;
@@ -628,39 +651,57 @@ bool IncrementalMapper::RegisterInitialImagePairByDepthProj(const Options& optio
 
   size_t num_inliers;
   std::vector<char> inlier_mask;
-  if (!EstimateAbsolutePose(abs_pose_options, tri_points2D, tri_points3D,
-                            &image2.Qvec(), &image2.Tvec(), &camera2, &num_inliers,
-                            &inlier_mask)) {
-    return false;
+  {
+    NonBaStageScope pose(
+        non_ba_profiler_, NonBaStageId::kInitialAbsolutePose,
+        tri_points2D.size());
+    const bool success = EstimateAbsolutePose(
+        abs_pose_options, tri_points2D, tri_points3D, &image2.Qvec(),
+        &image2.Tvec(), &camera2, &num_inliers, &inlier_mask);
+    pose.SetOutputItems(success ? num_inliers : 0);
+    if (!success) {
+      return false;
+    }
   }
 
   if (num_inliers < static_cast<size_t>(options.abs_pose_min_num_inliers)) {
     return false;
   }
 
-  if (!RefineAbsolutePose(abs_pose_refinement_options, inlier_mask,
-                          tri_points2D, tri_points3D, &image2.Qvec(),
-                          &image2.Tvec(), &camera2)) {
-    return false;
+  {
+    NonBaStageScope refine(
+        non_ba_profiler_, NonBaStageId::kInitialPoseRefine, num_inliers);
+    const bool success = RefineAbsolutePose(
+        abs_pose_refinement_options, inlier_mask, tri_points2D, tri_points3D,
+        &image2.Qvec(), &image2.Tvec(), &camera2);
+    refine.SetOutputItems(success ? num_inliers : 0);
+    if (!success) {
+      return false;
+    }
   }
 
-  reconstruction_->RegisterImage(image_id1);
-  reconstruction_->RegisterImage(image_id2);
-  RegisterImageEvent(image_id1);
-  RegisterImageEvent(image_id2);
-  Track track;
-  track.Reserve(2);
-  track.AddElement(TrackElement());
-  track.AddElement(TrackElement());
-  track.Element(0).image_id = image_id1;
-  track.Element(1).image_id = image_id2;
-  for (size_t i = 0; i < inlier_mask.size(); ++i) {
-    if (inlier_mask[i]) {
-      track.Element(0).point2D_idx = image1_idxs[i];
-      track.Element(1).point2D_idx = image2_idxs[i];
-      const Eigen::Vector3d xyz = tri_points3D[i];
-      reconstruction_->AddPoint3D(xyz, track);
+  {
+    NonBaStageScope commit(
+        non_ba_profiler_, NonBaStageId::kInitialCommit, num_inliers);
+    reconstruction_->RegisterImage(image_id1);
+    reconstruction_->RegisterImage(image_id2);
+    RegisterImageEvent(image_id1);
+    RegisterImageEvent(image_id2);
+    Track track;
+    track.Reserve(2);
+    track.AddElement(TrackElement());
+    track.AddElement(TrackElement());
+    track.Element(0).image_id = image_id1;
+    track.Element(1).image_id = image_id2;
+    for (size_t i = 0; i < inlier_mask.size(); ++i) {
+      if (inlier_mask[i]) {
+        track.Element(0).point2D_idx = image1_idxs[i];
+        track.Element(1).point2D_idx = image2_idxs[i];
+        const Eigen::Vector3d xyz = tri_points3D[i];
+        reconstruction_->AddPoint3D(xyz, track);
+      }
     }
+    commit.SetOutputItems(num_inliers);
   }
 
   return true;
@@ -713,45 +754,51 @@ bool IncrementalMapper::RegisterNextImage(const Options& options,
   std::vector<Eigen::Vector3d> tri_points3D;
 
   std::unordered_set<point3D_t> corr_point3D_ids;
-  for (point2D_t point2D_idx = 0; point2D_idx < image.NumPoints2D();
-       ++point2D_idx) {
-    const Point2D& point2D = image.Point2D(point2D_idx);
+  {
+    NonBaStageScope collect(
+        non_ba_profiler_, NonBaStageId::kRegisterCollect2D3D,
+        image.NumPoints2D());
+    for (point2D_t point2D_idx = 0; point2D_idx < image.NumPoints2D();
+         ++point2D_idx) {
+      const Point2D& point2D = image.Point2D(point2D_idx);
 
-    corr_point3D_ids.clear();
-    for (const auto& corr :
-         correspondence_graph.FindCorrespondences(image_id, point2D_idx)) {
-      const Image& corr_image = reconstruction_->Image(corr.image_id);
-      // If this image hasn't been registered, ignore this image
-      if (!corr_image.IsRegistered()) {
-        continue;
+      corr_point3D_ids.clear();
+      for (const auto& corr :
+           correspondence_graph.FindCorrespondences(image_id, point2D_idx)) {
+        const Image& corr_image = reconstruction_->Image(corr.image_id);
+        // If this image hasn't been registered, ignore this image
+        if (!corr_image.IsRegistered()) {
+          continue;
+        }
+        const Point2D& corr_point2D = corr_image.Point2D(corr.point2D_idx);
+        if (!corr_point2D.HasPoint3D()) {
+          continue;
+        }
+
+        // Avoid duplicate correspondences.
+        if (corr_point3D_ids.count(corr_point2D.Point3DId()) > 0) {
+          continue;
+        }
+        const Camera& corr_camera =
+            reconstruction_->Camera(corr_image.CameraId());
+
+        // Avoid correspondences to images with bogus camera parameters.
+        if (corr_camera.HasBogusParams(options.min_focal_length_ratio,
+                                       options.max_focal_length_ratio,
+                                       options.max_extra_param)) {
+          continue;
+        }
+
+        const Point3D& point3D =
+            reconstruction_->Point3D(corr_point2D.Point3DId());
+
+        tri_corrs.emplace_back(point2D_idx, corr_point2D.Point3DId());
+        corr_point3D_ids.insert(corr_point2D.Point3DId());
+        tri_points2D.push_back(point2D.XY());
+        tri_points3D.push_back(point3D.XYZ());
       }
-      const Point2D& corr_point2D = corr_image.Point2D(corr.point2D_idx);
-      if (!corr_point2D.HasPoint3D()) {
-        continue;
-      }
-
-      // Avoid duplicate correspondences.
-      if (corr_point3D_ids.count(corr_point2D.Point3DId()) > 0) {
-        continue;
-      }
-      const Camera& corr_camera =
-          reconstruction_->Camera(corr_image.CameraId());
-
-      // Avoid correspondences to images with bogus camera parameters.
-      if (corr_camera.HasBogusParams(options.min_focal_length_ratio,
-                                     options.max_focal_length_ratio,
-                                     options.max_extra_param)) {
-        continue;
-      }
-
-      const Point3D& point3D =
-          reconstruction_->Point3D(corr_point2D.Point3DId());
-
-      tri_corrs.emplace_back(point2D_idx, corr_point2D.Point3DId());
-      corr_point3D_ids.insert(corr_point2D.Point3DId());
-      tri_points2D.push_back(point2D.XY());
-      tri_points3D.push_back(point3D.XYZ());
     }
+    collect.SetOutputItems(tri_points2D.size());
   }
 
   // The size of `next_image.num_tri_obs` and `tri_corrs_point2D_idxs.size()`
@@ -824,10 +871,17 @@ bool IncrementalMapper::RegisterNextImage(const Options& options,
   size_t num_inliers;
   std::vector<char> inlier_mask;
 
-  if (!EstimateAbsolutePose(abs_pose_options, tri_points2D, tri_points3D,
-                            &image.Qvec(), &image.Tvec(), &camera, &num_inliers,
-                            &inlier_mask)) {
-    return false;
+  {
+    NonBaStageScope pose(
+        non_ba_profiler_, NonBaStageId::kRegisterAbsolutePose,
+        tri_points2D.size());
+    const bool success = EstimateAbsolutePose(
+        abs_pose_options, tri_points2D, tri_points3D, &image.Qvec(),
+        &image.Tvec(), &camera, &num_inliers, &inlier_mask);
+    pose.SetOutputItems(success ? num_inliers : 0);
+    if (!success) {
+      return false;
+    }
   }
 
   if (num_inliers < static_cast<size_t>(options.abs_pose_min_num_inliers)) {
@@ -838,30 +892,45 @@ bool IncrementalMapper::RegisterNextImage(const Options& options,
   // Pose refinement
   //////////////////////////////////////////////////////////////////////////////
 
-  if (!RefineAbsolutePose(abs_pose_refinement_options, inlier_mask,
-                          tri_points2D, tri_points3D, &image.Qvec(),
-                          &image.Tvec(), &camera)) {
-    return false;
+  {
+    NonBaStageScope refine(
+        non_ba_profiler_, NonBaStageId::kRegisterPoseRefine, num_inliers);
+    const bool success = RefineAbsolutePose(
+        abs_pose_refinement_options, inlier_mask, tri_points2D, tri_points3D,
+        &image.Qvec(), &image.Tvec(), &camera);
+    refine.SetOutputItems(success ? num_inliers : 0);
+    if (!success) {
+      return false;
+    }
   }
 
   //////////////////////////////////////////////////////////////////////////////
   // Continue tracks
   //////////////////////////////////////////////////////////////////////////////
 
-  reconstruction_->RegisterImage(image_id);
-  RegisterImageEvent(image_id);
+  {
+    NonBaStageScope commit(
+        non_ba_profiler_, NonBaStageId::kRegisterCommit, num_inliers);
+    reconstruction_->RegisterImage(image_id);
+    RegisterImageEvent(image_id);
 
-  for (size_t i = 0; i < inlier_mask.size(); ++i) {
-    if (inlier_mask[i]) {
-      const point2D_t point2D_idx = tri_corrs[i].first;
-      const Point2D& point2D = image.Point2D(point2D_idx);
-      if (!point2D.HasPoint3D()) {
-        const point3D_t point3D_id = tri_corrs[i].second;
-        const TrackElement track_el(image_id, point2D_idx);
-        reconstruction_->AddObservation(point3D_id, track_el);
-        triangulator_->AddModifiedPoint3D(point3D_id);
+    size_t committed = 0;
+    for (size_t i = 0; i < inlier_mask.size(); ++i) {
+      if (inlier_mask[i]) {
+        const point2D_t point2D_idx = tri_corrs[i].first;
+        const Point2D& point2D = image.Point2D(point2D_idx);
+        if (!point2D.HasPoint3D()) {
+          const point3D_t point3D_id = tri_corrs[i].second;
+          const TrackElement track_el(image_id, point2D_idx);
+          reconstruction_->AddObservation(point3D_id, track_el);
+          triangulator_->AddModifiedPoint3D(point3D_id);
+          if (non_ba_profiler_ != nullptr) {
+            ++committed;
+          }
+        }
       }
     }
+    commit.SetOutputItems(committed);
   }
 
   return true;
@@ -905,13 +974,24 @@ IncrementalMapper::AdjustLocalBundle(
   LocalBundleAdjustmentReport report;
 
   // Find images that have most 3D points with given image in common.
-  const std::vector<image_t> local_bundle = FindLocalBundle(options, image_id);
+  std::vector<image_t> local_bundle;
+  {
+    NonBaStageScope find_bundle(
+        non_ba_profiler_, NonBaStageId::kLocalFindBundle,
+        reconstruction_->Image(image_id).NumPoints3D());
+    local_bundle = FindLocalBundle(options, image_id);
+    find_bundle.SetOutputItems(local_bundle.size());
+  }
 
   std::cout<<std::endl;
   // Do the bundle adjustment only if there is any connected images.
   if (local_bundle.size() > 0) {
     BundleAdjustmentConfig ba_config;
-    if (ba_options.if_add_lidar_constraint || ba_options.if_add_lidar_corresponding){
+    NonBaStageScope ba_config_scope(
+        non_ba_profiler_, NonBaStageId::kLocalBaConfig,
+        point3D_ids.size());
+    if (ba_options.if_add_lidar_constraint ||
+        ba_options.if_add_lidar_corresponding) {
       ba_config.AddPointcloud(lidar_pointcloud_process_);
     }
 
@@ -983,60 +1063,114 @@ IncrementalMapper::AdjustLocalBundle(
     std::unordered_set<point3D_t> variable_point3D_ids;
     std::unordered_set<point3D_t> pcdproj_point3D_ids;
     std::unordered_set<point3D_t> search_closest_point3D_ids;
-    if (ba_options.if_add_lidar_constraint) {
-      for (const point3D_t point3D_id : point3D_ids) {
-        const Point3D& point3D = reconstruction_->Point3D(point3D_id);
-        const size_t kMaxTrackLength = 1000;
-        if (!point3D.HasError() || point3D.Track().Length() <= kMaxTrackLength) {
-          ba_config.AddVariablePoint(point3D_id);
-          variable_point3D_ids.insert(point3D_id);
-          if (point3D.Track().Length() < options.min_proj_num + 3){
-            pcdproj_point3D_ids.insert(point3D_id);
-          } else {
-            search_closest_point3D_ids.insert(point3D_id);
+    {
+      NonBaStageScope lidar_preparation(
+          non_ba_profiler_, NonBaStageId::kLocalLidarProjectionPreparation,
+          point3D_ids.size());
+      {
+        NonBaStageScope variable_points(
+            non_ba_profiler_, NonBaStageId::kLocalVariablePointCollection,
+            point3D_ids.size());
+        if (ba_options.if_add_lidar_constraint) {
+          for (const point3D_t point3D_id : point3D_ids) {
+            const Point3D& point3D = reconstruction_->Point3D(point3D_id);
+            const size_t kMaxTrackLength = 1000;
+            if (!point3D.HasError() ||
+                point3D.Track().Length() <= kMaxTrackLength) {
+              ba_config.AddVariablePoint(point3D_id);
+              variable_point3D_ids.insert(point3D_id);
+              if (point3D.Track().Length() < options.min_proj_num + 3) {
+                pcdproj_point3D_ids.insert(point3D_id);
+              } else {
+                search_closest_point3D_ids.insert(point3D_id);
+              }
+            }
+          }
+        } else {
+          for (const point3D_t point3D_id : point3D_ids) {
+            const Point3D& point3D = reconstruction_->Point3D(point3D_id);
+            const size_t kMaxTrackLength = 15;
+            if (!point3D.HasError() ||
+                point3D.Track().Length() <= kMaxTrackLength) {
+              ba_config.AddVariablePoint(point3D_id);
+              variable_point3D_ids.insert(point3D_id);
+            }
           }
         }
+        variable_points.SetOutputItems(variable_point3D_ids.size());
       }
-    } else {
-      for (const point3D_t point3D_id : point3D_ids) {
-        const Point3D& point3D = reconstruction_->Point3D(point3D_id);
-        const size_t kMaxTrackLength = 15;
-        if (!point3D.HasError() || point3D.Track().Length() <= kMaxTrackLength) {
-          ba_config.AddVariablePoint(point3D_id);
-          variable_point3D_ids.insert(point3D_id);
+      lidar_preparation.SetOutputItems(pcdproj_point3D_ids.size() +
+                                       search_closest_point3D_ids.size());
+    }
+
+    if (ba_options.if_add_lidar_constraint ||
+        ba_options.if_add_lidar_corresponding) {
+      {
+        NonBaStageScope projection_matching(
+            non_ba_profiler_,
+            NonBaStageId::kLocalLidarProjectionAndMatching,
+            pcdproj_point3D_ids.size());
+        const size_t num_lidar_before =
+            non_ba_profiler_ == nullptr ? 0 : ba_config.lidar_maps_.size();
+        for (auto iter = pcdproj_point3D_ids.begin();
+             iter != pcdproj_point3D_ids.end(); ++iter) {
+          const point3D_t point3D_id = *iter;
+          int threshold = ba_options.ba_match_features_threshold;
+          ba_config.Project2Image(
+              reconstruction_, point3D_id, image_id, threshold);
+        }
+        for (auto iter = pcdproj_point3D_ids.begin();
+             iter != pcdproj_point3D_ids.end(); ++iter) {
+          ba_config.MatchVariablePoint2LidarPoint(reconstruction_, *iter);
+        }
+        if (non_ba_profiler_ != nullptr) {
+          projection_matching.SetOutputItems(ba_config.lidar_maps_.size() -
+                                             num_lidar_before);
+        }
+      }
+
+      {
+        NonBaStageScope kd_queries(
+            non_ba_profiler_, NonBaStageId::kLocalKdQueries,
+            search_closest_point3D_ids.size());
+        const size_t num_lidar_before =
+            non_ba_profiler_ == nullptr ? 0 : ba_config.lidar_maps_.size();
+        for (auto iter = search_closest_point3D_ids.begin();
+             iter != search_closest_point3D_ids.end(); ++iter) {
+          const point3D_t point3D_id = *iter;
+          int opt_num = reconstruction_->Point3D(point3D_id).GlobalOptNum();
+          double max_search_range = options.kdtree_max_search_range -
+                                    opt_num * options.search_range_drop_speed;
+          if (max_search_range <= options.kdtree_min_search_range) {
+            max_search_range = options.kdtree_min_search_range;
+          }
+          ba_config.MatchClosestLidarPoint(
+              reconstruction_, point3D_id, max_search_range);
+        }
+        if (non_ba_profiler_ != nullptr) {
+          kd_queries.SetOutputItems(ba_config.lidar_maps_.size() -
+                                    num_lidar_before);
         }
       }
     }
 
-    if (ba_options.if_add_lidar_constraint || ba_options.if_add_lidar_corresponding){
-      for (auto iter = pcdproj_point3D_ids.begin(); iter != pcdproj_point3D_ids.end(); iter++){
-        const point3D_t point3D_id = *iter;
-        int threshold = ba_options.ba_match_features_threshold;
-        ba_config.Project2Image(reconstruction_,point3D_id, image_id, threshold);
-      }
-      for (auto iter = pcdproj_point3D_ids.begin(); iter != pcdproj_point3D_ids.end(); iter++){
-        const point3D_t point3D_id = *iter;
-        ba_config.MatchVariablePoint2LidarPoint(reconstruction_,point3D_id);
-      }
+    ba_config_scope.SetOutputItems(variable_point3D_ids.size());
 
-      for (auto iter = search_closest_point3D_ids.begin(); iter != search_closest_point3D_ids.end(); iter++){
-        const point3D_t point3D_id = *iter;
-        // const Point3D& point3D = reconstruction_->Point3D(point3D_id);
-        int opt_num = reconstruction_->Point3D(point3D_id).GlobalOptNum();
-        double max_search_range = options.kdtree_max_search_range - opt_num * options.search_range_drop_speed;
-        if (max_search_range <= options.kdtree_min_search_range) {
-          max_search_range = options.kdtree_min_search_range;
-        }
-        ba_config.MatchClosestLidarPoint(reconstruction_,point3D_id,max_search_range);
-      }
-    }
-
-    
     // Adjust the local bundle.
     BundleAdjuster bundle_adjuster(ba_options, ba_config);
-    const BundleAdjuster::OptimazePhrase phrase = BundleAdjuster::OptimazePhrase::Local;
-    if (!SolveBundleAdjustment(ba_options, ba_config, phrase,
-                               &bundle_adjuster)) {
+    const BundleAdjuster::OptimazePhrase phrase =
+        BundleAdjuster::OptimazePhrase::Local;
+    bool solve_success = false;
+    {
+      NonBaStageScope ba_solve(
+          non_ba_profiler_, NonBaStageId::kLocalBaSolve,
+          variable_point3D_ids.size());
+      solve_success = SolveBundleAdjustment(
+          ba_options, ba_config, phrase, &bundle_adjuster);
+      ba_solve.SetOutputItems(
+          solve_success ? bundle_adjuster.Summary().num_residuals / 2 : 0);
+    }
+    if (!solve_success) {
       report.success = false;
       return report;
     }
@@ -1045,16 +1179,35 @@ IncrementalMapper::AdjustLocalBundle(
         bundle_adjuster.Summary().num_residuals / 2;
 
     // Merge refined tracks with other existing points.
-    report.num_merged_observations =
-        triangulator_->MergeTracks(tri_options, variable_point3D_ids);
+    {
+      NonBaStageScope merge(
+          non_ba_profiler_, NonBaStageId::kLocalMergeTracks,
+          variable_point3D_ids.size());
+      report.num_merged_observations =
+          triangulator_->MergeTracks(tri_options, variable_point3D_ids);
+      merge.SetOutputItems(report.num_merged_observations);
+    }
     // Complete tracks that may have failed to triangulate before refinement
     // of camera pose and calibration in bundle-adjustment. This may avoid
     // that some points are filtered and it helps for subsequent image
     // registrations.
-    report.num_completed_observations =
-        triangulator_->CompleteTracks(tri_options, variable_point3D_ids);
-    report.num_completed_observations +=
-        triangulator_->CompleteImage(tri_options, image_id);
+    {
+      NonBaStageScope complete_tracks(
+          non_ba_profiler_, NonBaStageId::kLocalCompleteTracks,
+          variable_point3D_ids.size());
+      report.num_completed_observations =
+          triangulator_->CompleteTracks(tri_options, variable_point3D_ids);
+      complete_tracks.SetOutputItems(report.num_completed_observations);
+    }
+    {
+      NonBaStageScope complete_image(
+          non_ba_profiler_, NonBaStageId::kLocalCompleteImage,
+          reconstruction_->Image(image_id).NumObservations());
+      const size_t completed =
+          triangulator_->CompleteImage(tri_options, image_id);
+      complete_image.SetOutputItems(completed);
+      report.num_completed_observations += completed;
+    }
   }
 
   // Filter both the modified images and all changed 3D points to make sure
@@ -1065,15 +1218,34 @@ IncrementalMapper::AdjustLocalBundle(
   filter_image_ids.insert(image_id);
   filter_image_ids.insert(local_bundle.begin(), local_bundle.end());
 
-  report.num_filtered_observations = reconstruction_->FilterPoints3DInImages(
-      options.filter_max_reproj_error, options.filter_min_tri_angle,
-      filter_image_ids);
-  report.num_filtered_observations += reconstruction_->FilterPoints3D(
-      options.filter_max_reproj_error, options.filter_min_tri_angle,
-      point3D_ids);
+  {
+    NonBaStageScope filter_images(
+        non_ba_profiler_, NonBaStageId::kLocalFilterInImages,
+        filter_image_ids.size());
+    report.num_filtered_observations =
+        reconstruction_->FilterPoints3DInImages(
+            options.filter_max_reproj_error, options.filter_min_tri_angle,
+            filter_image_ids);
+    filter_images.SetOutputItems(report.num_filtered_observations);
+  }
+  {
+    NonBaStageScope filter_modified(
+        non_ba_profiler_, NonBaStageId::kLocalFilterModified,
+        point3D_ids.size());
+    const size_t filtered = reconstruction_->FilterPoints3D(
+        options.filter_max_reproj_error, options.filter_min_tri_angle,
+        point3D_ids);
+    filter_modified.SetOutputItems(filtered);
+    report.num_filtered_observations += filtered;
+  }
   if (ba_options.if_add_lidar_constraint) {
-    report.num_filtered_observations += reconstruction_->FilterLidarOutlier(
-        options.proj_max_dist_error,options.icp_max_dist_error);
+    NonBaStageScope filter_lidar(
+        non_ba_profiler_, NonBaStageId::kLocalLidarOutlier,
+        point3D_ids.size());
+    const size_t filtered = reconstruction_->FilterLidarOutlier(
+        options.proj_max_dist_error, options.icp_max_dist_error);
+    filter_lidar.SetOutputItems(filtered);
+    report.num_filtered_observations += filtered;
   }
   return report;
 }
@@ -1089,36 +1261,66 @@ bool IncrementalMapper::AdjustGlobalBundle(
                                        "bundle-adjustment";
 
   // Avoid degeneracies in bundle adjustment.
-  reconstruction_->FilterObservationsWithNegativeDepth();
+  {
+    NonBaStageScope negative_depth(
+        non_ba_profiler_, NonBaStageId::kGlobalNegativeDepthScan,
+        [this]() { return reconstruction_->ComputeNumObservations(); });
+    negative_depth.SetOutputItems(
+        reconstruction_->FilterObservationsWithNegativeDepth());
+  }
 
   // Configure bundle adjustment.
   BundleAdjustmentConfig ba_config;
-  for (const image_t image_id : reg_image_ids) {
-    ba_config.AddImage(image_id);
-  }
-
-  // Fix the existing images, if option specified.
-  if (options.fix_existing_images) {
+  {
+    NonBaStageScope image_config(
+        non_ba_profiler_, NonBaStageId::kGlobalImageConfigSelection,
+        reg_image_ids.size());
     for (const image_t image_id : reg_image_ids) {
-      if (existing_image_ids_.count(image_id)) {
-        ba_config.SetConstantPose(image_id);
+      ba_config.AddImage(image_id);
+    }
+
+    // Fix the existing images, if option specified.
+    if (options.fix_existing_images) {
+      for (const image_t image_id : reg_image_ids) {
+        if (existing_image_ids_.count(image_id)) {
+          ba_config.SetConstantPose(image_id);
+        }
       }
     }
-  }
 
-  // Fix 7-DOFs of the bundle adjustment problem.
-  ba_config.SetConstantPose(reg_image_ids[0]);
-  if (!options.fix_existing_images ||
-      !existing_image_ids_.count(reg_image_ids[1])) {
-    ba_config.SetConstantTvec(reg_image_ids[1], {0});
+    // Fix 7-DOFs of the bundle adjustment problem.
+    ba_config.SetConstantPose(reg_image_ids[0]);
+    if (!options.fix_existing_images ||
+        !existing_image_ids_.count(reg_image_ids[1])) {
+      ba_config.SetConstantTvec(reg_image_ids[1], {0});
+    }
+    image_config.SetOutputItems(ba_config.NumImages());
   }
 
   // Run bundle adjustment.
-  BundleAdjuster bundle_adjuster(ba_options, ba_config);
-  const BundleAdjuster::OptimazePhrase phrase = BundleAdjuster::OptimazePhrase::Global;
-  if (!SolveBundleAdjustment(ba_options, ba_config, phrase,
-                             &bundle_adjuster)) {
-    return false;
+  {
+    NonBaStageScope ba_config_scope(
+        non_ba_profiler_, NonBaStageId::kGlobalBaConfig,
+        ba_config.NumImages());
+    BundleAdjuster bundle_adjuster(ba_options, ba_config);
+    const BundleAdjuster::OptimazePhrase phrase =
+        BundleAdjuster::OptimazePhrase::Global;
+    ba_config_scope.SetOutputItems(ba_config.NumImages() +
+                                   ba_config.NumVariablePoints());
+
+    bool solve_success = false;
+    {
+      NonBaStageScope ba_solve(
+          non_ba_profiler_, NonBaStageId::kGlobalBaSolve,
+          [this]() { return reconstruction_->ComputeNumObservations(); });
+      solve_success = SolveBundleAdjustment(
+          ba_options, ba_config, phrase, &bundle_adjuster);
+      ba_solve.SetOutputItems(
+          solve_success ? bundle_adjuster.Summary().num_residuals / 2 : 0);
+    }
+    if (!solve_success) {
+      return false;
+    }
   }
 
   // Normalize scene for numerical stability and
@@ -1133,48 +1335,68 @@ bool IncrementalMapper::AdjustGlobalBundleByLidar(
   CHECK_NOTNULL(reconstruction_);
 
   const std::vector<image_t>& reg_image_ids = reconstruction_->RegImageIds();
-  EIGEN_STL_UMAP(point3D_t, Point3D) point3d_ids = reconstruction_->Points3D();
+  EIGEN_STL_UMAP(point3D_t, Point3D) point3d_ids;
+  {
+    NonBaStageScope points_copy(
+        non_ba_profiler_, NonBaStageId::kGlobalPoints3DAndConfigCopy,
+        reconstruction_->NumPoints3D());
+    point3d_ids = reconstruction_->Points3D();
+    points_copy.SetOutputItems(point3d_ids.size());
+  }
 
   CHECK_GE(reg_image_ids.size(), 2) << "At least two images must be "
                                        "registered for global "
                                        "bundle-adjustment";
 
   // Avoid degeneracies in bundle adjustment.
-  reconstruction_->FilterObservationsWithNegativeDepth();
+  {
+    NonBaStageScope negative_depth(
+        non_ba_profiler_, NonBaStageId::kGlobalNegativeDepthScan,
+        [this]() { return reconstruction_->ComputeNumObservations(); });
+    negative_depth.SetOutputItems(
+        reconstruction_->FilterObservationsWithNegativeDepth());
+  }
 
   // Configure bundle adjustment.
   BundleAdjustmentConfig ba_config;
-  for (const image_t image_id : reg_image_ids) {
-    ba_config.AddImage(image_id);
-  }
-
-  // Fix the existing images, if option specified.
-  if (options.fix_existing_images) {
+  {
+    NonBaStageScope image_config(
+        non_ba_profiler_, NonBaStageId::kGlobalImageConfigSelection,
+        reg_image_ids.size());
     for (const image_t image_id : reg_image_ids) {
-      if (existing_image_ids_.count(image_id)) {
-        ba_config.SetConstantPose(image_id);
+      ba_config.AddImage(image_id);
+    }
+
+    // Fix the existing images, if option specified.
+    if (options.fix_existing_images) {
+      for (const image_t image_id : reg_image_ids) {
+        if (existing_image_ids_.count(image_id)) {
+          ba_config.SetConstantPose(image_id);
+        }
       }
     }
-  }
 
-  // Fix 7-DOFs of the bundle adjustment problem.
-  // ba_config.SetConstantPose(reg_image_ids[0]);
-  // if (!options.fix_existing_images ||
-  //     !existing_image_ids_.count(reg_image_ids[1])) {
-  //   ba_config.SetConstantTvec(reg_image_ids[1], {0});
-  // }
-  int num = reg_image_ids.size() - 1 ;
-  if (num < options.first_image_fixed_frames){
-    ba_config.SetConstantPose(options.init_image_id1);
-    num +=1;
+    // Fix 7-DOFs of the bundle adjustment problem.
+    // ba_config.SetConstantPose(reg_image_ids[0]);
+    // if (!options.fix_existing_images ||
+    //     !existing_image_ids_.count(reg_image_ids[1])) {
+    //   ba_config.SetConstantTvec(reg_image_ids[1], {0});
+    // }
+    int num = reg_image_ids.size() - 1;
+    if (num < options.first_image_fixed_frames) {
+      ba_config.SetConstantPose(options.init_image_id1);
+      num += 1;
+    }
+    image_config.SetOutputItems(ba_config.NumImages());
   }
     
   // Variables inside the sphere that need to be optimized
   image_t latest_image_id = reg_image_ids.back();
-  Eigen::Quaterniond latest_q_cw(reconstruction_->Image(latest_image_id).Qvec()[0],
-                            reconstruction_->Image(latest_image_id).Qvec()[1],
-                            reconstruction_->Image(latest_image_id).Qvec()[2],
-                            reconstruction_->Image(latest_image_id).Qvec()[3]);
+  Eigen::Quaterniond latest_q_cw(
+      reconstruction_->Image(latest_image_id).Qvec()[0],
+      reconstruction_->Image(latest_image_id).Qvec()[1],
+      reconstruction_->Image(latest_image_id).Qvec()[2],
+      reconstruction_->Image(latest_image_id).Qvec()[3]);
   Eigen::Matrix3d latest_rot_cw = latest_q_cw.toRotationMatrix();
   Eigen::Vector3d latest_t_cw = reconstruction_->Image(latest_image_id).Tvec();
   Eigen::Vector3d latest_image_T = - latest_rot_cw.transpose() * latest_t_cw;
@@ -1182,93 +1404,144 @@ bool IncrementalMapper::AdjustGlobalBundleByLidar(
   std::vector<image_t> image_out_sphere;
   std::unordered_set<point3D_t> variable_point3D_ids;
 
-  for (const image_t& image_id : reg_image_ids){
-    Eigen::Quaterniond q_cw(reconstruction_->Image(image_id).Qvec()[0],
-                            reconstruction_->Image(image_id).Qvec()[1],
-                            reconstruction_->Image(image_id).Qvec()[2],
-                            reconstruction_->Image(image_id).Qvec()[3]);
-    Eigen::Matrix3d rot_cw = q_cw.toRotationMatrix();
-    Eigen::Vector3d t_cw = reconstruction_->Image(image_id).Tvec();
-    Eigen::Vector3d image_T = - rot_cw.transpose() * t_cw;
-    double dist = (latest_image_T - image_T).norm();
-    if (dist <= options.ba_spherical_search_radius) {
-      image_in_sphere.push_back(image_id);
-    } else {
-      image_out_sphere.push_back(image_id);
-    }
-  }
-
-  for (const image_t image_id : image_out_sphere) {
-    ba_config.SetConstantPose(image_id);
-  }
-
-  for (image_t image_id : image_in_sphere) {
-    std::vector<class Point2D> point2Ds = reconstruction_->Image(image_id).Points2D();
-    for (Point2D& point2D : point2Ds) {
-      if (!point2D.HasPoint3D()) {
-            continue;
-      }
-      point3D_t point3d_id = point2D.GetPoint3DId();
-      auto iter = point3d_ids.find(point3d_id);
-      if (iter != point3d_ids.end()){
-        ba_config.AddVariablePoint(point3d_id);
-        variable_point3D_ids.insert(point3d_id);
+  {
+    NonBaStageScope image_selection(
+        non_ba_profiler_, NonBaStageId::kGlobalImageConfigSelection,
+        reg_image_ids.size());
+    for (const image_t& image_id : reg_image_ids) {
+      Eigen::Quaterniond q_cw(reconstruction_->Image(image_id).Qvec()[0],
+                              reconstruction_->Image(image_id).Qvec()[1],
+                              reconstruction_->Image(image_id).Qvec()[2],
+                              reconstruction_->Image(image_id).Qvec()[3]);
+      Eigen::Matrix3d rot_cw = q_cw.toRotationMatrix();
+      Eigen::Vector3d t_cw = reconstruction_->Image(image_id).Tvec();
+      Eigen::Vector3d image_T = - rot_cw.transpose() * t_cw;
+      double dist = (latest_image_T - image_T).norm();
+      if (dist <= options.ba_spherical_search_radius) {
+        image_in_sphere.push_back(image_id);
+      } else {
+        image_out_sphere.push_back(image_id);
       }
     }
+
+    for (const image_t image_id : image_out_sphere) {
+      ba_config.SetConstantPose(image_id);
+    }
+    image_selection.SetOutputItems(image_in_sphere.size());
   }
 
-  if (ba_options.if_add_lidar_constraint || ba_options.if_add_lidar_corresponding){
-    for (auto iter = variable_point3D_ids.begin(); iter != variable_point3D_ids.end(); iter++){
-      point3D_t point3D_id = *iter;
-      Point3D& point3D = reconstruction_->Point3D(point3D_id);
-      point3D.IfInSphere() = true;
-      // int track_length = point3D.Track().Length();
-      // double max_search_range = options.kdtree_max_search_range - (track_length - 3) * options.search_range_drop_speed;
-      int opt_num = point3D.GlobalOptNum();
-      double max_search_range = options.kdtree_max_search_range - opt_num * options.search_range_drop_speed;
-      if (max_search_range <= options.kdtree_min_search_range) {
-        max_search_range = options.kdtree_min_search_range;
-      }
-      ba_config.SetLidarSearchRange(point3D_id, max_search_range);
-      Eigen::Vector3d pt_xyz = point3D.XYZ();
-      Eigen::Vector6d lidar_pt;
-      if (lidar_pointcloud_process_->SearchNearestNeiborByKdtree(pt_xyz,lidar_pt)) {
-        Eigen::Vector3d norm = lidar_pt.block(3,0,3,1);
-        Eigen::Vector3d l_pt = lidar_pt.block(0,0,3,1);
-        double d = 0 - l_pt.dot(norm);
-        Eigen::Vector4d plane;
-        plane << norm(0),norm(1),norm(2),d;
-
-        LidarPoint lidar_point(l_pt,plane);
-        if (std::abs(norm(1)/norm(0))>10 && std::abs(norm(1)/norm(2))>10) {
-          lidar_point.SetType(LidarPointType::IcpGround);
-          Eigen::Vector3ub color;
-          color << 255,255,0;
-          lidar_point.SetColor(color);
-        } else {
-          lidar_point.SetType(LidarPointType::Icp);
-          Eigen::Vector3ub color;
-          color << 0,0,255;
-          lidar_point.SetColor(color);
+  {
+    NonBaStageScope variable_points(
+        non_ba_profiler_, NonBaStageId::kGlobalVariablePointCollection,
+        point3d_ids.size());
+    for (image_t image_id : image_in_sphere) {
+      std::vector<class Point2D> point2Ds =
+          reconstruction_->Image(image_id).Points2D();
+      for (Point2D& point2D : point2Ds) {
+        if (!point2D.HasPoint3D()) {
+          continue;
         }
-        double dist = lidar_point.ComputePointToPointDist(pt_xyz);
-        if (dist > max_search_range) continue;
-        ba_config.AddLidarPoint(point3D_id,lidar_point);
-        reconstruction_ -> AddLidarPointInGlobal(point3D_id,lidar_point);
+        point3D_t point3d_id = point2D.GetPoint3DId();
+        auto iter = point3d_ids.find(point3d_id);
+        if (iter != point3d_ids.end()) {
+          ba_config.AddVariablePoint(point3d_id);
+          variable_point3D_ids.insert(point3d_id);
+        }
       }
     }
+    variable_points.SetOutputItems(variable_point3D_ids.size());
+  }
+
+  if (ba_options.if_add_lidar_constraint ||
+      ba_options.if_add_lidar_corresponding) {
+    NonBaStageScope lidar_preparation(
+        non_ba_profiler_, NonBaStageId::kGlobalLidarKdPreparation,
+        variable_point3D_ids.size());
+    {
+      NonBaStageScope kd_queries(
+          non_ba_profiler_, NonBaStageId::kGlobalKdQueries,
+          variable_point3D_ids.size());
+      size_t accepted_lidar_points = 0;
+      for (auto iter = variable_point3D_ids.begin();
+           iter != variable_point3D_ids.end(); iter++) {
+        point3D_t point3D_id = *iter;
+        Point3D& point3D = reconstruction_->Point3D(point3D_id);
+        point3D.IfInSphere() = true;
+        int opt_num = point3D.GlobalOptNum();
+        double max_search_range = options.kdtree_max_search_range -
+                                  opt_num * options.search_range_drop_speed;
+        if (max_search_range <= options.kdtree_min_search_range) {
+          max_search_range = options.kdtree_min_search_range;
+        }
+        ba_config.SetLidarSearchRange(point3D_id, max_search_range);
+        Eigen::Vector3d pt_xyz = point3D.XYZ();
+        Eigen::Vector6d lidar_pt;
+        if (lidar_pointcloud_process_->SearchNearestNeiborByKdtree(
+                pt_xyz, lidar_pt)) {
+          Eigen::Vector3d norm = lidar_pt.block(3,0,3,1);
+          Eigen::Vector3d l_pt = lidar_pt.block(0,0,3,1);
+          double d = 0 - l_pt.dot(norm);
+          Eigen::Vector4d plane;
+          plane << norm(0),norm(1),norm(2),d;
+
+          LidarPoint lidar_point(l_pt, plane);
+          if (std::abs(norm(1) / norm(0)) > 10 &&
+              std::abs(norm(1) / norm(2)) > 10) {
+            lidar_point.SetType(LidarPointType::IcpGround);
+            Eigen::Vector3ub color;
+            color << 255, 255, 0;
+            lidar_point.SetColor(color);
+          } else {
+            lidar_point.SetType(LidarPointType::Icp);
+            Eigen::Vector3ub color;
+            color << 0, 0, 255;
+            lidar_point.SetColor(color);
+          }
+          double dist = lidar_point.ComputePointToPointDist(pt_xyz);
+          if (dist > max_search_range) {
+            continue;
+          }
+          ba_config.AddLidarPoint(point3D_id, lidar_point);
+          reconstruction_->AddLidarPointInGlobal(point3D_id, lidar_point);
+          if (non_ba_profiler_ != nullptr) {
+            ++accepted_lidar_points;
+          }
+        }
+      }
+      kd_queries.SetOutputItems(accepted_lidar_points);
+    }
+    lidar_preparation.SetOutputItems(variable_point3D_ids.size());
   }
   
   // Run bundle adjustment.
-  BundleAdjuster bundle_adjuster(ba_options, ba_config);
-  const BundleAdjuster::OptimazePhrase phrase = BundleAdjuster::OptimazePhrase::Global;
-  if (!SolveBundleAdjustment(ba_options, ba_config, phrase,
-                             &bundle_adjuster)) {
-    return false;
+  {
+    NonBaStageScope ba_config_scope(
+        non_ba_profiler_, NonBaStageId::kGlobalBaConfig,
+        variable_point3D_ids.size());
+    BundleAdjuster bundle_adjuster(ba_options, ba_config);
+    const BundleAdjuster::OptimazePhrase phrase =
+        BundleAdjuster::OptimazePhrase::Global;
+    ba_config_scope.SetOutputItems(ba_config.NumImages() +
+                                   ba_config.NumVariablePoints());
+
+    bool solve_success = false;
+    {
+      NonBaStageScope ba_solve(
+          non_ba_profiler_, NonBaStageId::kGlobalBaSolve,
+          [this]() { return reconstruction_->ComputeNumObservations(); });
+      solve_success = SolveBundleAdjustment(
+          ba_options, ba_config, phrase, &bundle_adjuster);
+      ba_solve.SetOutputItems(
+          solve_success ? bundle_adjuster.Summary().num_residuals / 2 : 0);
+    }
+    if (!solve_success) {
+      return false;
+    }
   }
 
-  for (auto iter = variable_point3D_ids.begin(); iter != variable_point3D_ids.end(); iter++) {
-    Point3D& Point3D = reconstruction_ -> Point3D(*iter);
+  for (auto iter = variable_point3D_ids.begin();
+       iter != variable_point3D_ids.end(); iter++) {
+    Point3D& Point3D = reconstruction_->Point3D(*iter);
     Point3D.AddGlobalOptNum();
     Point3D.IfInSphere() = false;
   }

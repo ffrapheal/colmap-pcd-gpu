@@ -523,6 +523,10 @@ void OptionManager::AddMapperOptions() {
                               &mapper->ba_lidar_residual);
   AddAndRegisterDefaultOption("Mapper.ba_telemetry_path",
                               &mapper->ba_telemetry_path);
+  AddAndRegisterDefaultOption("Mapper.non_ba_profile",
+                              &mapper->non_ba_profile);
+  AddAndRegisterDefaultOption("Mapper.non_ba_profile_path",
+                              &mapper->non_ba_profile_path);
 
   AddAndRegisterDefaultOption("Mapper.first_image_fixed_frames",
                               &mapper->first_image_fixed_frames);
