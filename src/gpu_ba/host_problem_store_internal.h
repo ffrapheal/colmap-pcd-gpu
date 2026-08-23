@@ -49,6 +49,20 @@ struct HostCatalogObservation {
   std::array<double, 2> xy{{0.0, 0.0}};
 };
 
+// Full scalar projection of a committed Reconstruction catalog. It is built in
+// the ordinary C++ bridge and is safe for active_solve_view.cc/custom_cuda.cu
+// to consume without dereferencing Eigen-backed domain objects.
+struct HostIndexedCatalogData {
+  uint64_t owner_epoch = 0;
+  uint64_t revision = 0;
+  uint64_t generation = 0;
+  uint64_t resident_bytes = 0;
+  std::vector<HostCatalogCamera> cameras;
+  std::vector<HostCatalogImage> images;
+  std::vector<HostCatalogPoint> points;
+  std::vector<HostCatalogObservation> observations;
+};
+
 static_assert(std::is_standard_layout<HostCatalogCamera>::value &&
                   std::is_trivially_copyable<HostCatalogCamera>::value,
               "catalog camera bridge record must be scalar POD");
@@ -203,6 +217,11 @@ bool ApplyStructureJournalToCatalog(
     uint64_t generation,
     const std::shared_ptr<const StaticProblemDataCatalog>& base,
     std::shared_ptr<const StaticProblemDataCatalog>* output,
+    std::string* error);
+
+bool FlattenStaticProblemDataCatalog(
+    const std::shared_ptr<const StaticProblemDataCatalog>& root,
+    HostIndexedCatalogData* output,
     std::string* error);
 
 }  // namespace gpu_ba

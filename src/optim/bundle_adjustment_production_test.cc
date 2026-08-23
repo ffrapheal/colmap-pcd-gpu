@@ -875,6 +875,163 @@ BOOST_AUTO_TEST_CASE(HostPreparedStoreUnknownAndGapRebuildTransactionally) {
   problem.reconstruction.EndStructureJournal();
 }
 
+BOOST_AUTO_TEST_CASE(IndexedCatalogGapRebuildPublishesOnlyAfterCommit) {
+  FailureModeReset reset;
+  SyntheticProblem problem = MakeSyntheticProblem();
+  constexpr uint64_t kOwnerEpoch = 11009;
+  problem.reconstruction.BeginStructureJournal(kOwnerEpoch, 1);
+  gpu_ba::GpuBaHostProblemStore store(&problem.reconstruction, kOwnerEpoch);
+  gpu_ba::CudaHostStoreBinding binding;
+  binding.store = &store;
+  binding.owner_epoch = kOwnerEpoch;
+  binding.mode = gpu_ba::CudaHostProblemStoreMode::kHostPreparedStore;
+  BundleAdjustmentOptions options = CudaOptions(false);
+  options.ba_cuda_host_problem_store = "host_prepared_store";
+  options.ba_cuda_problem_source = gpu_ba::CudaProblemSource::kIndexedCatalog;
+
+  {
+    BundleAdjuster cold(options, problem.config);
+    cold.SetOptimazePhrase(BundleAdjuster::OptimazePhrase::Local);
+    cold.SetCudaHostStoreBinding(binding);
+    BOOST_REQUIRE(cold.Solve(&problem.reconstruction));
+    BOOST_CHECK_EQUAL(
+        cold.ExecutionResult().host_store_indexed_catalog_full_graph_build_calls,
+        1);
+  }
+  const uint64_t cursor_before =
+      store.LifetimeRuntimeInfo().journal_cursor_after;
+  problem.reconstruction.AddPoint3D(
+      Eigen::Vector3d(301.0, 100.0, 100.0), Track());
+  problem.reconstruction.AddPoint3D(
+      Eigen::Vector3d(302.0, 100.0, 100.0), Track());
+  BundleAdjuster::SetFailureModeForTesting(
+      BundleAdjuster::FailureModeForTesting::kCustomCudaFailure);
+  {
+    BundleAdjuster failed(options, problem.config);
+    failed.SetOptimazePhrase(BundleAdjuster::OptimazePhrase::Local);
+    failed.SetCudaHostStoreBinding(binding);
+    BOOST_CHECK(!failed.Solve(&problem.reconstruction));
+    BOOST_CHECK_EQUAL(failed.ExecutionResult().host_store_journal_gaps, 1);
+    BOOST_CHECK_EQUAL(
+        store.LifetimeRuntimeInfo().journal_cursor_after, cursor_before);
+  }
+  BundleAdjuster::SetFailureModeForTesting(
+      BundleAdjuster::FailureModeForTesting::kNone);
+  {
+    BundleAdjuster retry(options, problem.config);
+    retry.SetOptimazePhrase(BundleAdjuster::OptimazePhrase::Local);
+    retry.SetCudaHostStoreBinding(binding);
+    BOOST_REQUIRE(retry.Solve(&problem.reconstruction));
+    BOOST_CHECK_EQUAL(retry.ExecutionResult().host_store_journal_gaps, 1);
+    BOOST_CHECK_EQUAL(
+        retry.ExecutionResult().host_store_catalog_full_rebuilds, 1);
+    BOOST_CHECK_GT(store.LifetimeRuntimeInfo().journal_cursor_after,
+                   cursor_before);
+  }
+
+  std::string shutdown_error;
+  BOOST_REQUIRE(store.Shutdown(&shutdown_error));
+  problem.reconstruction.EndStructureJournal();
+}
+
+BOOST_AUTO_TEST_CASE(IndexedCatalogConsumesKnownJournalDelta) {
+  FailureModeReset reset;
+  SyntheticProblem problem = MakeSyntheticProblem();
+  constexpr uint64_t kOwnerEpoch = 11010;
+  problem.reconstruction.BeginStructureJournal(kOwnerEpoch, 32);
+  gpu_ba::GpuBaHostProblemStore store(&problem.reconstruction, kOwnerEpoch);
+  gpu_ba::CudaHostStoreBinding binding;
+  binding.store = &store;
+  binding.owner_epoch = kOwnerEpoch;
+  binding.mode = gpu_ba::CudaHostProblemStoreMode::kHostPreparedStore;
+  BundleAdjustmentOptions options = CudaOptions(false);
+  options.ba_cuda_host_problem_store = "host_prepared_store";
+  options.ba_cuda_problem_source = gpu_ba::CudaProblemSource::kIndexedCatalog;
+  {
+    BundleAdjuster cold(options, problem.config);
+    cold.SetOptimazePhrase(BundleAdjuster::OptimazePhrase::Local);
+    cold.SetCudaHostStoreBinding(binding);
+    BOOST_REQUIRE(cold.Solve(&problem.reconstruction));
+  }
+  const uint64_t cursor_before =
+      store.LifetimeRuntimeInfo().journal_cursor_after;
+  problem.reconstruction.AddPoint3D(
+      Eigen::Vector3d(401.0, 100.0, 100.0), Track());
+  {
+    BundleAdjuster delta(options, problem.config);
+    delta.SetOptimazePhrase(BundleAdjuster::OptimazePhrase::Local);
+    delta.SetCudaHostStoreBinding(binding);
+    BOOST_REQUIRE(delta.Solve(&problem.reconstruction));
+    const auto& execution = delta.ExecutionResult();
+    BOOST_CHECK_EQUAL(execution.host_store_catalog_delta_updates, 1);
+    BOOST_CHECK_EQUAL(
+        execution.host_store_indexed_catalog_journal_apply_calls, 1);
+    BOOST_CHECK_EQUAL(
+        execution.host_store_indexed_catalog_full_graph_build_calls, 0);
+    BOOST_CHECK_GT(execution.host_store_indexed_full_graph_records_scanned, 0);
+    BOOST_CHECK_GT(execution.host_store_indexed_estimated_impl_copy_bytes, 0);
+  }
+  BOOST_CHECK_GT(store.LifetimeRuntimeInfo().journal_cursor_after,
+                 cursor_before);
+
+  std::string shutdown_error;
+  BOOST_REQUIRE(store.Shutdown(&shutdown_error));
+  problem.reconstruction.EndStructureJournal();
+}
+
+BOOST_AUTO_TEST_CASE(IndexedCatalogStaleMergedPointRebuildsTransactionally) {
+  FailureModeReset reset;
+  SyntheticProblem problem = MakeSyntheticProblem();
+  constexpr uint64_t kOwnerEpoch = 11011;
+  problem.reconstruction.BeginStructureJournal(kOwnerEpoch, 32);
+  gpu_ba::GpuBaHostProblemStore store(&problem.reconstruction, kOwnerEpoch);
+  gpu_ba::CudaHostStoreBinding binding;
+  binding.store = &store;
+  binding.owner_epoch = kOwnerEpoch;
+  binding.mode = gpu_ba::CudaHostProblemStoreMode::kHostPreparedStore;
+  BundleAdjustmentOptions options = CudaOptions(false);
+  options.ba_cuda_host_problem_store = "host_prepared_store";
+  options.ba_cuda_problem_source = gpu_ba::CudaProblemSource::kIndexedCatalog;
+
+  {
+    BundleAdjuster cold(options, problem.config);
+    cold.SetOptimazePhrase(BundleAdjuster::OptimazePhrase::Local);
+    cold.SetCudaHostStoreBinding(binding);
+    BOOST_REQUIRE(cold.Solve(&problem.reconstruction));
+  }
+  const uint64_t cursor_before =
+      store.LifetimeRuntimeInfo().journal_cursor_after;
+  const point3D_t merged = problem.reconstruction.MergePoints3D(1, 2);
+  problem.reconstruction.DeletePoint3D(merged);
+
+  {
+    BundleAdjuster rebuilt(options, problem.config);
+    rebuilt.SetOptimazePhrase(BundleAdjuster::OptimazePhrase::Local);
+    rebuilt.SetCudaHostStoreBinding(binding);
+    BOOST_REQUIRE_MESSAGE(rebuilt.Solve(&problem.reconstruction),
+                          rebuilt.ExecutionResult().diagnostic_message);
+    const BundleAdjustmentExecutionResult& execution =
+        rebuilt.ExecutionResult();
+    BOOST_CHECK_EQUAL(
+        execution.host_store_indexed_catalog_journal_apply_calls, 1);
+    BOOST_CHECK_EQUAL(
+        execution.host_store_indexed_catalog_full_graph_build_calls, 1);
+    BOOST_CHECK_EQUAL(execution.host_store_catalog_delta_updates, 0);
+    BOOST_CHECK_EQUAL(execution.host_store_catalog_full_rebuilds, 1);
+    BOOST_CHECK_EQUAL(execution.host_store_fallback_rebuilds, 1);
+    BOOST_CHECK_EQUAL(execution.host_store_view_action,
+                      "indexed_catalog_full_rebuild");
+    BOOST_CHECK_EQUAL(execution.host_store_rebuild_reason,
+                      "catalog_delta_apply_failed");
+  }
+  BOOST_CHECK_GT(store.LifetimeRuntimeInfo().journal_cursor_after,
+                 cursor_before);
+
+  std::string shutdown_error;
+  BOOST_REQUIRE(store.Shutdown(&shutdown_error));
+  problem.reconstruction.EndStructureJournal();
+}
+
 BOOST_AUTO_TEST_CASE(HostPreparedStorePrecisionIdentityDoesNotLeak) {
   SyntheticProblem problem = MakeSyntheticProblem();
   constexpr uint64_t kOwnerEpoch = 11002;
@@ -889,6 +1046,7 @@ BOOST_AUTO_TEST_CASE(HostPreparedStorePrecisionIdentityDoesNotLeak) {
                                       std::string("fp64")}) {
     BundleAdjustmentOptions options = CudaOptions(false);
     options.ba_cuda_host_problem_store = "host_prepared_store";
+    options.ba_cuda_problem_source = gpu_ba::CudaProblemSource::kIndexedCatalog;
     options.ba_cuda_arithmetic_precision = precision;
     if (precision == "fp32_mixed") {
       options.ba_cuda_hessian_assembly_backend = "observation_segmented";
@@ -903,6 +1061,18 @@ BOOST_AUTO_TEST_CASE(HostPreparedStorePrecisionIdentityDoesNotLeak) {
     BOOST_CHECK_EQUAL(adjuster.ExecutionResult().arithmetic_precision_effective,
                       precision);
     BOOST_CHECK(!adjuster.ExecutionResult().fallback_used);
+    const BundleAdjustmentExecutionResult& execution =
+        adjuster.ExecutionResult();
+    BOOST_CHECK_GT(execution.indexed_device_catalog_lookup_calls, 0);
+    BOOST_CHECK_GT(execution.indexed_device_catalog_prefix_bytes, 0);
+    BOOST_CHECK_GT(execution.indexed_device_catalog_full_upload_calls +
+                       execution.indexed_device_catalog_reuse_calls,
+                   0);
+    BOOST_CHECK_EQUAL(execution.cuda_host_build_cuda_layer_a_inputs_calls, 1);
+    BOOST_CHECK_EQUAL(execution.cuda_host_build_static_layout_calls, 1);
+    BOOST_CHECK_EQUAL(execution.cuda_host_build_cost_layout_calls, 1);
+    BOOST_CHECK_EQUAL(execution.cuda_host_build_layer_b_topology_calls, 1);
+    BOOST_CHECK_EQUAL(execution.cuda_host_build_layer_c_topology_calls, 1);
   }
   std::string shutdown_error;
   BOOST_REQUIRE(store.Shutdown(&shutdown_error));

@@ -1,6 +1,7 @@
 set(FOLDER_NAME "gpu_ba")
 
 COLMAP_ADD_SOURCES(
+    active_solve_view.h active_solve_view.cc
     active_ba_solve_spec.h active_ba_solve_spec.cc
     ceres_envelope.h ceres_envelope.cc
     ceres_fidelity.h ceres_fidelity.cc
@@ -39,6 +40,14 @@ if(GPU_BA_CUDA_ENABLED)
 endif()
 
 if(GPU_BA_TESTS_ENABLED)
+    add_executable(gpu_ba_active_solve_view_test active_solve_view_test.cc)
+    set_target_properties(gpu_ba_active_solve_view_test PROPERTIES FOLDER
+        ${COLMAP_TARGETS_ROOT_FOLDER}/${FOLDER_NAME})
+    target_link_libraries(gpu_ba_active_solve_view_test colmap
+                          ${Boost_UNIT_TEST_FRAMEWORK_LIBRARY})
+    add_test("gpu_ba/gpu_ba_active_solve_view_test"
+             gpu_ba_active_solve_view_test)
+
     add_executable(gpu_ba_ceres_envelope_test ceres_envelope_test.cc)
     set_target_properties(gpu_ba_ceres_envelope_test PROPERTIES FOLDER
         ${COLMAP_TARGETS_ROOT_FOLDER}/${FOLDER_NAME})

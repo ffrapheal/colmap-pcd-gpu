@@ -185,6 +185,10 @@ bool ParseCudaProblemSource(const std::string& value,
     *source = CudaProblemSource::kActiveSpec;
     return true;
   }
+  if (value == "indexed_catalog") {
+    *source = CudaProblemSource::kIndexedCatalog;
+    return true;
+  }
   return false;
 }
 
@@ -192,6 +196,7 @@ const char* CudaProblemSourceName(const CudaProblemSource source) {
   switch (source) {
     case CudaProblemSource::kLegacySnapshot: return "legacy_snapshot";
     case CudaProblemSource::kActiveSpec: return "active_spec";
+    case CudaProblemSource::kIndexedCatalog: return "indexed_catalog";
   }
   return "invalid";
 }

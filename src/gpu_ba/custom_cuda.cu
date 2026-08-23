@@ -1,4 +1,5 @@
 #include "gpu_ba/custom_cuda.h"
+#include "gpu_ba/active_solve_view.h"
 #include "gpu_ba/host_problem_store_internal.h"
 
 #include <cuda_runtime.h>
@@ -56,6 +57,26 @@ struct CudaSolveCallCounters {
 };
 
 thread_local CudaSolveCallCounters* g_cuda_solve_call_counters = nullptr;
+thread_local uint32_t g_state_update_status_override_for_testing = 0;
+thread_local bool g_state_update_status_override_consumed = false;
+
+class ScopedStateUpdateStatusOverrideForTesting {
+ public:
+  explicit ScopedStateUpdateStatusOverrideForTesting(const uint32_t status)
+      : previous_status_(g_state_update_status_override_for_testing),
+        previous_consumed_(g_state_update_status_override_consumed) {
+    g_state_update_status_override_for_testing = status;
+    g_state_update_status_override_consumed = false;
+  }
+  ~ScopedStateUpdateStatusOverrideForTesting() {
+    g_state_update_status_override_for_testing = previous_status_;
+    g_state_update_status_override_consumed = previous_consumed_;
+  }
+
+ private:
+  uint32_t previous_status_ = 0;
+  bool previous_consumed_ = false;
+};
 
 uint64_t SaturatingAdd(uint64_t lhs, uint64_t rhs);
 
@@ -888,6 +909,9 @@ struct CudaRuntimePoolEntry {
   cublasHandle_t blas = nullptr;
   void* arena = nullptr;
   uint64_t arena_capacity = 0;
+  uint64_t context_incarnation = 0;
+  uint64_t arena_generation = 0;
+  PersistentDeviceCatalogState persistent_device_catalog;
   uint64_t lease_generation = 0;
   bool retainable = false;
   bool externally_cleared = false;
@@ -916,6 +940,7 @@ std::set<int> g_cuda_runtime_pool_poisoned_devices;
 std::set<int> g_cuda_runtime_pool_clearing_devices;
 std::map<int, uint64_t> g_cuda_runtime_pool_active_by_device;
 std::atomic<uint64_t> g_cuda_runtime_pool_next_lease_generation{0};
+uint64_t g_cuda_runtime_pool_next_context_incarnation = 0;
 
 bool RegisterPoolResource(const uintptr_t handle,
                           const CudaTeardownType type,
@@ -926,6 +951,7 @@ bool RegisterPoolResource(const uintptr_t handle,
 
 bool DestroyRuntimePoolEntry(CudaRuntimePoolEntry* entry) noexcept {
   if (entry == nullptr || entry->externally_cleared) return true;
+  entry->persistent_device_catalog.Invalidate();
   if (entry->device >= 0 &&
       CleanupCudaSetDevice(entry->device) != cudaSuccess) {
     return false;
@@ -967,8 +993,17 @@ bool CreateRuntimePoolEntry(const int device,
                             CudaRuntimePoolEntry* entry,
                             std::string* error) {
   if (entry == nullptr || error == nullptr) return false;
+  if (g_cuda_runtime_pool_next_context_incarnation ==
+      std::numeric_limits<uint64_t>::max()) {
+    *error = "RuntimePool CUDA context incarnation exhausted";
+    return false;
+  }
   entry->device = device;
   entry->retainable = retainable;
+  entry->context_incarnation =
+      ++g_cuda_runtime_pool_next_context_incarnation;
+  entry->arena_generation = 0;
+  entry->persistent_device_catalog.Invalidate();
   if (cudaSetDevice(device) != cudaSuccess ||
       !CurrentCudaCacheKey(&entry->key) || !entry->key.valid ||
       entry->key.device != device) {
@@ -1086,6 +1121,10 @@ bool EnsureRuntimePoolArena(CudaRuntimePoolLease* lease,
   }
   const uint64_t capacity =
       ((required + kArenaQuantum - 1) / kArenaQuantum) * kArenaQuantum;
+  if (entry.arena_generation == std::numeric_limits<uint64_t>::max()) {
+    *error = "RuntimePool arena generation exhausted";
+    return false;
+  }
   size_t free_bytes = 0;
   size_t total_bytes = 0;
   if (cudaMemGetInfo(&free_bytes, &total_bytes) != cudaSuccess ||
@@ -1108,8 +1147,12 @@ bool EnsureRuntimePoolArena(CudaRuntimePoolLease* lease,
   }
   void* previous = entry.arena;
   const uint64_t previous_capacity = entry.arena_capacity;
+  const bool invalidated_catalog = entry.persistent_device_catalog.valid();
   entry.arena = replacement;
   entry.arena_capacity = capacity;
+  ++entry.arena_generation;
+  entry.persistent_device_catalog.Invalidate();
+  if (invalidated_catalog) ++runtime->indexed_device_catalog_invalidations;
   ++runtime->arena_grow_calls;
   runtime->arena_grow_bytes = SaturatingAdd(runtime->arena_grow_bytes,
                                              capacity);
@@ -1123,6 +1166,166 @@ bool EnsureRuntimePoolArena(CudaRuntimePoolLease* lease,
   (void)previous_capacity;
   runtime->arena_capacity_bytes = capacity;
   runtime->arena_retained_bytes = capacity;
+  return true;
+}
+
+struct IndexedDeviceCatalogView {
+  const MapperCatalogCameraSlot* cameras = nullptr;
+  const MapperCatalogImageSlot* images = nullptr;
+  const MapperCatalogPointSlot* points = nullptr;
+  const MapperCatalogObservationSlot* observations = nullptr;
+  const MapperCatalogIncidenceSlot* image_incidences = nullptr;
+  const MapperCatalogIncidenceSlot* point_incidences = nullptr;
+  uint32_t camera_count = 0;
+  uint32_t image_count = 0;
+  uint32_t point_count = 0;
+  uint32_t observation_count = 0;
+  uint32_t image_incidence_count = 0;
+  uint32_t point_incidence_count = 0;
+  DeviceCatalogPhysicalIdentity identity;
+};
+
+bool SameDeviceCatalogLayout(const DeviceCatalogLayout& lhs,
+                             const DeviceCatalogLayout& rhs) noexcept {
+  const auto same = [](const DeviceCatalogSlice& a,
+                       const DeviceCatalogSlice& b) {
+    return a.offset == b.offset && a.bytes == b.bytes &&
+           a.elements == b.elements;
+  };
+  return lhs.alignment == rhs.alignment && lhs.begin == rhs.begin &&
+         lhs.end == rhs.end && same(lhs.cameras, rhs.cameras) &&
+         same(lhs.images, rhs.images) && same(lhs.points, rhs.points) &&
+         same(lhs.observations, rhs.observations) &&
+         same(lhs.image_incidences, rhs.image_incidences) &&
+         same(lhs.point_incidences, rhs.point_incidences);
+}
+
+template <typename T>
+bool UploadRuntimePoolCatalogVector(
+    CudaRuntimePoolEntry* entry,
+    const DeviceCatalogSlice& slice,
+    const std::vector<T>& source,
+    CudaPersistentDeviceRuntimeInfo* runtime,
+    std::string* error) {
+  if (slice.elements != source.size() ||
+      slice.bytes != source.size() * sizeof(T) ||
+      slice.offset > entry->arena_capacity ||
+      slice.bytes > entry->arena_capacity - slice.offset) {
+    *error = "indexed device catalog slice identity is invalid";
+    return false;
+  }
+  if (source.empty()) return true;
+  void* destination = static_cast<void*>(
+      static_cast<uint8_t*>(entry->arena) + slice.offset);
+  const cudaError_t status = cudaMemcpyAsync(
+      destination, source.data(), slice.bytes, cudaMemcpyHostToDevice,
+      entry->stream);
+  if (status != cudaSuccess) {
+    *error = std::string("indexed device catalog upload failed: ") +
+             CudaErrorText(status);
+    return false;
+  }
+  runtime->indexed_device_catalog_full_upload_bytes = SaturatingAdd(
+      runtime->indexed_device_catalog_full_upload_bytes, slice.bytes);
+  return true;
+}
+
+bool BindRuntimePoolIndexedCatalog(
+    CudaRuntimePoolLease* lease,
+    const MapperStaticCatalogStableTables& tables,
+    const DeviceCatalogLayout& layout,
+    CudaPersistentDeviceRuntimeInfo* runtime,
+    IndexedDeviceCatalogView* view,
+    std::string* error) {
+  if (lease == nullptr || lease->entry == nullptr || runtime == nullptr ||
+      view == nullptr || error == nullptr || tables.owner_epoch == 0 ||
+      tables.catalog_generation == 0) {
+    if (error != nullptr) *error = "indexed device catalog bind is invalid";
+    return false;
+  }
+  CudaRuntimePoolEntry& entry = *lease->entry;
+  ++runtime->indexed_device_catalog_lookup_calls;
+  DeviceCatalogPhysicalIdentity identity;
+  identity.device_ordinal = entry.device;
+  identity.context_incarnation = entry.context_incarnation;
+  identity.owner_epoch = tables.owner_epoch;
+  identity.catalog_revision = tables.catalog_revision;
+  identity.catalog_generation = tables.catalog_generation;
+  identity.arena_generation = entry.arena_generation;
+  if (!identity.valid() || layout.end > entry.arena_capacity ||
+      layout.end == 0) {
+    *error = "indexed device catalog physical identity is invalid";
+    return false;
+  }
+
+  bool reused = entry.persistent_device_catalog.CanReuse(identity);
+  if (!reused &&
+      entry.persistent_device_catalog.CanReuseStorage(identity) &&
+      SameDeviceCatalogLayout(entry.persistent_device_catalog.layout(),
+                              layout)) {
+    if (!entry.persistent_device_catalog.Publish(identity, layout, error)) {
+      return false;
+    }
+    reused = true;
+    ++runtime->indexed_device_catalog_revision_rebinds;
+  }
+  if (!reused) {
+    const bool uploaded =
+        UploadRuntimePoolCatalogVector(&entry, layout.cameras, tables.cameras,
+                                       runtime, error) &&
+        UploadRuntimePoolCatalogVector(&entry, layout.images, tables.images,
+                                       runtime, error) &&
+        UploadRuntimePoolCatalogVector(&entry, layout.points, tables.points,
+                                       runtime, error) &&
+        UploadRuntimePoolCatalogVector(&entry, layout.observations,
+                                       tables.observations, runtime, error) &&
+        UploadRuntimePoolCatalogVector(&entry, layout.image_incidences,
+                                       tables.image_incidences, runtime,
+                                       error) &&
+        UploadRuntimePoolCatalogVector(&entry, layout.point_incidences,
+                                       tables.point_incidences, runtime,
+                                       error);
+    if (!uploaded ||
+        !entry.persistent_device_catalog.Publish(identity, layout, error)) {
+      entry.persistent_device_catalog.Invalidate();
+      ++runtime->indexed_device_catalog_invalidations;
+      return false;
+    }
+    ++runtime->indexed_device_catalog_full_upload_calls;
+  } else {
+    ++runtime->indexed_device_catalog_reuse_calls;
+  }
+
+  const uint8_t* base = static_cast<const uint8_t*>(entry.arena);
+  const auto pointer = [base](const DeviceCatalogSlice& slice) {
+    return base + slice.offset;
+  };
+  view->cameras = reinterpret_cast<const MapperCatalogCameraSlot*>(
+      pointer(layout.cameras));
+  view->images = reinterpret_cast<const MapperCatalogImageSlot*>(
+      pointer(layout.images));
+  view->points = reinterpret_cast<const MapperCatalogPointSlot*>(
+      pointer(layout.points));
+  view->observations = reinterpret_cast<const MapperCatalogObservationSlot*>(
+      pointer(layout.observations));
+  view->image_incidences =
+      reinterpret_cast<const MapperCatalogIncidenceSlot*>(
+          pointer(layout.image_incidences));
+  view->point_incidences =
+      reinterpret_cast<const MapperCatalogIncidenceSlot*>(
+          pointer(layout.point_incidences));
+  view->camera_count = static_cast<uint32_t>(tables.cameras.size());
+  view->image_count = static_cast<uint32_t>(tables.images.size());
+  view->point_count = static_cast<uint32_t>(tables.points.size());
+  view->observation_count =
+      static_cast<uint32_t>(tables.observations.size());
+  view->image_incidence_count =
+      static_cast<uint32_t>(tables.image_incidences.size());
+  view->point_incidence_count =
+      static_cast<uint32_t>(tables.point_incidences.size());
+  view->identity = identity;
+  runtime->indexed_device_catalog_prefix_bytes = layout.end;
+  runtime->indexed_device_catalog_arena_generation = entry.arena_generation;
   return true;
 }
 
@@ -4380,6 +4583,12 @@ __global__ void UpdatePointEntityStateKernel(
     finite = finite && DeviceFinite(output.xyz[i]);
   if (!finite) atomicOr(status, 8u);
   trial[index] = output;
+}
+
+__global__ void InjectStateUpdateStatusForTestingKernel(
+    uint32_t* status, const uint32_t injected_status) {
+  if (blockIdx.x == 0 && threadIdx.x == 0)
+    atomicOr(status, injected_status);
 }
 
 __global__ void GatherVariablePoseStateKernel(
@@ -8958,6 +9167,7 @@ class GpuBaDeviceContext {
                   CudaArithmeticPrecision arithmetic_precision,
                   CudaExecutionProfile execution_profile,
                   bool audit_mirror_enabled,
+                  const MapperStaticCatalogStableTables* indexed_catalog,
                   CudaFullLmRuntimeInfo* runtime,
                   std::string* error);
   bool FinalizeConfig(uint64_t config_generation, std::string* error) noexcept;
@@ -9210,6 +9420,9 @@ class GpuBaDeviceContext {
   CudaRuntimePoolLease runtime_pool_lease_;
   uint64_t arena_offset_ = 0;
   bool arena_planning_ = false;
+  bool indexed_catalog_bound_ = false;
+  DeviceCatalogLayout indexed_catalog_layout_;
+  IndexedDeviceCatalogView indexed_catalog_view_;
   cudaStream_t stream_ = nullptr;
   std::array<cudaEvent_t, 20> events_{};
   cusolverDnHandle_t solver_ = nullptr;
@@ -9459,6 +9672,45 @@ class GpuBaSolveContext {
     arithmetic_precision_ = precision;
   }
 
+  bool SetIndexedCatalogForSolve(
+      const MapperStaticCatalogStableTables* tables,
+      const IndexedActiveSolveDescriptor* descriptor,
+      const CudaArithmeticPrecision arithmetic_precision,
+      const CudaHessianAssemblyBackend hessian_backend,
+      const CudaSchurContributionBackend schur_backend,
+      const CudaHotKernelMode hot_kernel,
+      const CudaExecutionProfile execution_profile,
+      const CudaLossMode loss_mode,
+      const double loss_scale,
+      std::string* error) noexcept {
+    if ((tables == nullptr) != (descriptor == nullptr)) {
+      if (error != nullptr)
+        *error = "indexed catalog and active descriptor must be bound together";
+      return false;
+    }
+    if (tables != nullptr) {
+      IndexedActiveSolveConfig expected = descriptor->config;
+      expected.effective_config_resolved = true;
+      expected.arithmetic_precision = arithmetic_precision;
+      expected.hessian_backend = hessian_backend;
+      expected.schur_backend = schur_backend;
+      expected.hot_kernel = hot_kernel;
+      expected.execution_profile = execution_profile;
+      expected.loss_mode = loss_mode;
+      expected.loss_scale = loss_scale;
+      if (arithmetic_precision != arithmetic_precision_ ||
+          !ValidateIndexedCatalogSolveBinding(
+              *tables, *descriptor, expected, error)) {
+        if (error != nullptr && error->empty())
+          *error = "indexed catalog arithmetic precision mismatch";
+        return false;
+      }
+    }
+    indexed_catalog_tables_ = tables;
+    indexed_active_solve_ = descriptor;
+    return true;
+  }
+
   bool MoveHostPreparationTo(PreparedHostSolveViewData* output,
                              std::string* error) {
     if (output == nullptr || error == nullptr || !initialized_ ||
@@ -9599,7 +9851,8 @@ class GpuBaSolveContext {
               backend_ == CudaDeviceContextBackend::kDeviceControl,
               hot_kernel_implementation, hessian_assembly_backend,
               schur_contribution_backend, arithmetic_precision_,
-              execution_profile, audit_mirror_enabled_, audit_runtime_, error)) {
+              execution_profile, audit_mirror_enabled_,
+              indexed_catalog_tables_, audit_runtime_, error)) {
         device_context_.reset();
         return false;
       }
@@ -9664,14 +9917,26 @@ class GpuBaSolveContext {
       audit_runtime_->persistent_device.unified_problem_builder_traversals =
           require_layer_c ? 6 : 5;
     }
+    if (audit_runtime_ != nullptr)
+      ++audit_runtime_->persistent_device.host_build_cuda_layer_a_inputs_calls;
     if (!BuildCudaLayerAInputs(snapshot, residual_order_,
                                &packed_state_.visual, &packed_state_.lidar,
-                               error) ||
-        !BuildStaticLayout(snapshot, error) ||
-        !BuildCostLayout(snapshot, residual_order_, packed_state_.visual,
+                               error)) {
+      return false;
+    }
+    if (audit_runtime_ != nullptr)
+      ++audit_runtime_->persistent_device.host_build_static_layout_calls;
+    if (!BuildStaticLayout(snapshot, error)) return false;
+    if (audit_runtime_ != nullptr)
+      ++audit_runtime_->persistent_device.host_build_cost_layout_calls;
+    if (!BuildCostLayout(snapshot, residual_order_, packed_state_.visual,
                          packed_state_.lidar, visual_output_indices_,
-                         lidar_output_indices_, &cost_layout_, error) ||
-        !BuildLayerBTopology(snapshot, packed_state_.visual,
+                         lidar_output_indices_, &cost_layout_, error)) {
+      return false;
+    }
+    if (audit_runtime_ != nullptr)
+      ++audit_runtime_->persistent_device.host_build_layer_b_topology_calls;
+    if (!BuildLayerBTopology(snapshot, packed_state_.visual,
                              packed_state_.lidar, cost_layout_, image_indices_,
                              point_indices_, &layer_b_topology_, error)) {
       return false;
@@ -9704,6 +9969,8 @@ class GpuBaSolveContext {
       ++g_cuda_timing_sink->cache_lookup_count;
     }
     if (require_layer_c) {
+      if (audit_runtime_ != nullptr)
+        ++audit_runtime_->persistent_device.host_build_layer_c_topology_calls;
       if (!BuildLayerCTopology(layer_b_topology_, pair_chunk_limit_bytes,
                                &layer_c_topology_, error))
         return false;
@@ -9784,6 +10051,7 @@ class GpuBaSolveContext {
               arithmetic_precision_,
               execution_profile,
               audit_mirror_enabled_,
+              indexed_catalog_tables_,
               audit_runtime_, error)) {
         device_context_.reset();
         return false;
@@ -10340,6 +10608,8 @@ class GpuBaSolveContext {
   CudaExecutionProfile execution_profile_ = CudaExecutionProfile::kBaseline;
   CudaArithmeticPrecision arithmetic_precision_ =
       CudaArithmeticPrecision::kFp64;
+  const MapperStaticCatalogStableTables* indexed_catalog_tables_ = nullptr;
+  const IndexedActiveSolveDescriptor* indexed_active_solve_ = nullptr;
   bool audit_mirror_enabled_ = false;
   CudaFullLmRuntimeInfo* audit_runtime_ = nullptr;
   // Non-owning immutable borrow. PreparedHostSolveView owns the shared data
@@ -10581,6 +10851,7 @@ bool GpuBaDeviceContext::Initialize(
     const CudaArithmeticPrecision arithmetic_precision,
     const CudaExecutionProfile execution_profile,
     const bool audit_mirror_enabled,
+    const MapperStaticCatalogStableTables* indexed_catalog,
     CudaFullLmRuntimeInfo* runtime,
     std::string* error) {
   if (initialized_ || initializing_ || runtime == nullptr || error == nullptr) {
@@ -10604,6 +10875,33 @@ bool GpuBaDeviceContext::Initialize(
       execution_profile_, CudaExecutionProfile::kCompactLayerA);
   compact_control_enabled_ = device_control_enabled_ && ProfileAtLeast(
       execution_profile_, CudaExecutionProfile::kCompactControl);
+  const auto fits_uint32 = [](const size_t count) {
+    return count <= std::numeric_limits<uint32_t>::max();
+  };
+  if (indexed_catalog != nullptr &&
+      (!runtime_pool_enabled_ || !arena_enabled_ ||
+       indexed_catalog->owner_epoch == 0 ||
+       indexed_catalog->catalog_generation == 0 ||
+       indexed_catalog->abi_version != kMapperStaticCatalogAbiVersion ||
+       !fits_uint32(indexed_catalog->cameras.size()) ||
+       !fits_uint32(indexed_catalog->images.size()) ||
+       !fits_uint32(indexed_catalog->points.size()) ||
+       !fits_uint32(indexed_catalog->observations.size()) ||
+       !fits_uint32(indexed_catalog->image_incidences.size()) ||
+       !fits_uint32(indexed_catalog->point_incidences.size()))) {
+    *error = "indexed device catalog requires a bounded RuntimePool arena";
+    initializing_ = false;
+    return false;
+  }
+  if (indexed_catalog != nullptr) {
+    DeviceCatalogLayoutSpec catalog_spec;
+    if (!PlanPersistentDeviceCatalogLayout(
+            *indexed_catalog, catalog_spec, &indexed_catalog_layout_, error)) {
+      initializing_ = false;
+      return false;
+    }
+    indexed_catalog_bound_ = true;
+  }
   audit_mirror_enabled_ = audit_mirror_enabled;
   hot_kernel_implementation_ = hot_kernel_implementation;
   hessian_assembly_backend_ = hessian_assembly_backend;
@@ -10830,6 +11128,10 @@ bool GpuBaDeviceContext::Initialize(
       return false;
     }
     CudaRuntimePoolEntry& pooled = *runtime_pool_lease_.entry;
+    if (!indexed_catalog_bound_ && pooled.persistent_device_catalog.valid()) {
+      pooled.persistent_device_catalog.Invalidate();
+      ++runtime_->persistent_device.indexed_device_catalog_invalidations;
+    }
     stream_ = pooled.stream;
     events_ = pooled.events;
     solver_ = pooled.solver;
@@ -11157,8 +11459,11 @@ bool GpuBaDeviceContext::Initialize(
   int workspace_count = 0;
   bool allocated = false;
   if (arena_enabled_) {
+    const uint64_t initial_arena_requirement = indexed_catalog_bound_
+        ? std::max<uint64_t>(256, indexed_catalog_layout_.end) : 256;
     if (runtime_pool_lease_.entry == nullptr ||
-        !EnsureRuntimePoolArena(&runtime_pool_lease_, 256,
+        !EnsureRuntimePoolArena(&runtime_pool_lease_,
+                                initial_arena_requirement,
                                 &runtime_->persistent_device, error)) {
       initializing_ = false;
       Close(nullptr);
@@ -11177,7 +11482,8 @@ bool GpuBaDeviceContext::Initialize(
     }
     workspace_count_ = static_cast<size_t>(workspace_count);
     arena_planning_ = true;
-    arena_offset_ = 0;
+    arena_offset_ =
+        indexed_catalog_bound_ ? indexed_catalog_layout_.end : 0;
     allocated = allocate_main() && allocate_transformed() &&
         AllocatePersistent(&d_workspace_, workspace_count_, error);
     const uint64_t required_arena_bytes = arena_offset_;
@@ -11193,7 +11499,8 @@ bool GpuBaDeviceContext::Initialize(
       Close(nullptr);
       return false;
     }
-    arena_offset_ = 0;
+    arena_offset_ =
+        indexed_catalog_bound_ ? indexed_catalog_layout_.end : 0;
     allocated = allocate_main() && allocate_transformed() &&
         AllocatePersistent(&d_workspace_, workspace_count_, error);
   } else {
@@ -11247,6 +11554,14 @@ bool GpuBaDeviceContext::Initialize(
     Close(nullptr);
     return false;
   }
+  if (indexed_catalog_bound_ &&
+      !BindRuntimePoolIndexedCatalog(
+          &runtime_pool_lease_, *indexed_catalog, indexed_catalog_layout_,
+          &runtime_->persistent_device, &indexed_catalog_view_, error)) {
+    initializing_ = false;
+    Close(nullptr);
+    return false;
+  }
   if (arena_enabled_) {
     runtime_->persistent_device.initialization_allocation_calls =
         runtime_->persistent_device.arena_grow_calls;
@@ -11259,6 +11574,13 @@ bool GpuBaDeviceContext::Initialize(
     runtime_->persistent_device.peak_resident_bytes = std::max(
         runtime_->persistent_device.peak_resident_bytes,
         runtime_pool_lease_.entry->arena_capacity);
+    if (indexed_catalog_bound_) {
+      runtime_->persistent_device.arena_slice_count = SaturatingAdd(
+          runtime_->persistent_device.arena_slice_count, 6);
+      runtime_->persistent_device.arena_slice_bytes = SaturatingAdd(
+          runtime_->persistent_device.arena_slice_bytes,
+          indexed_catalog_layout_.end);
+    }
   }
   runtime_->persistent_device.compact_visual_record_bytes =
       sizeof(CudaCompactVisualOutput);
@@ -13653,6 +13975,12 @@ bool GpuBaDeviceContext::BuildDeviceTrialState(
         current.points, d_point_update_meta_, d_point_delta_,
         trial_slot.points, d_state_update_status_, point_entity_count_);
   }
+  if (g_state_update_status_override_for_testing != 0 &&
+      !g_state_update_status_override_consumed) {
+    InjectStateUpdateStatusForTestingKernel<<<1, 1, 0, stream_>>>(
+        d_state_update_status_, g_state_update_status_override_for_testing);
+    g_state_update_status_override_consumed = true;
+  }
   status = cudaGetLastError();
   if (status != cudaSuccess) {
     InvalidateStateSlot(trial_state_slot_);
@@ -13701,7 +14029,13 @@ bool GpuBaDeviceContext::BuildDeviceTrialState(
   }
   if (host_status != 0) {
     InvalidateStateSlot(trial_state_slot_);
-    *error = "device-state update produced an invalid mapping or nonfinite state";
+    if ((host_status & 3u) != 0 || (host_status & ~15u) != 0) {
+      *error = "device-state update produced an invalid mapping (status=" +
+               std::to_string(host_status) + ")";
+    } else {
+      *error = "device-state update produced a nonfinite trial state "
+               "(status=" + std::to_string(host_status) + ")";
+    }
     return false;
   }
   if (!materialize_host_state) return true;
@@ -14818,6 +15152,11 @@ bool IsRecoverableFactorizationFailure(const std::string& error) {
              std::string::npos;
 }
 
+bool IsRecoverableNonfiniteTrialState(const std::string& error) {
+  return error.find("device-state update produced a nonfinite trial state") !=
+         std::string::npos;
+}
+
 void AccumulateLayerBRuntime(const CudaLayerBResult& layer_b,
                              CudaFullLmRuntimeInfo* total) {
   total->layer_a_kernel_milliseconds +=
@@ -15690,6 +16029,15 @@ void AccumulateHostStoreRuntime(const CudaHostProblemStoreRuntimeInfo& value,
   ADD_COUNTER(schur_topology_builder_calls);
   ADD_COUNTER(schur_segment_plan_builder_calls);
   ADD_COUNTER(dynamic_state_refresh_calls);
+  ADD_COUNTER(indexed_catalog_full_graph_build_calls);
+  ADD_COUNTER(indexed_catalog_journal_apply_calls);
+  ADD_COUNTER(indexed_catalog_flatten_calls);
+  ADD_COUNTER(indexed_catalog_reconcile_calls);
+  ADD_COUNTER(indexed_catalog_export_calls);
+  ADD_COUNTER(indexed_active_materializer_calls);
+  ADD_COUNTER(indexed_full_graph_records_scanned);
+  ADD_COUNTER(indexed_estimated_impl_copy_bytes);
+  ADD_COUNTER(indexed_estimated_export_bytes);
   ADD_COUNTER(evictions);
   ADD_COUNTER(invalidations);
   ADD_COUNTER(owner_identity_violations);
@@ -15726,7 +16074,9 @@ struct GpuBaHostProblemStoreControl {
   const Reconstruction* reconstruction = nullptr;
   uint64_t owner_epoch = 0;
   uint64_t journal_cursor = 0;
+  uint64_t indexed_journal_cursor = 0;
   uint64_t catalog_generation = 0;
+  uint64_t indexed_catalog_generation = 0;
   uint64_t next_view_generation = 0;
   uint64_t next_config_generation = 0;
   uint64_t next_lease_generation = 0;
@@ -15739,7 +16089,21 @@ struct GpuBaHostProblemStoreControl {
   std::unordered_map<uint64_t,
                      std::shared_ptr<const PreparedHostSolveViewData>> views;
   std::deque<uint64_t> lru;
+  std::shared_ptr<const StaticProblemDataCatalog> indexed_catalog_root;
+  std::shared_ptr<MapperStaticProblemDataCatalog> indexed_catalog;
+  std::shared_ptr<MapperStaticCatalogStableTables> indexed_catalog_tables;
+  IndexedActiveSolveMaterializer indexed_materializer;
   CudaHostProblemStoreRuntimeInfo lifetime;
+};
+
+struct PreparedIndexedCatalogPublication {
+  std::shared_ptr<const StaticProblemDataCatalog> root;
+  std::shared_ptr<MapperStaticProblemDataCatalog> catalog;
+  std::shared_ptr<MapperStaticCatalogStableTables> tables;
+  uint64_t journal_cursor = 0;
+  uint64_t root_generation = 0;
+  uint64_t resident_bytes = 0;
+  uint64_t peak_bytes = 0;
 };
 
 struct PreparedHostStorePublication {
@@ -15884,6 +16248,9 @@ bool PreparedHostSolveView::Complete(const bool publish,
     store.views.clear();
     store.lru.clear();
     store.catalog.reset();
+    store.indexed_catalog_root.reset();
+    store.indexed_catalog_tables.reset();
+    store.indexed_catalog.reset();
     store.catalog_valid = false;
     store.shutdown = true;
     store.lifetime.host_resident_bytes = 0;
@@ -15895,6 +16262,152 @@ bool PreparedHostSolveView::Complete(const bool publish,
   return true;
 }
 
+PreparedIndexedActiveSolve::PreparedIndexedActiveSolve() = default;
+
+PreparedIndexedActiveSolve::~PreparedIndexedActiveSolve() {
+  CancelIfActive();
+}
+
+PreparedIndexedActiveSolve::PreparedIndexedActiveSolve(
+    PreparedIndexedActiveSolve&& other) noexcept {
+  *this = std::move(other);
+}
+
+PreparedIndexedActiveSolve& PreparedIndexedActiveSolve::operator=(
+    PreparedIndexedActiveSolve&& other) noexcept {
+  if (this == &other) return *this;
+  CancelIfActive();
+  descriptor_ = std::move(other.descriptor_);
+  catalog_tables_ = std::move(other.catalog_tables_);
+  control_ = std::move(other.control_);
+  publication_ = std::move(other.publication_);
+  lease_generation_ = other.lease_generation_;
+  owner_epoch_ = other.owner_epoch_;
+  active_ = other.active_;
+  runtime_ = std::move(other.runtime_);
+  other.active_ = false;
+  return *this;
+}
+
+bool PreparedIndexedActiveSolve::valid() const noexcept {
+  return active_ && descriptor_ != nullptr && catalog_tables_ != nullptr &&
+         control_ != nullptr && publication_ != nullptr;
+}
+
+const IndexedActiveSolveDescriptor*
+PreparedIndexedActiveSolve::descriptor() const noexcept {
+  return valid() ? descriptor_.get() : nullptr;
+}
+
+const MapperStaticCatalogStableTables*
+PreparedIndexedActiveSolve::catalog_tables() const noexcept {
+  return valid() ? catalog_tables_.get() : nullptr;
+}
+
+const CudaHostProblemStoreRuntimeInfo&
+PreparedIndexedActiveSolve::runtime_info() const noexcept {
+  return runtime_;
+}
+
+void PreparedIndexedActiveSolve::CancelIfActive() noexcept {
+  if (!active_ || control_ == nullptr) return;
+  GpuBaHostProblemStoreControl& store = *control_;
+  if (store.active &&
+      store.active_lease_generation == lease_generation_) {
+    runtime_.journal_cursor_after = store.indexed_journal_cursor;
+    runtime_.catalog_generation = store.indexed_catalog == nullptr
+        ? 0 : store.indexed_catalog->generation();
+    runtime_.host_catalog_valid = store.indexed_catalog != nullptr;
+    runtime_.host_resident_bytes = store.lifetime.host_resident_bytes;
+    AccumulateHostStoreRuntime(runtime_, &store.lifetime);
+    store.active = false;
+    store.active_lease_generation = 0;
+  }
+  if (store.shutdown_requested) {
+    store.views.clear();
+    store.lru.clear();
+    store.catalog.reset();
+    store.indexed_catalog_root.reset();
+    store.indexed_catalog_tables.reset();
+    store.indexed_catalog.reset();
+    store.catalog_valid = false;
+    store.shutdown = true;
+    store.lifetime.host_resident_bytes = 0;
+  }
+  active_ = false;
+  descriptor_.reset();
+  catalog_tables_.reset();
+  publication_.reset();
+  control_.reset();
+}
+
+bool PreparedIndexedActiveSolve::Complete(
+    const bool publish,
+    const bool device_cleanup_failed,
+    std::string* error) noexcept {
+  if (error == nullptr) return false;
+  error->clear();
+  if (!active_ || control_ == nullptr) return true;
+  GpuBaHostProblemStoreControl& store = *control_;
+  if (!store.active || store.active_lease_generation != lease_generation_ ||
+      store.owner_epoch != owner_epoch_) {
+    *error = "indexed catalog lease identity mismatch";
+    ++store.lifetime.owner_identity_violations;
+    CancelIfActive();
+    return false;
+  }
+  if (device_cleanup_failed) {
+    ++store.lifetime.device_cleanup_failures_observed;
+    store.lifetime.device_poisoned = true;
+  }
+  if (publish) {
+    if (publication_ == nullptr || publication_->root == nullptr ||
+        publication_->catalog == nullptr || publication_->tables == nullptr) {
+      *error = "indexed catalog publication is incomplete";
+      ++store.lifetime.coverage_violations;
+      CancelIfActive();
+      return false;
+    }
+    store.indexed_catalog_root = publication_->root;
+    store.indexed_catalog = publication_->catalog;
+    store.indexed_catalog_tables = publication_->tables;
+    store.indexed_journal_cursor = publication_->journal_cursor;
+    store.indexed_catalog_generation = publication_->root_generation;
+    runtime_.journal_cursor_after = store.indexed_journal_cursor;
+    runtime_.catalog_generation = store.indexed_catalog->generation();
+    runtime_.host_resident_bytes = publication_->resident_bytes;
+    runtime_.host_peak_bytes = std::max(store.lifetime.host_peak_bytes,
+                                        publication_->peak_bytes);
+    runtime_.host_catalog_valid = true;
+  } else {
+    runtime_.journal_cursor_after = store.indexed_journal_cursor;
+    runtime_.catalog_generation = store.indexed_catalog == nullptr
+        ? 0 : store.indexed_catalog->generation();
+    runtime_.host_resident_bytes = store.lifetime.host_resident_bytes;
+    runtime_.host_catalog_valid = store.indexed_catalog != nullptr;
+  }
+  AccumulateHostStoreRuntime(runtime_, &store.lifetime);
+  store.active = false;
+  store.active_lease_generation = 0;
+  if (store.shutdown_requested) {
+    store.views.clear();
+    store.lru.clear();
+    store.catalog.reset();
+    store.indexed_catalog_root.reset();
+    store.indexed_catalog_tables.reset();
+    store.indexed_catalog.reset();
+    store.catalog_valid = false;
+    store.shutdown = true;
+    store.lifetime.host_resident_bytes = 0;
+  }
+  active_ = false;
+  descriptor_.reset();
+  catalog_tables_.reset();
+  publication_.reset();
+  control_.reset();
+  return true;
+}
+
 GpuBaHostProblemStore::GpuBaHostProblemStore(
     const Reconstruction* reconstruction, const uint64_t owner_epoch)
     : control_(std::make_shared<GpuBaHostProblemStoreControl>()) {
@@ -15903,6 +16416,7 @@ GpuBaHostProblemStore::GpuBaHostProblemStore(
   control_->journal_cursor = reconstruction == nullptr
       ? 0
       : HostReconstructionStructureRevision(reconstruction);
+  control_->indexed_journal_cursor = control_->journal_cursor;
   control_->lifetime.owner_epoch = owner_epoch;
 }
 
@@ -15929,6 +16443,9 @@ bool GpuBaHostProblemStore::Shutdown(std::string* error) noexcept {
   control_->views.clear();
   control_->lru.clear();
   control_->catalog.reset();
+  control_->indexed_catalog_root.reset();
+  control_->indexed_catalog_tables.reset();
+  control_->indexed_catalog.reset();
   control_->catalog_valid = false;
   control_->shutdown = true;
   control_->lifetime.host_resident_bytes = 0;
@@ -16026,6 +16543,402 @@ void SetCudaHostProblemStoreLookupHashForTesting(
     const uint64_t value) noexcept {
   g_host_store_lookup_hash_for_testing.store(value,
                                               std::memory_order_relaxed);
+}
+
+bool PrepareCudaIndexedActiveSolve(
+    const CudaSolveProblem& problem,
+    const CudaFullLmOptions& options,
+    const CudaHostStoreBinding& binding,
+    PreparedIndexedActiveSolve* prepared,
+    std::string* error) {
+  if (prepared == nullptr || error == nullptr) return false;
+  prepared->CancelIfActive();
+  prepared->runtime_ = CudaHostProblemStoreRuntimeInfo();
+  prepared->runtime_.mode_requested = "host_prepared_store";
+  prepared->runtime_.mode_effective = "host_prepared_store";
+  error->clear();
+  if (binding.mode != CudaHostProblemStoreMode::kHostPreparedStore ||
+      binding.store == nullptr || binding.store->control_ == nullptr) {
+    *error = "indexed catalog requires an enabled host store binding";
+    prepared->runtime_.mode_effective = "invalid";
+    return false;
+  }
+
+  std::shared_ptr<GpuBaHostProblemStoreControl> control =
+      binding.store->control_;
+  GpuBaHostProblemStoreControl& store = *control;
+  prepared->runtime_.owner_epoch = binding.owner_epoch;
+  if (store.shutdown || store.shutdown_requested ||
+      store.reconstruction == nullptr || binding.owner_epoch == 0 ||
+      binding.owner_epoch != store.owner_epoch ||
+      HostReconstructionOwnerEpoch(store.reconstruction) != store.owner_epoch) {
+    *error = "indexed catalog owner identity mismatch";
+    prepared->runtime_.mode_effective = "invalid";
+    ++prepared->runtime_.owner_identity_violations;
+    ++store.lifetime.owner_identity_violations;
+    return false;
+  }
+  if (store.active) {
+    *error = "StoreBusy: host store already has an active solve";
+    ++prepared->runtime_.store_busy_failures;
+    ++store.lifetime.store_busy_failures;
+    return false;
+  }
+
+  store.active = true;
+  store.active_lease_generation = ++store.next_lease_generation;
+  if (store.active_lease_generation == 0) {
+    store.active_lease_generation = ++store.next_lease_generation;
+  }
+  const auto preparation_start = std::chrono::steady_clock::now();
+  const auto fail = [&]() {
+    prepared->runtime_.host_preparation_total_wall_milliseconds =
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - preparation_start).count();
+    prepared->runtime_.journal_cursor_after = store.indexed_journal_cursor;
+    prepared->runtime_.catalog_generation = store.indexed_catalog == nullptr
+        ? 0 : store.indexed_catalog->generation();
+    prepared->runtime_.host_catalog_valid = store.indexed_catalog != nullptr;
+    prepared->runtime_.host_resident_bytes = store.lifetime.host_resident_bytes;
+    AccumulateHostStoreRuntime(prepared->runtime_, &store.lifetime);
+    store.active = false;
+    store.active_lease_generation = 0;
+    return false;
+  };
+
+  try {
+    prepared->runtime_.owner_epoch = store.owner_epoch;
+    prepared->runtime_.journal_cursor_before = store.indexed_journal_cursor;
+    prepared->runtime_.journal_cursor_after = store.indexed_journal_cursor;
+    ++prepared->runtime_.store_lookup_calls;
+
+    CudaLayerCOptions step_options;
+    CudaArithmeticPrecision precision = CudaArithmeticPrecision::kFp64;
+    HotKernelImplementation hot_kernel = HotKernelImplementation::kReference;
+    CudaSchurContributionBackend schur_backend =
+        CudaSchurContributionBackend::kDirectTransformed;
+    if (!ResolvePreparedHostBuildConfiguration(
+            options, &step_options, &precision, &hot_kernel, &schur_backend,
+            error)) {
+      return fail();
+    }
+    if (precision != CudaArithmeticPrecision::kFp64 &&
+        precision != CudaArithmeticPrecision::kFp32MixedStable) {
+      *error = "indexed catalog supports fp64 and fp32_mixed precision";
+      return fail();
+    }
+
+    IndexedActiveSolveConfig config;
+    config.effective_config_resolved = true;
+    if (store.next_config_generation ==
+        std::numeric_limits<uint64_t>::max()) {
+      *error = "indexed catalog config generation exhausted";
+      return fail();
+    }
+    config.config_generation = ++store.next_config_generation;
+    if (config.config_generation == 0) {
+      config.config_generation = ++store.next_config_generation;
+    }
+    config.arithmetic_precision = precision;
+    config.schur_backend = schur_backend;
+    config.execution_profile = options.execution_profile;
+    switch (hot_kernel) {
+      case HotKernelImplementation::kReference:
+        config.hot_kernel = CudaHotKernelMode::kReference;
+        break;
+      case HotKernelImplementation::kOptimized:
+        config.hot_kernel = CudaHotKernelMode::kOptimized;
+        break;
+      case HotKernelImplementation::kTransformed:
+        config.hot_kernel = CudaHotKernelMode::kTransformed;
+        break;
+    }
+    std::string hessian_requested;
+    if (!ResolveHessianAssemblyBackend(
+            step_options.layer_b.hessian_assembly_backend, hot_kernel,
+            &config.hessian_backend, &hessian_requested, error) ||
+        !ResolveCudaLoss(problem, step_options.layer_b, &config.loss_mode,
+                         &config.loss_scale, error)) {
+      return fail();
+    }
+
+    const auto lookup_start = std::chrono::steady_clock::now();
+    HostStructureReadResult journal;
+    if (!ReadHostStructureEventsSince(
+            store.reconstruction, store.owner_epoch,
+            store.indexed_journal_cursor, &journal, error) ||
+        journal.owner_epoch != store.owner_epoch) {
+      if (error->empty()) *error = "indexed catalog journal owner mismatch";
+      return fail();
+    }
+    uint64_t event_count = 0;
+    uint64_t unknown_count = 0;
+    for (const HostStructureBatch& batch : journal.batches) {
+      event_count = SaturatingAdd(event_count, batch.events.size());
+      for (const HostStructureEvent& event : batch.events) {
+        if (event.kind == HostStructureEventKind::kBulkUnknown)
+          unknown_count = SaturatingAdd(unknown_count, 1);
+      }
+    }
+    const bool has_unknown = unknown_count != 0;
+    prepared->runtime_.journal_events = event_count;
+    prepared->runtime_.journal_unknown_events = unknown_count;
+    prepared->runtime_.store_lookup_wall_milliseconds =
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - lookup_start).count();
+
+    const bool cold = store.indexed_catalog_root == nullptr ||
+                      store.indexed_catalog == nullptr ||
+                      store.indexed_catalog_tables == nullptr;
+    const bool journal_gap = !journal.complete || journal.gap;
+    constexpr uint32_t kMaximumIndexedCatalogOverlayDepth = 32;
+    const bool overlay_compaction =
+        !cold && event_count != 0 && store.indexed_catalog_root != nullptr &&
+        store.indexed_catalog_root->overlay_depth >=
+            kMaximumIndexedCatalogOverlayDepth;
+    const bool force_full_rebuild =
+        cold || journal_gap || has_unknown || overlay_compaction;
+    bool full_catalog_rebuild = force_full_rebuild;
+    if (journal_gap) {
+      ++prepared->runtime_.journal_gaps;
+      if (store.indexed_journal_cursor < journal.oldest_retained_revision)
+        ++prepared->runtime_.journal_overflows;
+    }
+
+    std::shared_ptr<const StaticProblemDataCatalog> pending_root =
+        store.indexed_catalog_root;
+    std::shared_ptr<MapperStaticProblemDataCatalog> pending_catalog =
+        store.indexed_catalog;
+    std::shared_ptr<MapperStaticCatalogStableTables> pending_tables =
+        store.indexed_catalog_tables;
+    uint64_t pending_root_generation = store.indexed_catalog_generation;
+    uint64_t flat_transient_bytes = 0;
+    uint64_t reconcile_transient_bytes = 0;
+    MapperStaticCatalogUpdateResult update;
+    const bool catalog_update_required = force_full_rebuild || event_count != 0;
+    const auto catalog_update_start = std::chrono::steady_clock::now();
+    if (catalog_update_required) {
+      if (pending_root_generation == std::numeric_limits<uint64_t>::max()) {
+        *error = "indexed host catalog generation exhausted";
+        return fail();
+      }
+      ++pending_root_generation;
+      if (pending_root_generation == 0) ++pending_root_generation;
+      if (full_catalog_rebuild) {
+        ++prepared->runtime_.indexed_catalog_full_graph_build_calls;
+        ++prepared->runtime_.host_builder_calls_executed;
+        ++prepared->runtime_.host_builder_traversals_executed;
+        if (!BuildStaticProblemDataCatalog(
+                store.reconstruction, store.owner_epoch,
+                journal.current_revision, pending_root_generation,
+                &pending_root, error)) {
+          return fail();
+        }
+        if (cold) {
+          ++prepared->runtime_.catalog_cold_builds;
+          prepared->runtime_.view_action = "indexed_catalog_cold_build";
+          prepared->runtime_.rebuild_reason = "catalog_cold";
+        } else {
+          ++prepared->runtime_.catalog_full_rebuilds;
+          ++prepared->runtime_.fallback_rebuilds;
+          prepared->runtime_.view_action = "indexed_catalog_full_rebuild";
+          prepared->runtime_.rebuild_reason = journal_gap
+              ? "journal_gap"
+              : (has_unknown ? "journal_bulk_unknown"
+                             : "catalog_overlay_compaction");
+        }
+        ++prepared->runtime_.store_misses;
+      } else {
+        ++prepared->runtime_.indexed_catalog_journal_apply_calls;
+        ++prepared->runtime_.host_builder_calls_executed;
+        ++prepared->runtime_.host_builder_traversals_executed;
+        if (!ApplyStructureJournalToCatalog(
+                store.reconstruction, journal, pending_root_generation,
+                store.indexed_catalog_root, &pending_root, error)) {
+          const std::string delta_error = *error;
+          error->clear();
+          ++prepared->runtime_.indexed_catalog_full_graph_build_calls;
+          ++prepared->runtime_.host_builder_calls_executed;
+          ++prepared->runtime_.host_builder_traversals_executed;
+          if (!BuildStaticProblemDataCatalog(
+                  store.reconstruction, store.owner_epoch,
+                  journal.current_revision, pending_root_generation,
+                  &pending_root, error)) {
+            *error = "indexed catalog delta apply failed (" + delta_error +
+                     "); full rebuild also failed: " + *error;
+            return fail();
+          }
+          full_catalog_rebuild = true;
+          ++prepared->runtime_.catalog_full_rebuilds;
+          ++prepared->runtime_.fallback_rebuilds;
+          ++prepared->runtime_.store_misses;
+          prepared->runtime_.view_action = "indexed_catalog_full_rebuild";
+          prepared->runtime_.rebuild_reason = "catalog_delta_apply_failed";
+        } else {
+          ++prepared->runtime_.catalog_delta_updates;
+          ++prepared->runtime_.store_hits;
+          prepared->runtime_.view_action = "indexed_catalog_delta_update";
+        }
+      }
+
+      // The journal conversion is incremental and transactional. Flattening
+      // the overlay plus copying the stable Impl/export tables is still a
+      // measured O(catalog) preparation debt; the counters below prevent it
+      // from being reported as an O(delta) fast path.
+      HostIndexedCatalogData flat;
+      ++prepared->runtime_.indexed_catalog_flatten_calls;
+      ++prepared->runtime_.host_builder_calls_executed;
+      ++prepared->runtime_.host_builder_traversals_executed;
+      if (!FlattenStaticProblemDataCatalog(pending_root, &flat, error)) {
+        return fail();
+      }
+      flat_transient_bytes = flat.resident_bytes;
+      if (full_catalog_rebuild) {
+        const uint64_t generation_floor = store.indexed_catalog == nullptr
+            ? 0 : store.indexed_catalog->generation();
+        pending_catalog = std::make_shared<MapperStaticProblemDataCatalog>(
+            store.owner_epoch, generation_floor);
+      } else {
+        // Copy-on-write publication currently clones the complete stable Impl
+        // before Reconcile performs its own transactional pending copy.
+        // Account for that debt explicitly until slot-level COW lands.
+        prepared->runtime_.indexed_estimated_impl_copy_bytes =
+            store.indexed_catalog->EstimatedResidentBytes();
+        pending_catalog =
+            std::make_shared<MapperStaticProblemDataCatalog>(
+                *store.indexed_catalog);
+      }
+      ++prepared->runtime_.indexed_catalog_reconcile_calls;
+      ++prepared->runtime_.host_builder_calls_executed;
+      ++prepared->runtime_.host_builder_traversals_executed;
+      if (!pending_catalog->ReconcileFullStaticData(flat, &update, error)) {
+        return fail();
+      }
+      reconcile_transient_bytes = update.estimated_impl_copy_bytes;
+      prepared->runtime_.indexed_full_graph_records_scanned =
+          update.full_graph_records_scanned;
+      prepared->runtime_.indexed_estimated_impl_copy_bytes = SaturatingAdd(
+          prepared->runtime_.indexed_estimated_impl_copy_bytes,
+          update.estimated_impl_copy_bytes);
+      pending_tables = std::make_shared<MapperStaticCatalogStableTables>();
+      ++prepared->runtime_.indexed_catalog_export_calls;
+      ++prepared->runtime_.host_builder_calls_executed;
+      ++prepared->runtime_.host_builder_traversals_executed;
+      if (!pending_catalog->ExportStableTables(pending_tables.get(), error)) {
+        return fail();
+      }
+      uint64_t export_bytes = 0;
+      const auto add_export_bytes = [&](const uint64_t count,
+                                        const uint64_t element_bytes) {
+        uint64_t bytes = 0;
+        if (!CheckedMultiply(count, element_bytes, &bytes)) {
+          export_bytes = std::numeric_limits<uint64_t>::max();
+        } else {
+          export_bytes = SaturatingAdd(export_bytes, bytes);
+        }
+      };
+      add_export_bytes(pending_tables->cameras.size(),
+                       sizeof(MapperCatalogCameraSlot));
+      add_export_bytes(pending_tables->images.size(),
+                       sizeof(MapperCatalogImageSlot));
+      add_export_bytes(pending_tables->points.size(),
+                       sizeof(MapperCatalogPointSlot));
+      add_export_bytes(pending_tables->observations.size(),
+                       sizeof(MapperCatalogObservationSlot));
+      add_export_bytes(pending_tables->image_incidences.size(),
+                       sizeof(MapperCatalogIncidenceSlot));
+      add_export_bytes(pending_tables->point_incidences.size(),
+                       sizeof(MapperCatalogIncidenceSlot));
+      prepared->runtime_.indexed_estimated_export_bytes = export_bytes;
+      prepared->runtime_.estimated_host_builder_bytes_executed =
+          SaturatingAdd(
+              prepared->runtime_.indexed_estimated_impl_copy_bytes,
+              export_bytes);
+    } else {
+      ++prepared->runtime_.store_hits;
+      prepared->runtime_.view_action = "indexed_catalog_reuse";
+    }
+    prepared->runtime_.catalog_delta_update_wall_milliseconds =
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - catalog_update_start).count();
+
+    std::shared_ptr<IndexedActiveSolveDescriptor> descriptor =
+        std::make_shared<IndexedActiveSolveDescriptor>();
+    const auto materialize_start = std::chrono::steady_clock::now();
+    ++prepared->runtime_.indexed_active_materializer_calls;
+    ++prepared->runtime_.host_builder_calls_executed;
+    ++prepared->runtime_.host_builder_traversals_executed;
+    if (!store.indexed_materializer.Materialize(
+            store.owner_epoch, *pending_catalog, problem, config,
+            descriptor.get(),
+            error)) {
+      return fail();
+    }
+    ++prepared->runtime_.dynamic_state_refresh_calls;
+    prepared->runtime_.dynamic_state_refresh_wall_milliseconds =
+        descriptor->runtime.dynamic_state_wall_milliseconds;
+    ++prepared->runtime_.solve_view_rebuilds;
+    prepared->runtime_.solve_view_build_or_patch_wall_milliseconds =
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - materialize_start).count();
+    if (descriptor->identity.catalog_revision !=
+            pending_tables->catalog_revision ||
+        descriptor->identity.catalog_generation !=
+            pending_tables->catalog_generation ||
+        descriptor->identity.owner_epoch != pending_tables->owner_epoch) {
+      *error = "indexed descriptor and stable catalog publication mismatch";
+      return fail();
+    }
+    std::shared_ptr<PreparedIndexedCatalogPublication> publication =
+        std::make_shared<PreparedIndexedCatalogPublication>();
+    publication->root = std::move(pending_root);
+    publication->catalog = std::move(pending_catalog);
+    publication->tables = pending_tables;
+    publication->journal_cursor = journal.current_revision;
+    publication->root_generation = pending_root_generation;
+    uint64_t root_resident_bytes = 0;
+    for (auto node = publication->root; node != nullptr; node = node->parent) {
+      root_resident_bytes = SaturatingAdd(root_resident_bytes,
+                                          node->resident_bytes);
+    }
+    publication->resident_bytes = SaturatingAdd(
+        root_resident_bytes,
+        SaturatingAdd(publication->catalog->EstimatedResidentBytes(),
+                      prepared->runtime_.indexed_estimated_export_bytes));
+    const uint64_t retained_peak_bytes = catalog_update_required
+        ? SaturatingAdd(store.lifetime.host_resident_bytes,
+                        publication->resident_bytes)
+        : publication->resident_bytes;
+    publication->peak_bytes = SaturatingAdd(
+        retained_peak_bytes,
+        SaturatingAdd(
+            flat_transient_bytes,
+            SaturatingAdd(reconcile_transient_bytes,
+                          descriptor->runtime.descriptor_bytes)));
+    prepared->runtime_.catalog_generation =
+        publication->catalog->generation();
+    prepared->runtime_.view_generation =
+        descriptor->identity.solve_view_generation;
+    prepared->runtime_.config_generation = config.config_generation;
+    prepared->runtime_.host_resident_bytes = publication->resident_bytes;
+    prepared->runtime_.host_peak_bytes = std::max(
+        store.lifetime.host_peak_bytes, publication->peak_bytes);
+    prepared->runtime_.host_catalog_valid = true;
+    prepared->runtime_.host_preparation_total_wall_milliseconds =
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - preparation_start).count();
+    prepared->descriptor_ = std::move(descriptor);
+    prepared->catalog_tables_ = std::move(pending_tables);
+    prepared->control_ = std::move(control);
+    prepared->publication_ = std::move(publication);
+    prepared->lease_generation_ = store.active_lease_generation;
+    prepared->owner_epoch_ = store.owner_epoch;
+    prepared->active_ = true;
+    return true;
+  } catch (const std::bad_alloc&) {
+    *error = "indexed catalog preparation allocation failed";
+    return fail();
+  }
 }
 
 bool PrepareCudaHostSolveView(
@@ -19168,6 +20081,14 @@ bool RunCustomCudaSolveCore(const CudaSolveProblem& snapshot,
   SolveCallCounterScope call_counter_scope(&solve_call_counters);
   GpuBaSolveContext solve_context;
   solve_context.SetArithmeticPrecisionForSolve(arithmetic_precision);
+  if (options.prepared_host_view != nullptr &&
+      options.indexed_active_solve != nullptr) {
+    *error = "prepared host view and indexed active solve are mutually exclusive";
+    result->error = *error;
+    result->termination_reason = "conflicting_problem_sources";
+    result->error_classification = CudaSolveErrorClass::kInvalidOptions;
+    return false;
+  }
   std::string device_context_backend;
   if (options.device_context_mode ==
       CudaDeviceContextMode::kCompatibilityDefault) {
@@ -19237,6 +20158,55 @@ bool RunCustomCudaSolveCore(const CudaSolveProblem& snapshot,
     *error = "segmented Schur contribution requires transformed hot kernels";
     result->error = *error;
     result->termination_reason = "invalid_schur_contribution_backend";
+    result->error_classification = CudaSolveErrorClass::kInvalidOptions;
+    return false;
+  }
+  if (options.indexed_active_solve != nullptr) {
+    CudaHessianAssemblyBackend indexed_hessian_backend =
+        CudaHessianAssemblyBackend::kCompatibilityDefault;
+    std::string indexed_hessian_requested;
+    CudaLossMode indexed_loss_mode = CudaLossMode::kFromSnapshot;
+    double indexed_loss_scale = 0.0;
+    CudaHotKernelMode indexed_hot_kernel =
+        CudaHotKernelMode::kCompatibilityDefault;
+    switch (hot_kernel_implementation) {
+      case HotKernelImplementation::kReference:
+        indexed_hot_kernel = CudaHotKernelMode::kReference;
+        break;
+      case HotKernelImplementation::kOptimized:
+        indexed_hot_kernel = CudaHotKernelMode::kOptimized;
+        break;
+      case HotKernelImplementation::kTransformed:
+        indexed_hot_kernel = CudaHotKernelMode::kTransformed;
+        break;
+    }
+    if (!ResolveHessianAssemblyBackend(
+            options.layer_c.layer_b.hessian_assembly_backend,
+            hot_kernel_implementation, &indexed_hessian_backend,
+            &indexed_hessian_requested, error) ||
+        !ResolveCudaLoss(snapshot, options.layer_c.layer_b,
+                         &indexed_loss_mode, &indexed_loss_scale, error) ||
+        !solve_context.SetIndexedCatalogForSolve(
+            options.indexed_catalog_tables, options.indexed_active_solve,
+            arithmetic_precision, indexed_hessian_backend,
+            schur_contribution_backend, indexed_hot_kernel,
+            options.execution_profile, indexed_loss_mode, indexed_loss_scale,
+            error)) {
+      result->error = *error;
+      result->termination_reason = "invalid_indexed_catalog_binding";
+      result->error_classification = CudaSolveErrorClass::kInvalidOptions;
+      return false;
+    }
+  } else if (!solve_context.SetIndexedCatalogForSolve(
+                 options.indexed_catalog_tables, nullptr,
+                 arithmetic_precision,
+                 CudaHessianAssemblyBackend::kCompatibilityDefault,
+                 schur_contribution_backend,
+                 CudaHotKernelMode::kCompatibilityDefault,
+                 options.execution_profile, CudaLossMode::kFromSnapshot, 0.0,
+                 error)) {
+    result->error = *error;
+    result->termination_reason = "invalid_indexed_catalog_binding";
     result->error_classification = CudaSolveErrorClass::kInvalidOptions;
     return false;
   }
@@ -19851,7 +20821,11 @@ bool RunCustomCudaSolveCore(const CudaSolveProblem& snapshot,
       step.trial_cost = std::numeric_limits<double>::quiet_NaN();
     }
     if (!solved) {
-      if (!IsRecoverableFactorizationFailure(step_error)) {
+      const bool factorization_failure =
+          IsRecoverableFactorizationFailure(step_error);
+      const bool nonfinite_trial_state =
+          IsRecoverableNonfiniteTrialState(step_error);
+      if (!factorization_failure && !nonfinite_trial_state) {
         result->termination_type = CudaTerminationType::kFailure;
         result->termination_reason = "cuda_step_failed: " + step_error;
         result->error_classification = CudaSolveErrorClass::kCudaStep;
@@ -19862,7 +20836,14 @@ bool RunCustomCudaSolveCore(const CudaSolveProblem& snapshot,
         result->trace.push_back(iteration);
         break;
       }
-      ++result->factorization_failures;
+      if (factorization_failure) {
+        ++result->factorization_failures;
+      } else {
+        // The dense solve completed, but applying its step overflowed the
+        // trial state. Treat this like an invalid LM trial: retain the current
+        // state and retry with stronger damping. Mapping errors remain fatal.
+        iteration.factorization_success = true;
+      }
       ++result->invalid_steps;
       ++consecutive_invalid_steps;
       iteration.invalid = true;
@@ -20353,6 +21334,22 @@ bool RunCustomCudaSolve(const CudaSolveProblem& problem,
                         CudaFullLmResult* result,
                         std::string* error) {
   return RunCustomCudaSolveCore(problem, nullptr, options, result, error);
+}
+
+bool RunCustomCudaSolveWithStateUpdateStatusForTesting(
+    const Snapshot& snapshot,
+    const CudaFullLmOptions& options,
+    const uint32_t status,
+    CudaFullLmResult* result,
+    std::string* error) {
+  if (status == 0 || (status & ~15u) != 0 || result == nullptr ||
+      error == nullptr || g_state_update_status_override_for_testing != 0) {
+    if (error != nullptr)
+      *error = "state-update status test override is invalid";
+    return false;
+  }
+  ScopedStateUpdateStatusOverrideForTesting override(status);
+  return RunCustomCudaSolve(snapshot, options, result, error);
 }
 
 bool RunCudaPersistentHandleSelfTest(const Snapshot& snapshot,
