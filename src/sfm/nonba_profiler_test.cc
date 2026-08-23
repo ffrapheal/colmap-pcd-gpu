@@ -52,6 +52,22 @@ int main(int argc, char** argv) {
   assert(g_now_calls == 0);
   assert(!std::ifstream(off_path).good());
 
+  // A zero output is not a zero-yield result for stages whose output is only
+  // setup/configuration bookkeeping.
+  colmap::NonBaStageProfiler no_yield_profiler(&FakeNowNs);
+  g_now_ns = 0;
+  {
+    colmap::NonBaStageScope configuration(
+        &no_yield_profiler, colmap::NonBaStageId::kGlobalBaConfig, 3);
+    g_now_ns = 10;
+  }
+  const colmap::NonBaStageSnapshot configuration =
+      no_yield_profiler.Snapshot(colmap::NonBaStageId::kGlobalBaConfig);
+  assert(configuration.calls == 1);
+  assert(configuration.output_items == 0);
+  assert(configuration.zero_yield_calls == 0);
+  assert(configuration.zero_yield_exclusive_ns == 0);
+
   colmap::NonBaStageProfiler profiler(&FakeNowNs);
   g_now_ns = 0;
   {

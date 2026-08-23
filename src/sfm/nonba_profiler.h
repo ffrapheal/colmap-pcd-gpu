@@ -85,25 +85,33 @@ enum class NonBaPartition : uint8_t {
 struct NonBaStageInfo {
   NonBaStageInfo(const char* name,
                  const NonBaPartition partition,
-                 const char* item_unit)
+                 const char* item_unit,
+                 const bool yield_defined = false)
       : name(name),
         partition(partition),
         input_item_unit(item_unit),
-        output_item_unit(item_unit) {}
+        output_item_unit(item_unit),
+        yield_defined(yield_defined) {}
 
   NonBaStageInfo(const char* name,
                  const NonBaPartition partition,
                  const char* input_item_unit,
-                 const char* output_item_unit)
+                 const char* output_item_unit,
+                 const bool yield_defined = false)
       : name(name),
         partition(partition),
         input_item_unit(input_item_unit),
-        output_item_unit(output_item_unit) {}
+        output_item_unit(output_item_unit),
+        yield_defined(yield_defined) {}
 
   const char* name;
   NonBaPartition partition;
   const char* input_item_unit;
   const char* output_item_unit;
+  // True only when a zero output is a meaningful algorithmic zero-yield
+  // result. Setup, selection/configuration, copying, output, and shutdown
+  // stages still report output items but are excluded from zero-yield totals.
+  bool yield_defined;
 };
 
 inline const std::array<NonBaStageInfo,
@@ -117,64 +125,67 @@ NonBaStageInfos() {
           {"lidar_load", NonBaPartition::kNonBa, "maps"},
           {"lidar_ply_load_transform_submap_kdtree_index",
            NonBaPartition::kNonBa, "maps"},
-          {"initial_pair", NonBaPartition::kNonBa, "images"},
+          {"initial_pair", NonBaPartition::kNonBa, "images", true},
           {"initial_lidar_projection", NonBaPartition::kNonBa,
-           "feature_matches", "projected_matches"},
+           "feature_matches", "projected_matches", true},
           {"initial_absolute_pose_ransac", NonBaPartition::kNonBa,
-           "correspondences", "inliers"},
-          {"initial_pose_refine", NonBaPartition::kNonBa, "inliers"},
+           "correspondences", "inliers", true},
+          {"initial_pose_refine", NonBaPartition::kNonBa, "inliers", true},
           {"initial_commit", NonBaPartition::kNonBa, "inliers",
-           "observations"},
-          {"find_next_images", NonBaPartition::kNonBa, "candidate_images"},
+           "observations", true},
+          {"find_next_images", NonBaPartition::kNonBa, "candidate_images",
+           true},
           {"register_next_image", NonBaPartition::kNonBa, "observations",
-           "registered_images"},
+           "registered_images", true},
           {"register_collect_2d3d", NonBaPartition::kNonBa,
-           "points2D", "correspondences"},
+           "points2D", "correspondences", true},
           {"register_absolute_pose_ransac", NonBaPartition::kNonBa,
-           "correspondences", "inliers"},
-          {"register_pose_refine", NonBaPartition::kNonBa, "inliers"},
+           "correspondences", "inliers", true},
+          {"register_pose_refine", NonBaPartition::kNonBa, "inliers", true},
           {"register_commit", NonBaPartition::kNonBa, "inliers",
-           "observations"},
-          {"triangulate_image", NonBaPartition::kNonBa, "observations"},
+           "observations", true},
+          {"triangulate_image", NonBaPartition::kNonBa, "observations",
+           true},
           {"local_refinement", NonBaPartition::kNonBa,
-           "modified_points3D", "adjusted_observations"},
+           "modified_points3D", "adjusted_observations", true},
           {"local_find_bundle", NonBaPartition::kNonBa, "points3D",
-           "images"},
+           "images", true},
           {"local_variable_point_collection", NonBaPartition::kNonBa,
            "points3D"},
           {"local_lidar_projection_preparation", NonBaPartition::kNonBa,
            "points3D", "candidate_points"},
           {"local_lidar_projection_matching", NonBaPartition::kNonBa,
-           "candidate_points", "accepted_lidar_constraints"},
+           "candidate_points", "accepted_lidar_constraints", true},
           {"local_kd_queries", NonBaPartition::kNonBa, "candidate_points",
-           "accepted_lidar_constraints"},
+           "accepted_lidar_constraints", true},
           {"local_ba_config", NonBaPartition::kNonBa, "points3D"},
           {"local_ba_solve", NonBaPartition::kBaExcluded, "points3D",
-           "adjusted_observations"},
+           "adjusted_observations", true},
           {"local_merge_tracks", NonBaPartition::kNonBa, "points3D",
-           "merged_observations"},
+           "merged_observations", true},
           {"local_complete_tracks", NonBaPartition::kNonBa, "points3D",
-           "completed_observations"},
+           "completed_observations", true},
           {"local_complete_image", NonBaPartition::kNonBa, "observations",
-           "completed_observations"},
+           "completed_observations", true},
           {"local_filter_in_images", NonBaPartition::kNonBa, "images",
-           "filtered_observations"},
+           "filtered_observations", true},
           {"local_filter_modified", NonBaPartition::kNonBa, "points3D",
-           "filtered_observations"},
+           "filtered_observations", true},
           {"local_lidar_outlier", NonBaPartition::kNonBa, "points3D",
-           "filtered_observations"},
+           "filtered_observations", true},
           {"global_refinement", NonBaPartition::kNonBa,
-           "observations", "changed_observations"},
+           "observations", "changed_observations", true},
           {"global_pre_complete", NonBaPartition::kNonBa, "points3D",
-           "completed_observations"},
+           "completed_observations", true},
           {"global_pre_merge", NonBaPartition::kNonBa, "points3D",
-           "merged_observations"},
-          {"global_retriangulate", NonBaPartition::kNonBa, "observations"},
+           "merged_observations", true},
+          {"global_retriangulate", NonBaPartition::kNonBa, "observations",
+           true},
           {"global_adjustment", NonBaPartition::kNonBa, "registered_images",
-           "successful_solves"},
+           "successful_solves", true},
           {"global_points3d_copy_access", NonBaPartition::kNonBa, "points3D"},
           {"global_pre_negative_depth_scan", NonBaPartition::kNonBa,
-           "observations", "filtered_observations"},
+           "observations", "filtered_observations", true},
           {"global_image_config_selection", NonBaPartition::kNonBa, "images",
            "configured_images"},
           {"global_variable_point_collection", NonBaPartition::kNonBa,
@@ -182,19 +193,19 @@ NonBaStageInfos() {
           {"global_lidar_kd_preparation", NonBaPartition::kNonBa,
            "points3D"},
           {"global_kd_queries", NonBaPartition::kNonBa, "points3D",
-           "accepted_lidar_constraints"},
+           "accepted_lidar_constraints", true},
           {"global_ba_config", NonBaPartition::kNonBa, "points3D",
            "config_items"},
           {"global_ba_solve", NonBaPartition::kBaExcluded,
-           "adjusted_observations"},
+           "adjusted_observations", true},
           {"global_post_complete", NonBaPartition::kNonBa, "points3D",
-           "completed_observations"},
+           "completed_observations", true},
           {"global_post_merge", NonBaPartition::kNonBa, "points3D",
-           "merged_observations"},
+           "merged_observations", true},
           {"global_post_filter_all", NonBaPartition::kNonBa, "observations",
-           "filtered_observations"},
+           "filtered_observations", true},
           {"global_post_filter_images", NonBaPartition::kNonBa, "images",
-           "filtered_images"},
+           "filtered_images", true},
           {"extract_colors", NonBaPartition::kNonBa, "images"},
           {"write_model", NonBaPartition::kNonBa, "points3D"},
           {"cuda_runtime_shutdown", NonBaPartition::kNonBa, "runtimes"},
@@ -336,7 +347,8 @@ class NonBaStageProfiler final : public NonBaStageSink {
         std::max(aggregate.output_items_max, output_items);
     aggregate.exclusive_samples_ns.push_back(exclusive_ns);
     aggregate.inclusive_samples_ns.push_back(inclusive_ns);
-    if (output_items == 0) {
+    if (NonBaStageInfos()[Index(frame.stage_id)].yield_defined &&
+        output_items == 0) {
       ++aggregate.zero_yield_calls;
       aggregate.zero_yield_exclusive_ns += exclusive_ns;
     }
@@ -452,6 +464,8 @@ class NonBaStageProfiler final : public NonBaStageSink {
              << "\", \"ba_excluded\": "
              << (info.partition == NonBaPartition::kBaExcluded ? "true"
                                                                : "false")
+             << ", \"yield_defined\": "
+             << (info.yield_defined ? "true" : "false")
              << ", \"input_item_unit\": \"" << info.input_item_unit
              << "\", \"output_item_unit\": \"" << info.output_item_unit
              << "\", \"calls\": " << aggregate.calls
