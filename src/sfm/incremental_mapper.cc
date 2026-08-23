@@ -1112,16 +1112,47 @@ IncrementalMapper::AdjustLocalBundle(
             pcdproj_point3D_ids.size());
         const size_t num_lidar_before =
             non_ba_profiler_ == nullptr ? 0 : ba_config.lidar_maps_.size();
-        for (auto iter = pcdproj_point3D_ids.begin();
-             iter != pcdproj_point3D_ids.end(); ++iter) {
-          const point3D_t point3D_id = *iter;
-          int threshold = ba_options.ba_match_features_threshold;
-          ba_config.Project2Image(
-              reconstruction_, point3D_id, image_id, threshold);
+        {
+          NonBaStageScope project2image_loop(
+              non_ba_profiler_, NonBaStageId::kLocalProject2ImageLoop,
+              pcdproj_point3D_ids.size());
+          const size_t num_projected_images_before =
+              non_ba_profiler_ == nullptr
+                  ? 0
+                  : ba_config.lidar_searched_image_ids_.size();
+          lidar::PcdProj::NonBaProfilerBinding profiler_binding(
+              ba_config.point_cloud_process_ == nullptr
+                  ? nullptr
+                  : ba_config.point_cloud_process_->pcd_proj_.get(),
+              non_ba_profiler_);
+          for (auto iter = pcdproj_point3D_ids.begin();
+               iter != pcdproj_point3D_ids.end(); ++iter) {
+            const point3D_t point3D_id = *iter;
+            int threshold = ba_options.ba_match_features_threshold;
+            ba_config.Project2Image(
+                reconstruction_, point3D_id, image_id, threshold);
+          }
+          if (non_ba_profiler_ != nullptr) {
+            project2image_loop.SetOutputItems(
+                ba_config.lidar_searched_image_ids_.size() -
+                num_projected_images_before);
+          }
         }
-        for (auto iter = pcdproj_point3D_ids.begin();
-             iter != pcdproj_point3D_ids.end(); ++iter) {
-          ba_config.MatchVariablePoint2LidarPoint(reconstruction_, *iter);
+        {
+          NonBaStageScope match_variable_point_loop(
+              non_ba_profiler_,
+              NonBaStageId::kLocalMatchVariablePointToLidarLoop,
+              pcdproj_point3D_ids.size());
+          const size_t num_matched_lidar_before =
+              non_ba_profiler_ == nullptr ? 0 : ba_config.lidar_maps_.size();
+          for (auto iter = pcdproj_point3D_ids.begin();
+               iter != pcdproj_point3D_ids.end(); ++iter) {
+            ba_config.MatchVariablePoint2LidarPoint(reconstruction_, *iter);
+          }
+          if (non_ba_profiler_ != nullptr) {
+            match_variable_point_loop.SetOutputItems(
+                ba_config.lidar_maps_.size() - num_matched_lidar_before);
+          }
         }
         if (non_ba_profiler_ != nullptr) {
           projection_matching.SetOutputItems(ba_config.lidar_maps_.size() -

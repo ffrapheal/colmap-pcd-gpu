@@ -26,6 +26,9 @@
 #include "lidar/pt_type.h"
 
 namespace colmap{
+
+class NonBaStageSink;
+
 namespace lidar{
 
 struct PcdProjectionOptions {
@@ -54,8 +57,24 @@ class PcdProj{
     using PlaneType = Eigen::Vector4f;
     using ImageMapType = std::vector<NodeType*>;
 
+    class NonBaProfilerBinding {
+      public:
+        NonBaProfilerBinding(PcdProj* projector, NonBaStageSink* profiler);
+        ~NonBaProfilerBinding();
+
+        NonBaProfilerBinding(const NonBaProfilerBinding&) = delete;
+        NonBaProfilerBinding& operator=(const NonBaProfilerBinding&) = delete;
+        NonBaProfilerBinding(NonBaProfilerBinding&&) = delete;
+        NonBaProfilerBinding& operator=(NonBaProfilerBinding&&) = delete;
+
+      private:
+        PcdProj* projector_;
+        NonBaStageSink* previous_profiler_;
+    };
+
     explicit PcdProj(PcdProjectionOptions options) : options_(options){}
     ~PcdProj(){}
+    NonBaStageSink* NonBaProfiler() const { return non_ba_profiler_; }
     void BuildSubMap(const MapType& ptr);
     void SetNewImage(const Image& image, 
                      const Camera& camera, 
@@ -181,8 +200,26 @@ class PcdProj{
     std::map<KeyType,NodeType,compare> submap_;
 
     std::mutex proj_mutex_;
+    NonBaStageSink* non_ba_profiler_ = nullptr;
 
 };
+
+inline PcdProj::NonBaProfilerBinding::NonBaProfilerBinding(
+    PcdProj* projector, NonBaStageSink* profiler)
+    : projector_(projector),
+      previous_profiler_(projector == nullptr
+                             ? nullptr
+                             : projector->non_ba_profiler_) {
+  if (projector_ != nullptr) {
+    projector_->non_ba_profiler_ = profiler;
+  }
+}
+
+inline PcdProj::NonBaProfilerBinding::~NonBaProfilerBinding() {
+  if (projector_ != nullptr) {
+    projector_->non_ba_profiler_ = previous_profiler_;
+  }
+}
 } //namespace lidar
 } //namespace colmap
 #endif

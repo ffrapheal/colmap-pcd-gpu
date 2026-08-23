@@ -44,6 +44,13 @@ enum class NonBaStageId : uint8_t {
   kLocalVariablePointCollection,
   kLocalLidarProjectionPreparation,
   kLocalLidarProjectionAndMatching,
+  kLocalProject2ImageLoop,
+  kLocalPcdSetNewImage,
+  kLocalPcdFeatureCollectionIndex,
+  kLocalPcdSearchSubmap,
+  kLocalPcdImageMapProj,
+  kLocalPcdAssociationExtraction,
+  kLocalMatchVariablePointToLidarLoop,
   kLocalKdQueries,
   kLocalBaConfig,
   kLocalBaSolve,
@@ -156,6 +163,21 @@ NonBaStageInfos() {
            "points3D", "candidate_points"},
           {"local_lidar_projection_matching", NonBaPartition::kNonBa,
            "candidate_points", "accepted_lidar_constraints", true},
+          {"local_project2image_loop", NonBaPartition::kNonBa,
+           "project2image_calls", "new_projected_images", true},
+          {"local_pcd_set_new_image", NonBaPartition::kNonBa,
+           "images", "new_unique_point3D_lidar_associations"},
+          {"local_pcd_feature_collection_index", NonBaPartition::kNonBa,
+           "points2D", "valid_unique_feature_pixels", true},
+          {"local_pcd_search_submap", NonBaPartition::kNonBa,
+           "images", "selected_lidar_nodes", true},
+          {"local_pcd_image_map_proj", NonBaPartition::kNonBa,
+           "selected_lidar_points", "projected_feature_pixels", true},
+          {"local_pcd_association_extraction", NonBaPartition::kNonBa,
+           "points2D", "new_unique_point3D_lidar_associations", true},
+          {"local_match_variable_point_to_lidar_loop",
+           NonBaPartition::kNonBa, "candidate_points",
+           "accepted_lidar_constraints", true},
           {"local_kd_queries", NonBaPartition::kNonBa, "candidate_points",
            "accepted_lidar_constraints", true},
           {"local_ba_config", NonBaPartition::kNonBa, "points3D"},
@@ -588,6 +610,16 @@ class NonBaStageProfiler final : public NonBaStageSink {
         return "local_ba_config";
       case NonBaStageId::kLocalVariablePointCollection:
         return "local_lidar_projection_preparation";
+      case NonBaStageId::kLocalProject2ImageLoop:
+      case NonBaStageId::kLocalMatchVariablePointToLidarLoop:
+        return "local_lidar_projection_matching";
+      case NonBaStageId::kLocalPcdSetNewImage:
+        return "local_project2image_loop";
+      case NonBaStageId::kLocalPcdFeatureCollectionIndex:
+      case NonBaStageId::kLocalPcdSearchSubmap:
+      case NonBaStageId::kLocalPcdImageMapProj:
+      case NonBaStageId::kLocalPcdAssociationExtraction:
+        return "local_pcd_set_new_image";
       case NonBaStageId::kGlobalPoints3DAndConfigCopy:
       case NonBaStageId::kGlobalNegativeDepthScan:
       case NonBaStageId::kGlobalImageConfigSelection:
@@ -639,6 +671,12 @@ class NonBaStageProfiler final : public NonBaStageSink {
         return "register_other";
       case NonBaStageId::kLocalRefinement:
         return "local_other";
+      case NonBaStageId::kLocalLidarProjectionAndMatching:
+        return "local_lidar_projection_matching_self_dispatch";
+      case NonBaStageId::kLocalProject2ImageLoop:
+        return "local_project2image_loop_self_dispatch";
+      case NonBaStageId::kLocalPcdSetNewImage:
+        return "local_pcd_set_new_image_self_remainder";
       case NonBaStageId::kGlobalRefinement:
         return "global_other";
       case NonBaStageId::kGlobalAdjustment:
@@ -679,8 +717,29 @@ class NonBaStageProfiler final : public NonBaStageSink {
         return "combined variable-point collection and LiDAR projection/KD "
                "candidate classification loop";
       case NonBaStageId::kLocalLidarProjectionAndMatching:
-        return "BundleAdjustmentConfig Project2Image and "
-               "MatchVariablePoint2LidarPoint owner boundaries";
+        return "diagnostic parent for the Project2Image and "
+               "MatchVariablePoint2LidarPoint caller loops; exclusive wall "
+               "is parent self and dispatch";
+      case NonBaStageId::kLocalProject2ImageLoop:
+        return "complete Project2Image caller loop; exclusive wall includes "
+               "owner-side track scans and dispatch outside nested "
+               "SetNewImage calls; track elements visited are not collected";
+      case NonBaStageId::kLocalPcdSetNewImage:
+        return "map-output PcdProj SetNewImage overload; exclusive wall is "
+               "setup save-depth and other remainder outside four children";
+      case NonBaStageId::kLocalPcdFeatureCollectionIndex:
+        return "collect valid unique feature pixels from image Points2D";
+      case NonBaStageId::kLocalPcdSearchSubmap:
+        return "SearchSubMap owner call and selected LiDAR node collection";
+      case NonBaStageId::kLocalPcdImageMapProj:
+        return "complete ImageMapProj caller wall including its OpenMP loop; "
+               "worker times are not summed";
+      case NonBaStageId::kLocalPcdAssociationExtraction:
+        return "extract newly inserted unique point3D-to-LiDAR associations "
+               "measured by output map size delta; not feature hit attempts";
+      case NonBaStageId::kLocalMatchVariablePointToLidarLoop:
+        return "complete MatchVariablePoint2LidarPoint caller loop and "
+               "accepted LiDAR constraint creation";
       case NonBaStageId::kLocalKdQueries:
         return "BundleAdjustmentConfig MatchClosestLidarPoint owner boundaries";
       case NonBaStageId::kLocalBaSolve:

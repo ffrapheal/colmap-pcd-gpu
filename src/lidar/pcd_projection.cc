@@ -3,6 +3,7 @@
 #include "opencv2/imgproc/imgproc.hpp"
 #include "omp.h"
 #include "pcd_projection.h"
+#include "sfm/nonba_profiler.h"
 
 namespace colmap{
 namespace lidar{
@@ -10,6 +11,12 @@ namespace lidar{
 using namespace Eigen;
 
 void PcdProj::SetNewImage(const Image& image, const Camera& camera, std::map<point3D_t,Eigen::Matrix<double,6,1>>& map){
+    NonBaStageSink* const non_ba_profiler = non_ba_profiler_;
+    NonBaStageScope set_new_image(
+        non_ba_profiler, NonBaStageId::kLocalPcdSetNewImage, 1);
+    const size_t output_map_size_before =
+        non_ba_profiler == nullptr ? 0 : map.size();
+
     // Create a new image struct
     Eigen::Quaterniond q_cw(image.Qvec()[0],image.Qvec()[1],image.Qvec()[2],image.Qvec()[3]);
     Eigen::Matrix3d rot_cw = q_cw.toRotationMatrix();
@@ -23,13 +30,22 @@ void PcdProj::SetNewImage(const Image& image, const Camera& camera, std::map<poi
 
     // Save the pixel position and 3d_id
     std::set<Eigen::Matrix<int,2,1>,fea_compare> features;
-    for (const Point2D& point2D : image.Points2D()){
-        if (!point2D.HasPoint3D()) {
-            continue;
-        } 
-        Eigen::Matrix<int,2,1> uv = (point2D.XY() * scale).cast<int>();
-        if (uv(0)<0 || uv(0)>=img_w || uv(1)<0 || uv(1)>=img_h ) continue;
-        features.insert(uv);
+    {
+        NonBaStageScope feature_collection(
+            non_ba_profiler,
+            NonBaStageId::kLocalPcdFeatureCollectionIndex,
+            [&image]() { return image.Points2D().size(); });
+        for (const Point2D& point2D : image.Points2D()){
+            if (!point2D.HasPoint3D()) {
+                continue;
+            }
+            Eigen::Matrix<int,2,1> uv = (point2D.XY() * scale).cast<int>();
+            if (uv(0)<0 || uv(0)>=img_w || uv(1)<0 || uv(1)>=img_h ) continue;
+            features.insert(uv);
+        }
+        if (non_ba_profiler != nullptr) {
+            feature_collection.SetOutputItems(features.size());
+        }
     }
 
     LImage img(features,rot_cw,t_cw);
@@ -45,36 +61,72 @@ void PcdProj::SetNewImage(const Image& image, const Camera& camera, std::map<poi
     // Search which nodes in the map correspond to the current image
     ImageMapType img_nodes;
 
-    SearchSubMap(img, img_nodes);
+    {
+        NonBaStageScope search_submap(
+            non_ba_profiler, NonBaStageId::kLocalPcdSearchSubmap, 1);
+        SearchSubMap(img, img_nodes);
+        if (non_ba_profiler != nullptr) {
+            search_submap.SetOutputItems(img_nodes.size());
+        }
+    }
 
     // Project lidar points to image
-    ImageMapProj(img, img_nodes, camera);
+    {
+        NonBaStageScope image_map_projection(
+            non_ba_profiler, NonBaStageId::kLocalPcdImageMapProj,
+            [&img_nodes]() {
+              uint64_t selected_lidar_points = 0;
+              for (const NodeType* node : img_nodes) {
+                selected_lidar_points += node->size();
+              }
+              return selected_lidar_points;
+            });
+        ImageMapProj(img, img_nodes, camera);
+        if (non_ba_profiler != nullptr) {
+            image_map_projection.SetOutputItems(img.feature_pts_map.size());
+        }
+    }
 
-    for (const Point2D& point2D : image.Points2D()){
-        if (!point2D.HasPoint3D()) {
-            continue;
-        } 
+    const size_t association_map_size_before =
+        non_ba_profiler == nullptr ? 0 : map.size();
+    {
+        NonBaStageScope association_extraction(
+            non_ba_profiler,
+            NonBaStageId::kLocalPcdAssociationExtraction,
+            [&image]() { return image.Points2D().size(); });
+        for (const Point2D& point2D : image.Points2D()){
+            if (!point2D.HasPoint3D()) {
+                continue;
+            }
 
-        Eigen::Matrix<int,2,1> uv = (point2D.XY() * scale).cast<int>();
-        if (uv(0)<0 || uv(0)>=img_w || uv(1)<0 || uv(1)>=img_h ) continue;
-        auto iter = img.feature_pts_map.find(uv);
-        if (iter != img.feature_pts_map.end()){
-            point3D_t id = point2D.GetPoint3DId();
-            Eigen::Matrix<double,6,1> pt_lidar;
-            pt_lidar <<static_cast<double>(iter->second.first.x),
-                        static_cast<double>(iter->second.first.y),
-                        static_cast<double>(iter->second.first.z),
-                        static_cast<double>(iter->second.first.normal_x),
-                        static_cast<double>(iter->second.first.normal_y),
-                        static_cast<double>(iter->second.first.normal_z);
-            map.insert({id,pt_lidar});
-            img.succeed_match +=1;
+            Eigen::Matrix<int,2,1> uv = (point2D.XY() * scale).cast<int>();
+            if (uv(0)<0 || uv(0)>=img_w || uv(1)<0 || uv(1)>=img_h ) continue;
+            auto iter = img.feature_pts_map.find(uv);
+            if (iter != img.feature_pts_map.end()){
+                point3D_t id = point2D.GetPoint3DId();
+                Eigen::Matrix<double,6,1> pt_lidar;
+                pt_lidar <<static_cast<double>(iter->second.first.x),
+                            static_cast<double>(iter->second.first.y),
+                            static_cast<double>(iter->second.first.z),
+                            static_cast<double>(iter->second.first.normal_x),
+                            static_cast<double>(iter->second.first.normal_y),
+                            static_cast<double>(iter->second.first.normal_z);
+                map.insert({id,pt_lidar});
+                img.succeed_match +=1;
+            }
+        }
+        if (non_ba_profiler != nullptr) {
+            association_extraction.SetOutputItems(
+                map.size() - association_map_size_before);
         }
     }
 
     if (options_.if_save_depth_image){
         SaveDepthImage(img);
         std::cout<<"Saved depth image "<<img.img_name<<std::endl;
+    }
+    if (non_ba_profiler != nullptr) {
+        set_new_image.SetOutputItems(map.size() - output_map_size_before);
     }
 }
 
