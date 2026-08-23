@@ -483,6 +483,10 @@ void OptionManager::AddMapperOptions() {
   added_mapper_options_ = true;
 
   AddAndRegisterDefaultOption("Mapper.ba_backend", &mapper->ba_backend);
+  AddAndRegisterDefaultOption("Mapper.ba_cuda_execution_profile",
+                              &mapper->ba_cuda_execution_profile);
+  AddAndRegisterDefaultOption("Mapper.ba_cuda_audit_profile",
+                              &mapper->ba_cuda_audit_profile);
   AddAndRegisterDefaultOption("Mapper.ba_fallback_to_ceres",
                               &mapper->ba_fallback_to_ceres);
   AddAndRegisterDefaultOption("Mapper.ba_snapshot_dir",
@@ -491,14 +495,34 @@ void OptionManager::AddMapperOptions() {
                               &mapper->ba_snapshot_capture);
   AddAndRegisterDefaultOption("Mapper.ba_snapshot_registered_images",
                               &mapper->ba_snapshot_registered_images);
+  AddAndRegisterDefaultOption("Mapper.ba_ceres_oracle_dir",
+                              &mapper->ba_ceres_oracle_dir);
+  AddAndRegisterDefaultOption("Mapper.ba_ceres_oracle_run_id",
+                              &mapper->ba_ceres_oracle_run_id);
+  AddAndRegisterDefaultOption("Mapper.ba_ceres_oracle_repeat_count",
+                              &mapper->ba_ceres_oracle_repeat_count);
   AddAndRegisterDefaultOption("Mapper.ba_compare_dir",
                               &mapper->ba_compare_dir);
   AddAndRegisterDefaultOption("Mapper.ba_cuda_device",
                               &mapper->ba_cuda_device);
+  AddAndRegisterDefaultOption("Mapper.ba_cuda_arithmetic_precision",
+                              &mapper->ba_cuda_arithmetic_precision);
+  AddAndRegisterDefaultOption("Mapper.ba_cuda_hessian_assembly_backend",
+                              &mapper->ba_cuda_hessian_assembly_backend);
+  AddAndRegisterDefaultOption("Mapper.ba_cuda_hot_kernel_mode",
+                              &mapper->ba_cuda_hot_kernel_mode);
+  AddAndRegisterDefaultOption("Mapper.ba_cuda_schur_contribution_backend",
+                              &mapper->ba_cuda_schur_contribution_backend);
   AddAndRegisterDefaultOption("Mapper.ba_cuda_schur_mode",
                               &mapper->ba_cuda_schur_mode);
+  AddAndRegisterDefaultOption("Mapper.ba_cuda_host_problem_store",
+                              &mapper->ba_cuda_host_problem_store);
+  AddAndRegisterDefaultOption("Mapper.ba_cuda_problem_source",
+                              &mapper->ba_cuda_problem_source);
   AddAndRegisterDefaultOption("Mapper.ba_lidar_residual",
                               &mapper->ba_lidar_residual);
+  AddAndRegisterDefaultOption("Mapper.ba_telemetry_path",
+                              &mapper->ba_telemetry_path);
 
   AddAndRegisterDefaultOption("Mapper.first_image_fixed_frames",
                               &mapper->first_image_fixed_frames);

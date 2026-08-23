@@ -127,6 +127,31 @@ BOOST_FIXTURE_TEST_CASE(QuaternionPlusAndLocalJacobian, VisualFixture) {
   }
 }
 
+BOOST_FIXTURE_TEST_CASE(Ceres14QuaternionPlusIsIndependentAndExact,
+                        VisualFixture) {
+  ceres::QuaternionParameterization parameterization;
+  const std::array<double, 3> delta{{0.17, -0.08, 0.03}};
+  std::array<double, 4> reference;
+  std::array<double, 4> candidate;
+  BOOST_REQUIRE(parameterization.Plus(quaternion.data(), delta.data(),
+                                      reference.data()));
+  BOOST_REQUIRE(QuaternionPlusCeres14(quaternion, delta, &candidate));
+  CheckArrayNear(reference, candidate, 1e-15);
+
+  const std::array<double, 3> zero_delta{{0.0, 0.0, 0.0}};
+  BOOST_REQUIRE(QuaternionPlusCeres14(quaternion, zero_delta, &candidate));
+  CheckArrayNear(quaternion, candidate, 0.0);
+
+  std::array<double, 4> non_unit = quaternion;
+  for (double& value : non_unit) value *= 3.0;
+  BOOST_REQUIRE(QuaternionPlusCeres14(non_unit, delta, &candidate));
+  const double norm = std::sqrt(candidate[0] * candidate[0] +
+                                candidate[1] * candidate[1] +
+                                candidate[2] * candidate[2] +
+                                candidate[3] * candidate[3]);
+  BOOST_CHECK_CLOSE_FRACTION(norm, 3.0, 1e-15);
+}
+
 BOOST_AUTO_TEST_CASE(SmallAngleLeftMultiplyAndFactorTwo) {
   const std::array<double, 4> identity{{1.0, 0.0, 0.0, 0.0}};
   const std::array<double, 3> delta{{1e-12, -2e-12, 3e-12}};

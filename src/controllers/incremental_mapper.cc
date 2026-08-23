@@ -31,6 +31,10 @@
 
 #include "controllers/incremental_mapper.h"
 
+#ifdef GPU_BA_CUDA_ENABLED
+#include "gpu_ba/custom_cuda.h"
+#endif
+
 #include "util/misc.h"
 
 namespace colmap {
@@ -44,10 +48,29 @@ void ConfigureGpuBaOptions(const IncrementalMapperOptions& source,
   target->ba_snapshot_capture = source.ba_snapshot_capture;
   target->ba_snapshot_registered_images =
       source.ba_snapshot_registered_images;
+  target->ba_ceres_oracle_dir = source.ba_ceres_oracle_dir;
+  target->ba_ceres_oracle_run_id = source.ba_ceres_oracle_run_id;
+  target->ba_ceres_oracle_repeat_count =
+      source.ba_ceres_oracle_repeat_count;
   target->ba_compare_dir = source.ba_compare_dir;
   target->ba_cuda_device = source.ba_cuda_device;
+  target->ba_cuda_execution_profile =
+      ParseBundleAdjustmentCudaExecutionProfile(
+          source.ba_cuda_execution_profile);
+  target->ba_cuda_audit_profile = source.ba_cuda_audit_profile;
+  target->ba_cuda_arithmetic_precision =
+      source.ba_cuda_arithmetic_precision;
+  target->ba_cuda_hessian_assembly_backend =
+      source.ba_cuda_hessian_assembly_backend;
+  target->ba_cuda_hot_kernel_mode = source.ba_cuda_hot_kernel_mode;
+  target->ba_cuda_schur_contribution_backend =
+      source.ba_cuda_schur_contribution_backend;
   target->ba_cuda_schur_mode = source.ba_cuda_schur_mode;
+  target->ba_cuda_host_problem_store = source.ba_cuda_host_problem_store;
+  CHECK(gpu_ba::ParseCudaProblemSource(source.ba_cuda_problem_source,
+                                       &target->ba_cuda_problem_source));
   target->ba_lidar_residual = source.ba_lidar_residual;
+  target->ba_telemetry_path = source.ba_telemetry_path;
 }
 
 size_t TriangulateImage(const IncrementalMapperOptions& options,
@@ -60,7 +83,7 @@ size_t TriangulateImage(const IncrementalMapperOptions& options,
   return num_tris;
 }
 
-void AdjustGlobalBundle(const IncrementalMapperOptions& options,
+bool AdjustGlobalBundle(const IncrementalMapperOptions& options,
                         IncrementalMapper* mapper,
                         uint64_t refinement_index) {
   BundleAdjustmentOptions custom_ba_options = options.GlobalBundleAdjustment();
@@ -83,21 +106,22 @@ void AdjustGlobalBundle(const IncrementalMapperOptions& options,
 
   PrintHeading1("Global bundle adjustment");
   if (options.if_add_lidar_constraint) {
-    mapper->AdjustGlobalBundleByLidar(options.Mapper(), custom_ba_options);  
+    return mapper->AdjustGlobalBundleByLidar(options.Mapper(), custom_ba_options);
   } else {
     if (options.ba_global_use_pba && !options.fix_existing_images &&
         num_reg_images >= kMinNumRegImagesForFastBA &&
         ParallelBundleAdjuster::IsSupported(custom_ba_options,
                                             mapper->GetReconstruction())) {
-      mapper->AdjustParallelGlobalBundle(
+      return mapper->AdjustParallelGlobalBundle(
           custom_ba_options, options.ParallelGlobalBundleAdjustment());
     } else {
-      mapper->AdjustGlobalBundle(options.Mapper(), custom_ba_options);
+      return mapper->AdjustGlobalBundle(options.Mapper(), custom_ba_options);
     }
   }
+  return false;
 }
 
-void IterativeLocalRefinement(const IncrementalMapperOptions& options,
+bool IterativeLocalRefinement(const IncrementalMapperOptions& options,
                               const image_t image_id,
                               IncrementalMapper* mapper) {
   // mapper->ClearLidarPoints();
@@ -108,6 +132,7 @@ void IterativeLocalRefinement(const IncrementalMapperOptions& options,
     const auto report = mapper->AdjustLocalBundle(
         options.Mapper(), ba_options, options.Triangulation(), image_id,
         mapper->GetModifiedPoints3D());
+    if (!report.success) return false;
     std::cout << "  => Merged observations: " << report.num_merged_observations
               << std::endl;
     std::cout << "  => Completed observations: "
@@ -131,10 +156,10 @@ void IterativeLocalRefinement(const IncrementalMapperOptions& options,
         BundleAdjustmentOptions::LossFunctionType::TRIVIAL;
   }
   mapper->ClearModifiedPoints3D();
-
+  return true;
 }
 
-void IterativeGlobalRefinement(const IncrementalMapperOptions& options,
+bool IterativeGlobalRefinement(const IncrementalMapperOptions& options,
                                IncrementalMapper* mapper) {
   PrintHeading1("Retriangulation");
   CompleteAndMergeTracks(options, mapper);
@@ -145,7 +170,9 @@ void IterativeGlobalRefinement(const IncrementalMapperOptions& options,
     const size_t num_observations =
         mapper->GetReconstruction().ComputeNumObservations();
     size_t num_changed_observations = 0;
-    AdjustGlobalBundle(options, mapper, static_cast<uint64_t>(i));
+    if (!AdjustGlobalBundle(options, mapper, static_cast<uint64_t>(i))) {
+      return false;
+    }
     num_changed_observations += CompleteAndMergeTracks(options, mapper);
     num_changed_observations += FilterPoints(options, mapper);
     const double changed =
@@ -160,6 +187,7 @@ void IterativeGlobalRefinement(const IncrementalMapperOptions& options,
   }
 
   FilterImages(options, mapper);
+  return true;
 }
 
 void ExtractColors(const std::string& image_path, const image_t image_id,
@@ -436,6 +464,15 @@ void IncrementalMapperController::Run() {
   }
 
   GetTimer().PrintMinutes();
+#ifdef GPU_BA_CUDA_ENABLED
+  if (options_->ba_backend == "custom_cuda") {
+    std::string shutdown_error;
+    if (!gpu_ba::ShutdownCudaRuntimePool(&shutdown_error)) {
+      LOG(ERROR) << "custom CUDA RuntimePool shutdown failed: "
+                 << shutdown_error;
+    }
+  }
+#endif
 }
 
 bool IncrementalMapperController::LoadDatabase() {
@@ -489,6 +526,12 @@ void IncrementalMapperController::Reconstruct(
   //////////////////////////////////////////////////////////////////////////////
 
   IncrementalMapper mapper(&database_cache_);
+#ifdef GPU_BA_CUDA_ENABLED
+  gpu_ba::CudaHostProblemStoreMode host_store_mode =
+      gpu_ba::CudaHostProblemStoreMode::kDisabled;
+  CHECK(gpu_ba::ParseCudaHostProblemStoreMode(
+      options_->ba_cuda_host_problem_store, &host_store_mode));
+#endif
   if (options_->if_import_pose_prior) {
     mapper.LoadExistedImagePoses(image_poses_);
   }
@@ -520,7 +563,12 @@ void IncrementalMapperController::Reconstruct(
     }
     Reconstruction& reconstruction =
         reconstruction_manager_->Get(reconstruction_idx);
-    mapper.BeginReconstruction(&reconstruction);
+    mapper.BeginReconstruction(
+        &reconstruction
+#ifdef GPU_BA_CUDA_ENABLED
+        , host_store_mode
+#endif
+    );
 
     ////////////////////////////////////////////////////////////////////////////
     // Register initial pair
@@ -578,7 +626,11 @@ void IncrementalMapperController::Reconstruct(
         break;
       }
 
-      AdjustGlobalBundle(*options_, &mapper, 0);
+      if (!AdjustGlobalBundle(*options_, &mapper, 0)) {
+        ba_failed_.store(true);
+        mapper.EndReconstruction(false);
+        return;
+      }
 
       FilterPoints(*options_, &mapper);
       FilterImages(*options_, &mapper);
@@ -647,7 +699,11 @@ void IncrementalMapperController::Reconstruct(
         if (reg_next_success) {
           mapper.ClearLidarPoints();
           TriangulateImage(*options_, next_image, &mapper);
-          IterativeLocalRefinement(*options_, next_image_id, &mapper);
+          if (!IterativeLocalRefinement(*options_, next_image_id, &mapper)) {
+            ba_failed_.store(true);
+            mapper.EndReconstruction(false);
+            return;
+          }
           if (reconstruction.NumRegImages() >=
                   options_->ba_global_images_ratio * ba_prev_num_reg_images ||
               reconstruction.NumRegImages() >=
@@ -656,7 +712,11 @@ void IncrementalMapperController::Reconstruct(
                   options_->ba_global_points_ratio * ba_prev_num_points ||
               reconstruction.NumPoints3D() >=
                   options_->ba_global_points_freq + ba_prev_num_points) {
-            IterativeGlobalRefinement(*options_, &mapper);
+            if (!IterativeGlobalRefinement(*options_, &mapper)) {
+              ba_failed_.store(true);
+              mapper.EndReconstruction(false);
+              return;
+            }
             ba_prev_num_points = reconstruction.NumPoints3D();
             ba_prev_num_reg_images = reconstruction.NumRegImages();
           }
@@ -703,7 +763,11 @@ void IncrementalMapperController::Reconstruct(
       if (!reg_next_success && prev_reg_next_success) {
         reg_next_success = true;
         prev_reg_next_success = false;
-        IterativeGlobalRefinement(*options_, &mapper);
+        if (!IterativeGlobalRefinement(*options_, &mapper)) {
+          ba_failed_.store(true);
+          mapper.EndReconstruction(false);
+          return;
+        }
       } else {
         prev_reg_next_success = reg_next_success;
       }
@@ -719,7 +783,11 @@ void IncrementalMapperController::Reconstruct(
     if (reconstruction.NumRegImages() >= 2 &&
         reconstruction.NumRegImages() != ba_prev_num_reg_images &&
         reconstruction.NumPoints3D() != ba_prev_num_points) {
-      IterativeGlobalRefinement(*options_, &mapper);
+      if (!IterativeGlobalRefinement(*options_, &mapper)) {
+        ba_failed_.store(true);
+        mapper.EndReconstruction(false);
+        return;
+      }
     }
 
     // If the total number of images is small then do not enforce the minimum

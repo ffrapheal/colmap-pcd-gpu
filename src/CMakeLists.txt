@@ -77,6 +77,13 @@ if(GPU_BA_ENABLED)
 endif()
 
 COLMAP_ADD_LIBRARY(colmap ${COLMAP_SOURCES})
+if(GPU_BA_CUDA_ENABLED)
+    # Production BundleAdjuster dispatch lives in libcolmap while the CUDA
+    # implementation remains a separately compiled CUDA target. Both static
+    # archives reference symbols from the other, so expose the dependency at
+    # the library boundary and let CMake emit the required repeated link group.
+    target_link_libraries(colmap gpu_ba_custom_cuda)
+endif()
 
 if(CUDA_ENABLED)
     set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --use_fast_math")

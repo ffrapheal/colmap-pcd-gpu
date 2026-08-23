@@ -47,6 +47,152 @@ namespace colmap {
 Reconstruction::Reconstruction()
     : correspondence_graph_(nullptr), num_added_points3D_(0) {}
 
+Reconstruction::StructureMutationBatch::StructureMutationBatch(
+    Reconstruction* reconstruction, const bool suppress_nested_events)
+    : reconstruction_(reconstruction) {
+  if (reconstruction_ != nullptr) {
+    outer_ = reconstruction_->BeginStructureMutationBatch(
+        suppress_nested_events);
+  }
+}
+
+Reconstruction::StructureMutationBatch::~StructureMutationBatch() {
+  if (reconstruction_ != nullptr) {
+    reconstruction_->FinishStructureMutationBatch(outer_, !canceled_);
+  }
+}
+
+void Reconstruction::StructureMutationBatch::RecordComposite(
+    ReconstructionStructureEvent event) {
+  if (reconstruction_ != nullptr && !canceled_) {
+    reconstruction_->RecordStructureEvent(std::move(event), true);
+  }
+}
+
+void Reconstruction::StructureMutationBatch::Cancel() noexcept {
+  canceled_ = true;
+  if (reconstruction_ != nullptr) {
+    reconstruction_->AbortStructureMutationBatch();
+  }
+}
+
+void Reconstruction::BeginStructureJournal(
+    const uint64_t owner_epoch, const size_t retained_batch_capacity) {
+  CHECK_NE(owner_epoch, 0);
+  CHECK_GT(retained_batch_capacity, 0);
+  CHECK_EQ(structure_mutation_depth_, 0);
+  structure_journal_enabled_ = true;
+  structure_owner_epoch_ = owner_epoch;
+  structure_revision_ = 1;
+  oldest_retained_structure_revision_ = 2;
+  structure_journal_capacity_ = retained_batch_capacity;
+  pending_structure_events_.clear();
+  structure_journal_.clear();
+}
+
+void Reconstruction::EndStructureJournal() {
+  CHECK_EQ(structure_mutation_depth_, 0);
+  structure_journal_enabled_ = false;
+  structure_owner_epoch_ = 0;
+  structure_revision_ = 0;
+  oldest_retained_structure_revision_ = 0;
+  structure_journal_capacity_ = 0;
+  structure_suppress_nested_events_ = false;
+  pending_structure_events_.clear();
+  structure_journal_.clear();
+}
+
+bool Reconstruction::BeginStructureMutationBatch(
+    const bool suppress_nested_events) {
+  const bool outer = structure_mutation_depth_ == 0;
+  if (outer) {
+    pending_structure_events_.clear();
+    structure_suppress_nested_events_ = suppress_nested_events;
+    structure_batch_abort_requested_ = false;
+  }
+  ++structure_mutation_depth_;
+  return outer;
+}
+
+void Reconstruction::FinishStructureMutationBatch(const bool outer,
+                                                   const bool commit) {
+  CHECK_GT(structure_mutation_depth_, 0);
+  if (!commit) structure_batch_abort_requested_ = true;
+  --structure_mutation_depth_;
+  if (!outer) return;
+  CHECK_EQ(structure_mutation_depth_, 0);
+  if (commit && !structure_batch_abort_requested_) {
+    PublishStructureBatch();
+  } else {
+    pending_structure_events_.clear();
+  }
+  structure_suppress_nested_events_ = false;
+  structure_batch_abort_requested_ = false;
+}
+
+void Reconstruction::AbortStructureMutationBatch() noexcept {
+  if (structure_mutation_depth_ != 0) structure_batch_abort_requested_ = true;
+}
+
+void Reconstruction::RecordStructureEvent(
+    ReconstructionStructureEvent event, const bool force) {
+  if (!structure_journal_enabled_) return;
+  CHECK_GT(structure_mutation_depth_, 0);
+  if (structure_suppress_nested_events_ && !force) return;
+  pending_structure_events_.push_back(std::move(event));
+}
+
+void Reconstruction::PublishStructureBatch() {
+  if (!structure_journal_enabled_ || pending_structure_events_.empty()) {
+    pending_structure_events_.clear();
+    return;
+  }
+  CHECK_LT(structure_revision_, std::numeric_limits<uint64_t>::max());
+  ReconstructionStructureBatch batch;
+  batch.revision = ++structure_revision_;
+  batch.events.swap(pending_structure_events_);
+  structure_journal_.push_back(std::move(batch));
+  while (structure_journal_.size() > structure_journal_capacity_) {
+    structure_journal_.pop_front();
+  }
+  oldest_retained_structure_revision_ = structure_journal_.empty()
+      ? structure_revision_ + 1
+      : structure_journal_.front().revision;
+}
+
+void Reconstruction::MarkStructureUnknown(const std::string& reason) {
+  StructureMutationBatch batch(this);
+  ReconstructionStructureEvent event;
+  event.kind = ReconstructionStructureEventKind::kBulkUnknown;
+  event.reason = reason;
+  RecordStructureEvent(std::move(event));
+}
+
+ReconstructionStructureReadResult Reconstruction::ReadStructureEventsSince(
+    const uint64_t owner_epoch, const uint64_t cursor) const {
+  ReconstructionStructureReadResult result;
+  result.owner_epoch = structure_owner_epoch_;
+  result.cursor = cursor;
+  result.current_revision = structure_revision_;
+  result.oldest_retained_revision = oldest_retained_structure_revision_;
+  if (!structure_journal_enabled_ || owner_epoch == 0 ||
+      owner_epoch != structure_owner_epoch_ || cursor == 0 ||
+      cursor > structure_revision_) {
+    result.gap = true;
+    return result;
+  }
+  if (!structure_journal_.empty() &&
+      cursor + 1 < structure_journal_.front().revision) {
+    result.gap = true;
+    return result;
+  }
+  result.complete = true;
+  for (const ReconstructionStructureBatch& batch : structure_journal_) {
+    if (batch.revision > cursor) result.batches.push_back(batch);
+  }
+  return result;
+}
+
 std::unordered_set<point3D_t> Reconstruction::Point3DIds() const {
   std::unordered_set<point3D_t> point3D_ids;
   point3D_ids.reserve(points3D_.size());
@@ -59,6 +205,7 @@ std::unordered_set<point3D_t> Reconstruction::Point3DIds() const {
 }
 
 void Reconstruction::Load(const DatabaseCache& database_cache) {
+  StructureMutationBatch mutation(this, true);
   correspondence_graph_ = nullptr;
 
   // Add cameras.
@@ -96,6 +243,10 @@ void Reconstruction::Load(const DatabaseCache& database_cache) {
     image_pair_stat.num_total_corrs = image_pair.second;
     image_pair_stats_.emplace(image_pair.first, image_pair_stat);
   }
+  ReconstructionStructureEvent event;
+  event.kind = ReconstructionStructureEventKind::kBulkUnknown;
+  event.reason = "Load";
+  mutation.RecordComposite(std::move(event));
 }
 
 void Reconstruction::SetUp(const CorrespondenceGraph* correspondence_graph) {
@@ -128,6 +279,7 @@ void Reconstruction::ClearLidarPointsInGlobal(){
 }
 
 void Reconstruction::TearDown() {
+  StructureMutationBatch mutation(this, true);
   correspondence_graph_ = nullptr;
   image_pair_stats_.clear();
 
@@ -156,17 +308,33 @@ void Reconstruction::TearDown() {
   for (auto& point3D : points3D_) {
     point3D.second.Track().Compress();
   }
+  ReconstructionStructureEvent event;
+  event.kind = ReconstructionStructureEventKind::kBulkUnknown;
+  event.reason = "TearDown";
+  mutation.RecordComposite(std::move(event));
 }
 
 void Reconstruction::AddCamera(class Camera camera) {
+  StructureMutationBatch mutation(this);
   const camera_t camera_id = camera.CameraId();
   CHECK(camera.VerifyParams());
   CHECK(cameras_.emplace(camera_id, std::move(camera)).second);
+  ReconstructionStructureEvent event;
+  event.kind = ReconstructionStructureEventKind::kCameraAdded;
+  event.new_camera_id = camera_id;
+  RecordStructureEvent(std::move(event));
 }
 
 void Reconstruction::AddImage(class Image image) {
+  StructureMutationBatch mutation(this);
   const image_t image_id = image.ImageId();
+  const camera_t camera_id = image.CameraId();
   CHECK(images_.emplace(image_id, std::move(image)).second);
+  ReconstructionStructureEvent event;
+  event.kind = ReconstructionStructureEventKind::kImageAdded;
+  event.image_id = image_id;
+  event.new_camera_id = camera_id;
+  RecordStructureEvent(std::move(event));
 }
 
 void Reconstruction::AddLidarPoint(const point3D_t& point3D_id, LidarPoint& lidar_point){
@@ -179,6 +347,7 @@ void Reconstruction::AddLidarPointInGlobal(const point3D_t& point3D_id, LidarPoi
 
 point3D_t Reconstruction::AddPoint3D(const Eigen::Vector3d& xyz, Track track,
                                      const Eigen::Vector3ub& color) {
+  StructureMutationBatch mutation(this);
   const point3D_t point3D_id = ++num_added_points3D_;
   CHECK(!ExistsPoint3D(point3D_id));
 
@@ -201,11 +370,17 @@ point3D_t Reconstruction::AddPoint3D(const Eigen::Vector3d& xyz, Track track,
   point3D.SetTrack(std::move(track));
   point3D.SetColor(color);
 
+  ReconstructionStructureEvent event;
+  event.kind = ReconstructionStructureEventKind::kPointAdded;
+  event.point3D_id = point3D_id;
+  RecordStructureEvent(std::move(event));
+
   return point3D_id;
 }
 
 void Reconstruction::AddObservation(const point3D_t point3D_id,
                                     const TrackElement& track_el) {
+  StructureMutationBatch mutation(this);
   class Image& image = Image(track_el.image_id);
   CHECK(!image.Point2D(track_el.point2D_idx).HasPoint3D());
 
@@ -218,10 +393,17 @@ void Reconstruction::AddObservation(const point3D_t point3D_id,
   const bool kIsContinuedPoint3D = true;
   SetObservationAsTriangulated(track_el.image_id, track_el.point2D_idx,
                                kIsContinuedPoint3D);
+  ReconstructionStructureEvent event;
+  event.kind = ReconstructionStructureEventKind::kObservationAdded;
+  event.point3D_id = point3D_id;
+  event.image_id = track_el.image_id;
+  event.point2D_idx = track_el.point2D_idx;
+  RecordStructureEvent(std::move(event));
 }
 
 point3D_t Reconstruction::MergePoints3D(const point3D_t point3D_id1,
                                         const point3D_t point3D_id2) {
+  StructureMutationBatch mutation(this, true);
   const class Point3D& point3D1 = Point3D(point3D_id1);
   const class Point3D& point3D2 = Point3D(point3D_id2);
 
@@ -245,14 +427,23 @@ point3D_t Reconstruction::MergePoints3D(const point3D_t point3D_id1,
   const point3D_t merged_point3D_id =
       AddPoint3D(merged_xyz, merged_track, merged_rgb.cast<uint8_t>());
 
+  ReconstructionStructureEvent event;
+  event.kind = ReconstructionStructureEventKind::kPointMerged;
+  event.old_point3D_id1 = point3D_id1;
+  event.old_point3D_id2 = point3D_id2;
+  event.point3D_id = merged_point3D_id;
+  mutation.RecordComposite(std::move(event));
+
   return merged_point3D_id;
 }
 
 void Reconstruction::DeletePoint3D(const point3D_t point3D_id) {
+  StructureMutationBatch mutation(this);
   // Note: Do not change order of these instructions, especially with respect to
   // `Reconstruction::ResetTriObservations`
 
   const class Track& track = Point3D(point3D_id).Track();
+  std::vector<TrackElement> old_track = track.Elements();
 
   const bool kIsDeletedPoint3D = true;
 
@@ -267,10 +458,16 @@ void Reconstruction::DeletePoint3D(const point3D_t point3D_id) {
   }
 
   points3D_.erase(point3D_id);
+  ReconstructionStructureEvent event;
+  event.kind = ReconstructionStructureEventKind::kPointDeleted;
+  event.point3D_id = point3D_id;
+  event.old_track = std::move(old_track);
+  RecordStructureEvent(std::move(event));
 }
 
 void Reconstruction::DeleteObservation(const image_t image_id,
                                        const point2D_t point2D_idx) {
+  StructureMutationBatch mutation(this);
   // Note: Do not change order of these instructions, especially with respect to
   // `Reconstruction::ResetTriObservations`
 
@@ -289,9 +486,16 @@ void Reconstruction::DeleteObservation(const image_t image_id,
   ResetTriObservations(image_id, point2D_idx, kIsDeletedPoint3D);
 
   image.ResetPoint3DForPoint2D(point2D_idx);
+  ReconstructionStructureEvent event;
+  event.kind = ReconstructionStructureEventKind::kObservationDeleted;
+  event.point3D_id = point3D_id;
+  event.image_id = image_id;
+  event.point2D_idx = point2D_idx;
+  RecordStructureEvent(std::move(event));
 }
 
 void Reconstruction::DeleteAllPoints2DAndPoints3D() {
+  StructureMutationBatch mutation(this, true);
   points3D_.clear();
   for (auto& image : images_) {
     class Image new_image;
@@ -306,17 +510,29 @@ void Reconstruction::DeleteAllPoints2DAndPoints3D() {
     new_image.SetTvecPrior(image.second.TvecPrior());
     image.second = new_image;
   }
+  ReconstructionStructureEvent event;
+  event.kind = ReconstructionStructureEventKind::kBulkUnknown;
+  event.reason = "DeleteAllPoints2DAndPoints3D";
+  mutation.RecordComposite(std::move(event));
 }
 
 void Reconstruction::RegisterImage(const image_t image_id) {
+  StructureMutationBatch mutation(this);
   class Image& image = Image(image_id);
   if (!image.IsRegistered()) {
     image.SetRegistered(true);
     reg_image_ids_.push_back(image_id);
+    ReconstructionStructureEvent event;
+    event.kind = ReconstructionStructureEventKind::kImageRegistrationChanged;
+    event.image_id = image_id;
+    event.old_registration = false;
+    event.new_registration = true;
+    RecordStructureEvent(std::move(event));
   }
 }
 
 void Reconstruction::DeRegisterImage(const image_t image_id) {
+  StructureMutationBatch mutation(this);
   class Image& image = Image(image_id);
 
   for (point2D_t point2D_idx = 0; point2D_idx < image.NumPoints2D();
@@ -331,6 +547,12 @@ void Reconstruction::DeRegisterImage(const image_t image_id) {
   reg_image_ids_.erase(
       std::remove(reg_image_ids_.begin(), reg_image_ids_.end(), image_id),
       reg_image_ids_.end());
+  ReconstructionStructureEvent event;
+  event.kind = ReconstructionStructureEventKind::kImageRegistrationChanged;
+  event.image_id = image_id;
+  event.old_registration = true;
+  event.new_registration = false;
+  RecordStructureEvent(std::move(event));
 }
 
 void Reconstruction::Normalize(const double extent, const double p0,
@@ -475,6 +697,7 @@ Reconstruction Reconstruction::Crop(
 
 bool Reconstruction::Merge(const Reconstruction& reconstruction,
                            const double max_reproj_error) {
+  StructureMutationBatch mutation(this, true);
   const double kMinInlierObservations = 0.3;
 
   Eigen::Matrix3x4d alignment;
@@ -560,6 +783,10 @@ bool Reconstruction::Merge(const Reconstruction& reconstruction,
 
   FilterPoints3DWithLargeReprojectionError(max_reproj_error, Point3DIds());
 
+  ReconstructionStructureEvent event;
+  event.kind = ReconstructionStructureEventKind::kBulkUnknown;
+  event.reason = "MergeReconstruction";
+  mutation.RecordComposite(std::move(event));
   return true;
 }
 
@@ -587,6 +814,7 @@ std::vector<image_t> Reconstruction::FindCommonRegImageIds(
 }
 
 void Reconstruction::TranscribeImageIdsToDatabase(const Database& database) {
+  StructureMutationBatch mutation(this, true);
   std::unordered_map<image_t, image_t> old_to_new_image_ids;
   old_to_new_image_ids.reserve(NumImages());
 
@@ -617,6 +845,10 @@ void Reconstruction::TranscribeImageIdsToDatabase(const Database& database) {
       track_el.image_id = old_to_new_image_ids.at(track_el.image_id);
     }
   }
+  ReconstructionStructureEvent event;
+  event.kind = ReconstructionStructureEventKind::kBulkUnknown;
+  event.reason = "TranscribeImageIdsToDatabase";
+  mutation.RecordComposite(std::move(event));
 }
 
 size_t Reconstruction::FilterPoints3D(
@@ -783,6 +1015,7 @@ double Reconstruction::ComputeMeanReprojectionError() const {
 }
 
 void Reconstruction::Read(const std::string& path) {
+  StructureMutationBatch mutation(this, true);
   if (ExistsFile(JoinPaths(path, "cameras.bin")) &&
       ExistsFile(JoinPaths(path, "images.bin")) &&
       ExistsFile(JoinPaths(path, "points3D.bin"))) {
@@ -794,20 +1027,34 @@ void Reconstruction::Read(const std::string& path) {
   } else {
     LOG(FATAL) << "cameras, images, points3D files do not exist at " << path;
   }
+  ReconstructionStructureEvent event;
+  event.kind = ReconstructionStructureEventKind::kBulkUnknown;
+  event.reason = "Read";
+  mutation.RecordComposite(std::move(event));
 }
 
 void Reconstruction::Write(const std::string& path) const { WriteBinary(path); }
 
 void Reconstruction::ReadText(const std::string& path) {
+  StructureMutationBatch mutation(this, true);
   ReadCamerasText(JoinPaths(path, "cameras.txt"));
   ReadImagesText(JoinPaths(path, "images.txt"));
   ReadPoints3DText(JoinPaths(path, "points3D.txt"));
+  ReconstructionStructureEvent event;
+  event.kind = ReconstructionStructureEventKind::kBulkUnknown;
+  event.reason = "ReadText";
+  mutation.RecordComposite(std::move(event));
 }
 
 void Reconstruction::ReadBinary(const std::string& path) {
+  StructureMutationBatch mutation(this, true);
   ReadCamerasBinary(JoinPaths(path, "cameras.bin"));
   ReadImagesBinary(JoinPaths(path, "images.bin"));
   ReadPoints3DBinary(JoinPaths(path, "points3D.bin"));
+  ReconstructionStructureEvent event;
+  event.kind = ReconstructionStructureEventKind::kBulkUnknown;
+  event.reason = "ReadBinary";
+  mutation.RecordComposite(std::move(event));
 }
 
 void Reconstruction::WriteText(const std::string& path) const {
@@ -841,6 +1088,7 @@ std::vector<PlyPoint> Reconstruction::ConvertToPLY() const {
 }
 
 void Reconstruction::ImportPLY(const std::string& path) {
+  StructureMutationBatch mutation(this, true);
   points3D_.clear();
 
   const auto ply_points = ReadPly(path);
@@ -851,15 +1099,24 @@ void Reconstruction::ImportPLY(const std::string& path) {
     AddPoint3D(Eigen::Vector3d(ply_point.x, ply_point.y, ply_point.z), Track(),
                Eigen::Vector3ub(ply_point.r, ply_point.g, ply_point.b));
   }
+  ReconstructionStructureEvent event;
+  event.kind = ReconstructionStructureEventKind::kBulkUnknown;
+  event.reason = "ImportPLYPath";
+  mutation.RecordComposite(std::move(event));
 }
 
 void Reconstruction::ImportPLY(const std::vector<PlyPoint>& ply_points) {
+  StructureMutationBatch mutation(this, true);
   points3D_.clear();
   points3D_.reserve(ply_points.size());
   for (const auto& ply_point : ply_points) {
     AddPoint3D(Eigen::Vector3d(ply_point.x, ply_point.y, ply_point.z), Track(),
                Eigen::Vector3ub(ply_point.r, ply_point.g, ply_point.b));
   }
+  ReconstructionStructureEvent event;
+  event.kind = ReconstructionStructureEventKind::kBulkUnknown;
+  event.reason = "ImportPLYData";
+  mutation.RecordComposite(std::move(event));
 }
 
 bool Reconstruction::ExportNVM(const std::string& path,

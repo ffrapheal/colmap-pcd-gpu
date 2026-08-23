@@ -32,6 +32,7 @@
 #include "sfm/incremental_mapper.h"
 
 #include <array>
+#include <atomic>
 #include <fstream>
 
 #include "base/projection.h"
@@ -42,6 +43,30 @@
 
 namespace colmap {
 namespace {
+
+#ifdef GPU_BA_CUDA_ENABLED
+std::atomic<uint64_t> g_next_gpu_ba_host_store_owner_epoch{0};
+
+uint64_t NextGpuBaHostStoreOwnerEpoch() {
+  uint64_t epoch = ++g_next_gpu_ba_host_store_owner_epoch;
+  if (epoch == 0) epoch = ++g_next_gpu_ba_host_store_owner_epoch;
+  return epoch;
+}
+
+void BindGpuBaHostProblemStore(
+    const gpu_ba::CudaHostProblemStoreMode mode,
+    gpu_ba::GpuBaHostProblemStore* store,
+    const uint64_t owner_epoch,
+    BundleAdjuster* bundle_adjuster) {
+  gpu_ba::CudaHostStoreBinding binding;
+  binding.mode = mode;
+  if (mode == gpu_ba::CudaHostProblemStoreMode::kHostPreparedStore) {
+    binding.store = store;
+    binding.owner_epoch = owner_epoch;
+  }
+  bundle_adjuster->SetCudaHostStoreBinding(binding);
+}
+#endif
 
 void SortAndAppendNextImages(std::vector<std::pair<image_t, float>> image_ranks,
                              std::vector<image_t>* sorted_images_ids) {
@@ -109,11 +134,26 @@ void IncrementalMapper::LoadExistedImagePoses(std::map<uint32_t, std::vector<dou
   if_import_pose_prior_ = true;
 }
 
-void IncrementalMapper::BeginReconstruction(Reconstruction* reconstruction) {
+void IncrementalMapper::BeginReconstruction(
+    Reconstruction* reconstruction
+#ifdef GPU_BA_CUDA_ENABLED
+    , const gpu_ba::CudaHostProblemStoreMode host_store_mode
+#endif
+) {
   CHECK(reconstruction_ == nullptr);
   reconstruction_ = reconstruction;
   reconstruction_->Load(*database_cache_);
   reconstruction_->SetUp(&database_cache_->CorrespondenceGraph());
+#ifdef GPU_BA_CUDA_ENABLED
+  gpu_ba_host_store_mode_ = host_store_mode;
+  if (gpu_ba_host_store_mode_ ==
+      gpu_ba::CudaHostProblemStoreMode::kHostPreparedStore) {
+    gpu_ba_host_store_owner_epoch_ = NextGpuBaHostStoreOwnerEpoch();
+    reconstruction_->BeginStructureJournal(gpu_ba_host_store_owner_epoch_);
+    gpu_ba_host_problem_store_.reset(new gpu_ba::GpuBaHostProblemStore(
+        reconstruction_, gpu_ba_host_store_owner_epoch_));
+  }
+#endif
   triangulator_ = std::make_unique<IncrementalTriangulator>(
       &database_cache_->CorrespondenceGraph(), reconstruction);
 
@@ -143,10 +183,51 @@ void IncrementalMapper::EndReconstruction(const bool discard) {
     }
   }
 
+#ifdef GPU_BA_CUDA_ENABLED
+  if (gpu_ba_host_store_mode_ ==
+      gpu_ba::CudaHostProblemStoreMode::kHostPreparedStore) {
+    CHECK_NOTNULL(gpu_ba_host_problem_store_.get());
+    std::string shutdown_error;
+    CHECK(gpu_ba_host_problem_store_->Shutdown(&shutdown_error))
+        << shutdown_error;
+    gpu_ba_host_problem_store_.reset();
+    reconstruction_->EndStructureJournal();
+  }
+  gpu_ba_host_store_owner_epoch_ = 0;
+  gpu_ba_host_store_mode_ = gpu_ba::CudaHostProblemStoreMode::kDisabled;
+#endif
   reconstruction_->TearDown();
   reconstruction_ = nullptr;
   triangulator_.reset();
 }
+
+#ifdef GPU_BA_CUDA_ENABLED
+gpu_ba::CudaHostProblemStoreMode
+IncrementalMapper::CudaHostStoreModeForTesting() const {
+  return gpu_ba_host_store_mode_;
+}
+
+uint64_t IncrementalMapper::CudaHostStoreOwnerEpochForTesting() const {
+  return gpu_ba_host_store_owner_epoch_;
+}
+
+bool IncrementalMapper::HasCudaHostProblemStoreForTesting() const {
+  return gpu_ba_host_problem_store_ != nullptr;
+}
+
+gpu_ba::CudaHostStoreBinding
+IncrementalMapper::CudaHostStoreBindingForTesting() const {
+  gpu_ba::CudaHostStoreBinding binding;
+  binding.mode = gpu_ba_host_store_mode_;
+  if (gpu_ba_host_store_mode_ ==
+      gpu_ba::CudaHostProblemStoreMode::kHostPreparedStore) {
+    binding.store = gpu_ba_host_problem_store_.get();
+    binding.owner_epoch = gpu_ba_host_store_owner_epoch_;
+  }
+  return binding;
+}
+#endif
+
 void IncrementalMapper::LoadPointcloud(std::string& pointcloud_path, 
                                        const lidar::PcdProjectionOptions& pp_options){
   if (pointcloud_path == ""){
@@ -888,9 +969,18 @@ IncrementalMapper::AdjustLocalBundle(
     
     // Adjust the local bundle.
     BundleAdjuster bundle_adjuster(ba_options, ba_config);
+#ifdef GPU_BA_CUDA_ENABLED
+    BindGpuBaHostProblemStore(gpu_ba_host_store_mode_,
+                              gpu_ba_host_problem_store_.get(),
+                              gpu_ba_host_store_owner_epoch_,
+                              &bundle_adjuster);
+#endif
     const BundleAdjuster::OptimazePhrase phrase = BundleAdjuster::OptimazePhrase::Local;
     bundle_adjuster.SetOptimazePhrase(phrase);
-    bundle_adjuster.Solve(reconstruction_);
+    if (!bundle_adjuster.Solve(reconstruction_)) {
+      report.success = false;
+      return report;
+    }
 
     report.num_adjusted_observations =
         bundle_adjuster.Summary().num_residuals / 2;
@@ -966,6 +1056,12 @@ bool IncrementalMapper::AdjustGlobalBundle(
 
   // Run bundle adjustment.
   BundleAdjuster bundle_adjuster(ba_options, ba_config);
+#ifdef GPU_BA_CUDA_ENABLED
+  BindGpuBaHostProblemStore(gpu_ba_host_store_mode_,
+                            gpu_ba_host_problem_store_.get(),
+                            gpu_ba_host_store_owner_epoch_,
+                            &bundle_adjuster);
+#endif
   const BundleAdjuster::OptimazePhrase phrase = BundleAdjuster::OptimazePhrase::Global;
   bundle_adjuster.SetOptimazePhrase(phrase);
 
@@ -1113,6 +1209,12 @@ bool IncrementalMapper::AdjustGlobalBundleByLidar(
   
   // Run bundle adjustment.
   BundleAdjuster bundle_adjuster(ba_options, ba_config);
+#ifdef GPU_BA_CUDA_ENABLED
+  BindGpuBaHostProblemStore(gpu_ba_host_store_mode_,
+                            gpu_ba_host_problem_store_.get(),
+                            gpu_ba_host_store_owner_epoch_,
+                            &bundle_adjuster);
+#endif
   const BundleAdjuster::OptimazePhrase phrase = BundleAdjuster::OptimazePhrase::Global;
   bundle_adjuster.SetOptimazePhrase(phrase);
 

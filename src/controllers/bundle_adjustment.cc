@@ -90,10 +90,26 @@ void BundleAdjustmentController::Run() {
   ba_options.ba_snapshot_capture = mapper_options.ba_snapshot_capture;
   ba_options.ba_snapshot_registered_images =
       mapper_options.ba_snapshot_registered_images;
+  ba_options.ba_ceres_oracle_dir = mapper_options.ba_ceres_oracle_dir;
+  ba_options.ba_ceres_oracle_run_id = mapper_options.ba_ceres_oracle_run_id;
+  ba_options.ba_ceres_oracle_repeat_count =
+      mapper_options.ba_ceres_oracle_repeat_count;
   ba_options.ba_compare_dir = mapper_options.ba_compare_dir;
   ba_options.ba_cuda_device = mapper_options.ba_cuda_device;
+  ba_options.ba_cuda_execution_profile =
+      ParseBundleAdjustmentCudaExecutionProfile(
+          mapper_options.ba_cuda_execution_profile);
+  ba_options.ba_cuda_audit_profile = mapper_options.ba_cuda_audit_profile;
+  ba_options.ba_cuda_arithmetic_precision =
+      mapper_options.ba_cuda_arithmetic_precision;
+  ba_options.ba_cuda_hessian_assembly_backend =
+      mapper_options.ba_cuda_hessian_assembly_backend;
+  ba_options.ba_cuda_hot_kernel_mode = mapper_options.ba_cuda_hot_kernel_mode;
+  ba_options.ba_cuda_schur_contribution_backend =
+      mapper_options.ba_cuda_schur_contribution_backend;
   ba_options.ba_cuda_schur_mode = mapper_options.ba_cuda_schur_mode;
   ba_options.ba_lidar_residual = mapper_options.ba_lidar_residual;
+  ba_options.ba_telemetry_path = mapper_options.ba_telemetry_path;
   ba_options.ba_refinement_index = 0;
   ba_options.ba_trigger_image_id =
       reg_image_ids.empty() ? 0 : reg_image_ids.back();

@@ -35,6 +35,7 @@
 #include "base/reconstruction_manager.h"
 #include "sfm/incremental_mapper.h"
 #include "util/threading.h"
+#include <atomic>
 #include <map>
 #include <fstream>
 
@@ -48,10 +49,22 @@ struct IncrementalMapperOptions {
   std::string ba_snapshot_dir;
   std::string ba_snapshot_capture = "none";
   std::string ba_snapshot_registered_images = "2,6,20,50,270";
+  std::string ba_ceres_oracle_dir;
+  std::string ba_ceres_oracle_run_id = "original";
+  int ba_ceres_oracle_repeat_count = 1;
   std::string ba_compare_dir;
   int ba_cuda_device = 0;
+  std::string ba_cuda_execution_profile = "compact_control";
+  std::string ba_cuda_audit_profile = "production";
+  std::string ba_cuda_arithmetic_precision = "compatibility_default";
+  std::string ba_cuda_hessian_assembly_backend = "compatibility_default";
+  std::string ba_cuda_hot_kernel_mode = "transformed";
+  std::string ba_cuda_schur_contribution_backend = "direct";
   std::string ba_cuda_schur_mode = "deterministic";
+  std::string ba_cuda_host_problem_store = "disabled";
+  std::string ba_cuda_problem_source = "legacy_snapshot";
   std::string ba_lidar_residual = "legacy_exact";
+  std::string ba_telemetry_path;
 
   // Fix pose of the first image for some times
   int first_image_fixed_frames = 8;
@@ -258,6 +271,7 @@ class IncrementalMapperController : public Thread {
                               ReconstructionManager* reconstruction_manager);
 
   int OriginImagesNum();
+  bool HasFailed() const { return ba_failed_.load(); }
   DatabaseCache database_cache_;//数据都在这里面存着
  private:
   void Run();
@@ -271,6 +285,7 @@ class IncrementalMapperController : public Thread {
   ReconstructionManager* reconstruction_manager_;
   //Tx, Ty, Tz, qw, qx, qy, qz
   std::map<uint32_t, std::vector<double>> image_poses_;
+  std::atomic<bool> ba_failed_{false};
 };
 
 // Globally filter points and images in mapper.

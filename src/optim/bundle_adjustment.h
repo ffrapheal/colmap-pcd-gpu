@@ -45,6 +45,8 @@
 #include "PBA/pba.h"
 #include "base/camera_rig.h"
 #include "base/reconstruction.h"
+#include "gpu_ba/host_problem_store.h"
+#include "gpu_ba/active_ba_solve_spec.h"
 #include "util/alignment.h"
 
 
@@ -52,20 +54,47 @@ namespace colmap {
 
 namespace gpu_ba {
 class SnapshotRecorder;
+struct Snapshot;
+struct SnapshotWriteResult;
 }
 
 //参数的结构，包括损失函数类型，
 struct BundleAdjustmentOptions {
+  enum class CudaExecutionProfile {
+    INVALID = -1,
+    BASELINE = 0,
+    RUNTIME_POOL = 1,
+    ARENA = 2,
+    DEVICE_SCALING = 3,
+    FAST_IDENTITY = 4,
+    UNIFIED_BUILDER = 5,
+    COMPACT_LAYER_A = 6,
+    COMPACT_CONTROL = 7,
+  };
   // GPU BA backend and snapshot controls. The default preserves legacy Ceres.
   std::string ba_backend = "ceres_cpu";
   bool ba_fallback_to_ceres = true;
   std::string ba_snapshot_dir;
   std::string ba_snapshot_capture = "none";
   std::string ba_snapshot_registered_images = "2,6,20,50,270";
+  std::string ba_ceres_oracle_dir;
+  std::string ba_ceres_oracle_run_id = "original";
+  int ba_ceres_oracle_repeat_count = 1;
   std::string ba_compare_dir;
   int ba_cuda_device = 0;
+  CudaExecutionProfile ba_cuda_execution_profile =
+      CudaExecutionProfile::COMPACT_CONTROL;
+  std::string ba_cuda_audit_profile = "compatibility_default";
+  std::string ba_cuda_arithmetic_precision = "compatibility_default";
+  std::string ba_cuda_hessian_assembly_backend = "compatibility_default";
+  std::string ba_cuda_hot_kernel_mode = "transformed";
+  std::string ba_cuda_schur_contribution_backend = "direct";
   std::string ba_cuda_schur_mode = "deterministic";
+  std::string ba_cuda_host_problem_store = "disabled";
+  gpu_ba::CudaProblemSource ba_cuda_problem_source =
+      gpu_ba::CudaProblemSource::kLegacySnapshot;
   std::string ba_lidar_residual = "legacy_exact";
+  std::string ba_telemetry_path;
   uint64_t ba_refinement_index = 0;
   image_t ba_trigger_image_id = 0;
 
@@ -133,6 +162,174 @@ struct BundleAdjustmentOptions {
 
   bool Check() const;
 };
+
+BundleAdjustmentOptions::CudaExecutionProfile
+ParseBundleAdjustmentCudaExecutionProfile(const std::string& value);
+
+struct BundleAdjustmentExecutionResult {
+  uint64_t call_index = 0;
+  std::string ba_kind;
+  uint64_t registered_images = 0;
+  std::string requested_backend;
+  std::string executed_backend;
+  std::string problem_source_requested = "legacy_snapshot";
+  std::string problem_source_effective = "legacy_snapshot";
+  std::string problem_source_fallback_reason;
+  std::string selected_schur;
+  std::string execution_profile;
+  std::string audit_profile_requested;
+  std::string audit_profile_effective;
+  bool capture_state_trace_effective = false;
+  bool instrumentation_effective = false;
+  bool production_audit_invariants_checked = false;
+  bool production_audit_invariants_pass = false;
+  uint64_t production_audit_violation_count = 0;
+  std::string first_production_audit_violation;
+  uint64_t state_hash_computations = 0;
+  uint64_t topology_fingerprint_computations = 0;
+  uint64_t audit_mirror_bytes = 0;
+  uint64_t optional_full_array_d2h_bytes = 0;
+  uint64_t mixed_double_edge_materialization_bytes = 0;
+  std::string arithmetic_precision_requested;
+  std::string arithmetic_precision_effective;
+  std::string hessian_backend_requested;
+  std::string hessian_backend_effective;
+  std::string hot_kernel_requested;
+  std::string hot_kernel_effective;
+  std::string schur_contribution_backend_requested;
+  std::string schur_contribution_backend_effective;
+  std::string state_storage_precision;
+  std::string residual_jacobian_precision;
+  std::string hessian_schur_precision;
+  std::string factorization_routine;
+  std::string delta_precision;
+  std::string quaternion_plus_precision;
+  std::string cost_precision;
+  std::string controller_precision;
+  std::string summary_source;
+  bool success = false;
+  std::string termination;
+  std::string stable_error;
+  std::string diagnostic_message;
+  bool fallback_used = false;
+  std::string fallback_reason;
+  double wall_seconds = 0.0;
+  int trial_steps = 0;
+  int accepted_steps = 0;
+  int accepted_commits = 0;
+  int rejected_steps = 0;
+  int invalid_steps = 0;
+  double initial_cost = 0.0;
+  double final_cost = 0.0;
+  double max_backward_error = 0.0;
+  uint64_t residuals = 0;
+  uint64_t parameter_blocks = 0;
+  uint64_t parameters = 0;
+  uint64_t residual_blocks = 0;
+  uint64_t effective_parameters = 0;
+  bool ceres_problem_created = false;
+  uint64_t ceres_cost_function_creations = 0;
+  uint64_t ceres_add_residual_calls = 0;
+  bool snapshot_recorder_created = false;
+  uint64_t snapshot_materialization_calls = 0;
+  uint64_t active_spec_build_calls = 0;
+  uint64_t residual_enumerator_passes = 0;
+  uint64_t residual_enumerator_items = 0;
+  uint64_t peak_cuda_bytes = 0;
+  uint64_t ceres_solve_calls = 0;
+  std::string ceres_solve_calls_scope = "bundle_adjuster_only";
+  uint64_t transaction_qvec_count = 0;
+  uint64_t transaction_parameter_block_count = 0;
+  uint64_t transaction_backup_entity_count = 0;
+  uint64_t transaction_backup_bytes = 0;
+  uint64_t transaction_identity_index_entries = 0;
+  uint64_t transaction_parameter_lookup_count = 0;
+  double transaction_checkpoint_milliseconds = 0.0;
+  double transaction_restore_milliseconds = 0.0;
+  std::string host_store_mode_requested = "disabled";
+  std::string host_store_mode_effective = "disabled";
+  std::string host_store_view_action = "disabled";
+  std::string host_store_rebuild_reason;
+  uint64_t host_store_owner_epoch = 0;
+  uint64_t host_store_catalog_generation = 0;
+  uint64_t host_store_view_generation = 0;
+  uint64_t host_store_lookup_calls = 0;
+  uint64_t host_store_hits = 0;
+  uint64_t host_store_misses = 0;
+  uint64_t host_store_journal_cursor_before = 0;
+  uint64_t host_store_journal_cursor_after = 0;
+  uint64_t host_store_catalog_cold_builds = 0;
+  uint64_t host_store_catalog_delta_updates = 0;
+  uint64_t host_store_catalog_full_rebuilds = 0;
+  uint64_t host_store_journal_events = 0;
+  uint64_t host_store_journal_gaps = 0;
+  uint64_t host_store_journal_overflows = 0;
+  uint64_t host_store_journal_unknown_events = 0;
+  uint64_t host_store_exact_view_reuses = 0;
+  uint64_t host_store_view_patches = 0;
+  uint64_t host_store_view_rebuilds = 0;
+  uint64_t host_store_fallback_rebuilds = 0;
+  uint64_t host_store_builder_calls_executed = 0;
+  uint64_t host_store_builder_calls_saved = 0;
+  uint64_t host_store_builder_traversals_executed = 0;
+  uint64_t host_store_builder_traversals_saved = 0;
+  uint64_t host_store_estimated_builder_bytes_executed = 0;
+  uint64_t host_store_estimated_builder_bytes_saved = 0;
+  uint64_t host_store_static_binding_builder_calls = 0;
+  uint64_t host_store_cost_layout_builder_calls = 0;
+  uint64_t host_store_hessian_topology_builder_calls = 0;
+  uint64_t host_store_hessian_segment_plan_builder_calls = 0;
+  uint64_t host_store_schur_topology_builder_calls = 0;
+  uint64_t host_store_schur_segment_plan_builder_calls = 0;
+  uint64_t host_store_dynamic_state_refresh_calls = 0;
+  uint64_t host_store_descriptor_identity = 0;
+  uint64_t host_store_descriptor_items = 0;
+  uint64_t host_store_descriptor_hash_updates = 0;
+  uint64_t host_store_device_static_h2d_saved_calls = 0;
+  uint64_t host_store_device_static_h2d_saved_bytes = 0;
+  uint64_t host_store_dynamic_h2d_calls = 0;
+  uint64_t host_store_dynamic_h2d_bytes = 0;
+  uint64_t host_store_host_resident_bytes = 0;
+  uint64_t host_store_host_peak_bytes = 0;
+  uint64_t host_store_owner_identity_violations = 0;
+  uint64_t host_store_coverage_violations = 0;
+  uint64_t host_store_busy_failures = 0;
+  bool host_store_catalog_valid = false;
+  bool host_store_device_prepared_context_reuse = false;
+  bool host_store_full_cross_solve_initialization_removed = false;
+  double host_store_descriptor_milliseconds = 0.0;
+  double host_store_lookup_milliseconds = 0.0;
+  double host_store_catalog_delta_milliseconds = 0.0;
+  double host_store_view_build_or_patch_milliseconds = 0.0;
+  double host_store_dynamic_refresh_milliseconds = 0.0;
+  double host_store_preparation_total_milliseconds = 0.0;
+  double host_store_prepare_and_cuda_wall_seconds = 0.0;
+  double problem_source_prepare_and_cuda_wall_seconds = 0.0;
+  double custom_cuda_caller_wall_seconds = 0.0;
+  double bundle_adjuster_setup_milliseconds = 0.0;
+  double snapshot_materialization_milliseconds = 0.0;
+  double active_spec_build_milliseconds = 0.0;
+  double active_spec_checkpoint_milliseconds = 0.0;
+  double legacy_cpu_preparation_milliseconds = 0.0;
+  double fast_cpu_preparation_milliseconds = 0.0;
+  uint64_t trigger_image_id = 0;
+  uint64_t refinement_index = 0;
+};
+
+#ifdef GPU_BA_ENABLED
+struct ActiveBaProblemSourceComparisonForTesting {
+  gpu_ba::ActiveBaSolveSpec active;
+  gpu_ba::Snapshot legacy;
+};
+#endif
+
+// Compute the exact options passed by the original BundleAdjuster to
+// ceres::Solve. Fidelity replay serializes the returned value and restores it;
+// it must not call this helper to infer options.
+ceres::Solver::Options CreateEffectiveBundleAdjustmentSolverOptions(
+    const BundleAdjustmentOptions& options,
+    size_t config_num_images,
+    int problem_num_residuals);
 
 // Configuration container to setup bundle adjustment problems.
 class BundleAdjustmentConfig {
@@ -228,16 +425,38 @@ class BundleAdjustmentConfig {
 class BundleAdjuster {
  public:
   enum class OptimazePhrase{Local, Global, WholeMap};
+  enum class FailureModeForTesting {
+    kNone = 0,
+    kCustomCudaFailure = 1,
+    kCeresFailure = 2,
+    kCudaTopologyMismatch = 3,
+    kRestoreValidationFailure = 4,
+    kActiveSpecBuildFailure = 5,
+    kCustomCudaThenCeresFailure = 6,
+  };
   BundleAdjuster(const BundleAdjustmentOptions& options,//
                  const BundleAdjustmentConfig& config);//
   ~BundleAdjuster();
 
   void SetOptimazePhrase(const OptimazePhrase& phrase);
+  void SetCudaHostStoreBinding(
+      const gpu_ba::CudaHostStoreBinding& binding) noexcept;
 
   bool Solve(Reconstruction* reconstruction);
+#ifdef GPU_BA_ENABLED
+  bool CompareProblemSourcesForTesting(
+      Reconstruction* reconstruction,
+      ActiveBaProblemSourceComparisonForTesting* comparison,
+      std::string* error);
+#endif
 
   // Get the Ceres solver summary for the last call to `Solve`.
   const ceres::Solver::Summary& Summary() const;
+  const BundleAdjustmentExecutionResult& ExecutionResult() const;
+
+  static uint64_t CeresSolveCallCountForTesting();
+  static void ResetCeresSolveCallCountForTesting();
+  static void SetFailureModeForTesting(FailureModeForTesting mode);
 
  private:
   void SetUp(Reconstruction* reconstruction,
@@ -266,7 +485,11 @@ class BundleAdjuster {
                          ceres::LossFunction* loss_function);
 #ifdef GPU_BA_ENABLED
   bool CaptureSnapshotIfRequested(Reconstruction* reconstruction,
-                                  uint64_t ba_call_index);
+                                  const ceres::Solver::Options& solver_options,
+                                  bool write_snapshot,
+                                  uint64_t ba_call_index,
+                                  gpu_ba::Snapshot* snapshot,
+                                  gpu_ba::SnapshotWriteResult* result);
 #endif
  protected:
   void ParameterizeCameras(Reconstruction* reconstruction);
@@ -276,12 +499,18 @@ class BundleAdjuster {
   const BundleAdjustmentOptions options_;
   BundleAdjustmentConfig config_;
   std::unique_ptr<ceres::Problem> problem_;
+  bool solve_called_ = false;
   ceres::Solver::Summary summary_;
+  BundleAdjustmentExecutionResult execution_result_;
   std::unordered_set<camera_t> camera_ids_;
   std::unordered_map<point3D_t, size_t> point3D_num_observations_;
 #ifdef GPU_BA_ENABLED
   std::unique_ptr<gpu_ba::SnapshotRecorder> snapshot_recorder_;
+  std::unique_ptr<gpu_ba::ActiveBaSolveSpecBuilder> active_spec_builder_;
 #endif
+  uint64_t ceres_cost_function_creations_ = 0;
+  uint64_t ceres_add_residual_calls_ = 0;
+  gpu_ba::CudaHostStoreBinding cuda_host_store_binding_;
 };
 
 // Bundle adjustment using PBA (GPU or CPU). Less flexible and accurate than

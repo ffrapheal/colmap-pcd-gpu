@@ -50,6 +50,9 @@ COLMAP_ADD_EXECUTABLE(colmap_exe
     vocab_tree.cc
     ${GPU_BA_EXE_SOURCES})
 set_target_properties(colmap_exe PROPERTIES OUTPUT_NAME colmap)
+if(GPU_BA_CUDA_ENABLED)
+    target_link_libraries(colmap_exe gpu_ba_custom_cuda)
+endif()
 
 COLMAP_ADD_SOURCES(
     feature.h feature.cc

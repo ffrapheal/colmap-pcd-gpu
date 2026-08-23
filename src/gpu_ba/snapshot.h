@@ -3,6 +3,7 @@
 
 #include <array>
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -19,6 +20,25 @@ enum class ParameterKind : uint8_t {
   kTranslation = 1,
   kPoint3D = 2,
   kCamera = 3,
+};
+
+struct ParameterIdentityKey {
+  ParameterKind kind = ParameterKind::kPoint3D;
+  uint64_t entity_id = 0;
+
+  bool operator==(const ParameterIdentityKey& other) const noexcept {
+    return kind == other.kind && entity_id == other.entity_id;
+  }
+};
+
+struct ParameterIdentityKeyHash {
+  size_t operator()(const ParameterIdentityKey& value) const noexcept {
+    const size_t entity_hash = std::hash<uint64_t>()(value.entity_id);
+    const size_t kind_hash = std::hash<uint8_t>()(
+        static_cast<uint8_t>(value.kind));
+    return entity_hash ^ (kind_hash + 0x9e3779b9u + (entity_hash << 6) +
+                          (entity_hash >> 2));
+  }
 };
 
 struct SnapshotMetadata {
@@ -121,18 +141,32 @@ struct OrderEntrySnapshot {
   uint64_t point3D_id = 0;
 };
 
-struct Snapshot {
+// Core numerical problem/state consumed by the custom CUDA solver. It excludes
+// legacy capture-only track and parameter-canonical payloads so production
+// callers can provide a typed active solve without materializing a Snapshot.
+struct CudaSolveProblem {
   SnapshotMetadata metadata;
   std::vector<CameraSnapshot> cameras;
   std::vector<ImageSnapshot> images;
   std::vector<PointSnapshot> points;
   std::vector<ObservationSnapshot> observations;
-  std::vector<TrackElementSnapshot> tracks;
   std::vector<LidarSnapshot> lidar;
   std::vector<ParameterBlockSnapshot> parameter_blocks_source_order;
-  std::vector<uint64_t> parameter_blocks_canonical_order;
   std::vector<OrderEntrySnapshot> source_insertion_order;
   std::vector<OrderEntrySnapshot> canonical_order;
+
+  // Runtime-only prepared-view descriptor. SnapshotRecorder derives this
+  // while SetUp/Finalize already owns the active-entity traversal. It is not
+  // serialized and therefore does not change the V1 snapshot schema/hash.
+  uint64_t prepared_host_topology_identity = 0;
+  uint64_t prepared_host_descriptor_items = 0;
+  uint64_t prepared_host_descriptor_hash_updates = 0;
+  double prepared_host_descriptor_wall_milliseconds = 0.0;
+};
+
+struct Snapshot : CudaSolveProblem {
+  std::vector<TrackElementSnapshot> tracks;
+  std::vector<uint64_t> parameter_blocks_canonical_order;
 };
 
 struct SnapshotIntegrity {

@@ -36,7 +36,9 @@ project(COLMAP LANGUAGES C CXX)
 set(COLMAP_VERSION "3.8")
 set(COLMAP_VERSION_NUMBER "3800")
 
-set(CMAKE_CUDA_ARCHITECTURES "all-major")
+if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+    set(CMAKE_CUDA_ARCHITECTURES "all-major")
+endif()
 
 ################################################################################
 # Include CMake dependencies
@@ -59,6 +61,10 @@ option(IPO_ENABLED "Whether to enable interprocedural optimization" ON)
 option(CUDA_ENABLED "Whether to enable CUDA, if available" OFF)
 option(GPU_BA_ENABLED "Whether to enable the custom GPU BA framework" OFF)
 option(GPU_BA_TESTS_ENABLED "Whether to build only GPU BA tests" OFF)
+option(GPU_BA_CUDA_ENABLED
+       "Whether to enable the standalone custom CUDA BA implementation" OFF)
+option(GPU_BA_CUDA_PERFORMANCE
+       "Build custom CUDA BA performance mode (not correctness reference)" OFF)
 option(GUI_ENABLED "Whether to enable the graphical UI" ON)
 option(OPENGL_ENABLED "Whether to enable OpenGL, if available" ON)
 option(TESTS_ENABLED "Whether to build test binaries" OFF)
@@ -76,6 +82,12 @@ if(TESTS_ENABLED OR GPU_BA_TESTS_ENABLED)
 endif()
 if(GPU_BA_TESTS_ENABLED AND NOT GPU_BA_ENABLED)
     message(FATAL_ERROR "GPU_BA_TESTS_ENABLED requires GPU_BA_ENABLED")
+endif()
+if(GPU_BA_CUDA_ENABLED AND NOT GPU_BA_ENABLED)
+    message(FATAL_ERROR "GPU_BA_CUDA_ENABLED requires GPU_BA_ENABLED")
+endif()
+if(GPU_BA_CUDA_PERFORMANCE AND NOT GPU_BA_CUDA_ENABLED)
+    message(FATAL_ERROR "GPU_BA_CUDA_PERFORMANCE requires GPU_BA_CUDA_ENABLED")
 endif()
 if(BOOST_STATIC)
     set(Boost_USE_STATIC_LIBS ON)
@@ -171,6 +183,28 @@ if(CUDA_ENABLED)
         endif()
     endif()
 endif()
+
+# Keep the custom BA CUDA backend separate from the legacy CUDA path.  A phase
+# 6 build can therefore compile only the new FP64 kernels while CUDA_ENABLED
+# remains OFF, avoiding legacy PBA/SIFT/MVS targets and --use_fast_math.
+if(GPU_BA_CUDA_ENABLED)
+    if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+        message(FATAL_ERROR
+                "GPU_BA_CUDA_ENABLED requires CMAKE_CUDA_ARCHITECTURES")
+    endif()
+    enable_language(CUDA)
+    find_package(CUDAToolkit REQUIRED)
+    add_definitions("-DGPU_BA_CUDA_ENABLED")
+    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -D_FORCE_INLINES")
+    if(NOT IS_MSVC)
+        set(CMAKE_CUDA_FLAGS
+            "${CMAKE_CUDA_FLAGS} --compiler-options -fPIC")
+    endif()
+    message(STATUS
+            "Enabling standalone custom CUDA BA (CUDA ${CUDAToolkit_VERSION}, "
+            "archs: ${CMAKE_CUDA_ARCHITECTURES}, FP64, no fast math)")
+endif()
+
 if(GUI_ENABLED)
     find_package(Qt5 5.4 COMPONENTS Core OpenGL Widgets)
     if(Qt5_FOUND)

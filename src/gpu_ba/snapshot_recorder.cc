@@ -1,7 +1,9 @@
 #include "gpu_ba/snapshot_recorder.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cctype>
+#include <cstring>
 #include <limits>
 #include <set>
 #include <sstream>
@@ -61,11 +63,35 @@ struct ParameterState {
   uint32_t tangent_size = 0;
 };
 
-uint64_t ParameterKey(ParameterKind kind, uint64_t entity_id) {
-  return (static_cast<uint64_t>(kind) << 60) ^ entity_id;
+void DescriptorHashByte(uint64_t* state, const uint8_t value) {
+  *state ^= value;
+  *state *= 1099511628211ull;
+}
+
+void DescriptorHashWord(uint64_t* state, uint64_t value) {
+  for (size_t i = 0; i < sizeof(value); ++i) {
+    DescriptorHashByte(state, static_cast<uint8_t>(value & 0xffu));
+    value >>= 8;
+  }
+}
+
+void DescriptorHashDouble(uint64_t* state, const double value) {
+  uint64_t bits = 0;
+  static_assert(sizeof(bits) == sizeof(value), "double descriptor size");
+  std::memcpy(&bits, &value, sizeof(bits));
+  DescriptorHashWord(state, bits);
+}
+
+void DescriptorHashString(uint64_t* state, const std::string& value) {
+  DescriptorHashWord(state, value.size());
+  for (const unsigned char ch : value) DescriptorHashByte(state, ch);
 }
 
 }  // namespace
+
+SnapshotRecorder::SnapshotRecorder(
+    const bool compute_prepared_host_descriptor)
+    : compute_prepared_host_descriptor_(compute_prepared_host_descriptor) {}
 
 bool ShouldCaptureSnapshot(const std::string& capture_mode,
                            const std::string& registered_images,
@@ -128,6 +154,19 @@ void SnapshotRecorder::RecordVisualResidual(
   entry.point2D_idx = point2D_idx;
   entry.point3D_id = point3D_id;
   source_order_.push_back(entry);
+
+  if (compute_prepared_host_descriptor_) {
+    DescriptorHashWord(&residual_descriptor_identity_, 0);
+    DescriptorHashWord(&residual_descriptor_identity_, source_index);
+    DescriptorHashWord(&residual_descriptor_identity_, image_id);
+    DescriptorHashWord(&residual_descriptor_identity_, point2D_idx);
+    DescriptorHashWord(&residual_descriptor_identity_, point3D_id);
+    DescriptorHashWord(&residual_descriptor_identity_, pose_constant);
+    DescriptorHashDouble(&residual_descriptor_identity_, xy[0]);
+    DescriptorHashDouble(&residual_descriptor_identity_, xy[1]);
+    residual_descriptor_hash_updates_ += 8;
+    ++residual_descriptor_items_;
+  }
 }
 
 void SnapshotRecorder::RecordLidarResidual(
@@ -157,6 +196,24 @@ void SnapshotRecorder::RecordLidarResidual(
   entry.point2D_idx = std::numeric_limits<uint32_t>::max();
   entry.point3D_id = point3D_id;
   source_order_.push_back(entry);
+
+  if (compute_prepared_host_descriptor_) {
+    DescriptorHashWord(&residual_descriptor_identity_, 1);
+    DescriptorHashWord(&residual_descriptor_identity_, source_index);
+    DescriptorHashWord(&residual_descriptor_identity_, point3D_id);
+    DescriptorHashWord(&residual_descriptor_identity_, lidar_type);
+    DescriptorHashWord(&residual_descriptor_identity_, has_search_range);
+    DescriptorHashDouble(&residual_descriptor_identity_, search_range);
+    DescriptorHashDouble(&residual_descriptor_identity_, weight);
+    for (const double value : lidar_xyz) {
+      DescriptorHashDouble(&residual_descriptor_identity_, value);
+    }
+    for (const double value : plane) {
+      DescriptorHashDouble(&residual_descriptor_identity_, value);
+    }
+    residual_descriptor_hash_updates_ += 13;
+    ++residual_descriptor_items_;
+  }
 }
 
 void SnapshotRecorder::RecordParameterBlock(ParameterKind kind,
@@ -171,15 +228,20 @@ void SnapshotRecorder::RecordParameterBlock(ParameterKind kind,
   parameters_.push_back(parameter);
 }
 
-bool SnapshotRecorder::FinalizeAndWrite(
+bool SnapshotRecorder::Finalize(
     const BundleAdjustmentOptions& options,
+    const ceres::Solver::Options& effective_solver_options,
     const BundleAdjustmentConfig& config,
     const Reconstruction& reconstruction,
     const ceres::Problem& problem,
     BaKind ba_kind,
     uint64_t ba_call_index,
-    SnapshotWriteResult* result,
+    Snapshot* snapshot_output,
     std::string* error) const {
+  if (snapshot_output == nullptr) {
+    *error = "Snapshot recorder requires an output snapshot";
+    return false;
+  }
   Snapshot snapshot;
   snapshot.metadata.ba_kind = ba_kind;
   snapshot.metadata.registered_image_count = reconstruction.NumRegImages();
@@ -202,17 +264,17 @@ bool SnapshotRecorder::FinalizeAndWrite(
   snapshot.metadata.icp_ground_lidar_weight =
       options.icp_ground_lidar_constraint_weight;
   snapshot.metadata.function_tolerance =
-      options.solver_options.function_tolerance;
+      effective_solver_options.function_tolerance;
   snapshot.metadata.gradient_tolerance =
-      options.solver_options.gradient_tolerance;
+      effective_solver_options.gradient_tolerance;
   snapshot.metadata.parameter_tolerance =
-      options.solver_options.parameter_tolerance;
+      effective_solver_options.parameter_tolerance;
   snapshot.metadata.max_num_iterations =
-      options.solver_options.max_num_iterations;
+      effective_solver_options.max_num_iterations;
   snapshot.metadata.max_linear_solver_iterations =
-      options.solver_options.max_linear_solver_iterations;
+      effective_solver_options.max_linear_solver_iterations;
   snapshot.metadata.max_consecutive_invalid_steps =
-      options.solver_options.max_num_consecutive_invalid_steps;
+      effective_solver_options.max_num_consecutive_invalid_steps;
 
   std::ostringstream snapshot_id;
   snapshot_id << BaKindName(ba_kind) << "-reg"
@@ -222,7 +284,8 @@ bool SnapshotRecorder::FinalizeAndWrite(
               << SanitizeIdToken(snapshot.metadata.optimize_phrase);
   snapshot.metadata.snapshot_id = snapshot_id.str();
 
-  std::unordered_map<uint64_t, ParameterState> parameter_states;
+  std::unordered_map<ParameterIdentityKey, ParameterState,
+                     ParameterIdentityKeyHash> parameter_states;
   snapshot.parameter_blocks_source_order.reserve(parameters_.size());
   for (size_t index = 0; index < parameters_.size(); ++index) {
     const auto& recorded = parameters_[index];
@@ -244,7 +307,8 @@ bool SnapshotRecorder::FinalizeAndWrite(
     state.constant = parameter.constant;
     state.ambient_size = parameter.ambient_size;
     state.tangent_size = parameter.tangent_size;
-    parameter_states[ParameterKey(recorded.kind, recorded.entity_id)] = state;
+    parameter_states[ParameterIdentityKey{recorded.kind, recorded.entity_id}] =
+        state;
   }
   snapshot.parameter_blocks_canonical_order.resize(parameters_.size());
   for (size_t i = 0; i < parameters_.size(); ++i) {
@@ -289,9 +353,9 @@ bool SnapshotRecorder::FinalizeAndWrite(
     const Image& image = reconstruction.Image(image_id);
     camera_ids.insert(image.CameraId());
     const auto q_state = parameter_states.find(
-        ParameterKey(ParameterKind::kQuaternion, image_id));
+        ParameterIdentityKey{ParameterKind::kQuaternion, image_id});
     const auto t_state = parameter_states.find(
-        ParameterKey(ParameterKind::kTranslation, image_id));
+        ParameterIdentityKey{ParameterKind::kTranslation, image_id});
     ImageSnapshot output;
     output.image_id = image_id;
     output.camera_id = image.CameraId();
@@ -313,7 +377,7 @@ bool SnapshotRecorder::FinalizeAndWrite(
   for (const uint32_t camera_id : camera_ids) {
     const Camera& camera = reconstruction.Camera(camera_id);
     const auto state = parameter_states.find(
-        ParameterKey(ParameterKind::kCamera, camera_id));
+        ParameterIdentityKey{ParameterKind::kCamera, camera_id});
     CameraSnapshot output;
     output.camera_id = camera_id;
     output.model_id = camera.ModelId();
@@ -327,7 +391,7 @@ bool SnapshotRecorder::FinalizeAndWrite(
   for (const uint64_t point_id : point_ids) {
     const Point3D& point = reconstruction.Point3D(point_id);
     const auto state = parameter_states.find(
-        ParameterKey(ParameterKind::kPoint3D, point_id));
+        ParameterIdentityKey{ParameterKind::kPoint3D, point_id});
     PointSnapshot output;
     output.point3D_id = point_id;
     output.constant = state == parameter_states.end() || state->second.constant;
@@ -371,7 +435,97 @@ bool SnapshotRecorder::FinalizeAndWrite(
                               rhs.point3D_id, rhs.source_index);
             });
 
-  return WriteSnapshot(snapshot, options.ba_snapshot_dir, result, error);
+  if (compute_prepared_host_descriptor_) {
+    // Residual identity is accumulated inside SetUp. This final pass only
+    // covers the active entities and parameter blocks already materialized by
+    // Finalize, and is entirely absent when the host store is disabled.
+    const auto descriptor_start = std::chrono::steady_clock::now();
+    uint64_t descriptor = residual_descriptor_identity_;
+    uint64_t descriptor_hash_updates = residual_descriptor_hash_updates_;
+    const auto hash_word = [&](const uint64_t value) {
+      DescriptorHashWord(&descriptor, value);
+      ++descriptor_hash_updates;
+    };
+    const auto hash_double = [&](const double value) {
+      DescriptorHashDouble(&descriptor, value);
+      ++descriptor_hash_updates;
+    };
+    const auto hash_string = [&](const std::string& value) {
+      DescriptorHashString(&descriptor, value);
+      ++descriptor_hash_updates;
+    };
+    hash_word(0x4853545657455631ull);
+    hash_word(static_cast<uint64_t>(ba_kind));
+    hash_word(options.refine_focal_length);
+    hash_word(options.refine_principal_point);
+    hash_word(options.refine_extra_params);
+    hash_word(options.refine_extrinsics);
+    hash_string(snapshot.metadata.loss_function);
+    hash_string(snapshot.metadata.lidar_residual_mode);
+    for (const CameraSnapshot& value : snapshot.cameras) {
+      hash_word(value.camera_id);
+      hash_word(static_cast<uint64_t>(value.model_id));
+      hash_word(value.width);
+      hash_word(value.height);
+      hash_word(value.constant);
+      hash_word(value.params.size());
+      for (const double parameter : value.params) hash_double(parameter);
+    }
+    for (const ImageSnapshot& value : snapshot.images) {
+      hash_word(value.image_id);
+      hash_word(value.camera_id);
+      hash_word(value.selected);
+      hash_word(value.pose_constant);
+      hash_word(value.has_pose_parameter_blocks);
+      hash_word(value.constant_tvec_mask);
+    }
+    for (const PointSnapshot& value : snapshot.points) {
+      hash_word(value.point3D_id);
+      hash_word(value.constant);
+      hash_word(value.config_role);
+      hash_word(value.has_search_range);
+      if (value.has_search_range) hash_double(value.search_range);
+    }
+    for (const ParameterBlockSnapshot& value :
+         snapshot.parameter_blocks_source_order) {
+      hash_word(value.source_index);
+      hash_word(static_cast<uint64_t>(value.kind));
+      hash_word(value.entity_id);
+      hash_word(value.ambient_size);
+      hash_word(value.tangent_size);
+      hash_word(value.constant);
+    }
+    snapshot.prepared_host_topology_identity = descriptor == 0 ? 1 : descriptor;
+    snapshot.prepared_host_descriptor_items =
+        residual_descriptor_items_ + snapshot.cameras.size() +
+        snapshot.images.size() + snapshot.points.size() +
+        snapshot.parameter_blocks_source_order.size();
+    snapshot.prepared_host_descriptor_hash_updates = descriptor_hash_updates;
+    snapshot.prepared_host_descriptor_wall_milliseconds =
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - descriptor_start).count();
+  }
+
+  *snapshot_output = std::move(snapshot);
+  return true;
+}
+
+bool SnapshotRecorder::FinalizeAndWrite(
+    const BundleAdjustmentOptions& options,
+    const ceres::Solver::Options& effective_solver_options,
+    const BundleAdjustmentConfig& config,
+    const Reconstruction& reconstruction,
+    const ceres::Problem& problem,
+    BaKind ba_kind,
+    uint64_t ba_call_index,
+    Snapshot* snapshot_output,
+    SnapshotWriteResult* result,
+    std::string* error) const {
+  if (!Finalize(options, effective_solver_options, config, reconstruction,
+                problem, ba_kind, ba_call_index, snapshot_output, error)) {
+    return false;
+  }
+  return WriteSnapshot(*snapshot_output, options.ba_snapshot_dir, result, error);
 }
 
 }  // namespace gpu_ba

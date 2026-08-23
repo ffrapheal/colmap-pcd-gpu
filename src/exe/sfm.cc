@@ -246,6 +246,12 @@ int RunMapper(int argc, char** argv) {
   mapper.Start();
   mapper.Wait();
 
+  if (mapper.HasFailed()) {
+    std::cerr << "ERROR: incremental mapper stopped after bundle-adjustment failure"
+              << std::endl;
+    return EXIT_FAILURE;
+  }
+
   if (reconstruction_manager.Size() == 0) {
     std::cerr << "ERROR: failed to create sparse model" << std::endl;
     return EXIT_FAILURE;

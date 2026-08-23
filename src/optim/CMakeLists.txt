@@ -42,6 +42,20 @@ COLMAP_ADD_SOURCES(
 )
 
 COLMAP_ADD_TEST(bundle_adjustment_test bundle_adjustment_test.cc)
+if(TESTS_ENABLED OR GPU_BA_TESTS_ENABLED)
+    add_executable(bundle_adjustment_production_test
+                   bundle_adjustment_production_test.cc)
+    set_target_properties(bundle_adjustment_production_test PROPERTIES FOLDER
+        ${COLMAP_TARGETS_ROOT_FOLDER}/${FOLDER_NAME})
+    target_link_libraries(bundle_adjustment_production_test colmap
+                          ${Boost_UNIT_TEST_FRAMEWORK_LIBRARY})
+    if(GPU_BA_CUDA_ENABLED)
+        target_link_libraries(bundle_adjustment_production_test
+                              gpu_ba_custom_cuda)
+    endif()
+    add_test("optim/bundle_adjustment_production_test"
+             bundle_adjustment_production_test)
+endif()
 COLMAP_ADD_TEST(combination_sampler_test combination_sampler_test.cc)
 COLMAP_ADD_TEST(least_absolute_deviations_test
                 least_absolute_deviations_test.cc)

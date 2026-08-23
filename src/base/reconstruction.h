@@ -32,6 +32,8 @@
 #ifndef COLMAP_SRC_BASE_RECONSTRUCTION_H_
 #define COLMAP_SRC_BASE_RECONSTRUCTION_H_
 
+#include <deque>
+#include <string>
 #include <tuple>
 #include <unordered_map>
 #include <unordered_set>
@@ -59,6 +61,52 @@ struct RANSACOptions;
 class DatabaseCache;
 class CorrespondenceGraph;
 
+enum class ReconstructionStructureEventKind : uint8_t {
+  kImageRegistrationChanged = 0,
+  kCameraAssociationChanged = 1,
+  kCameraAdded = 2,
+  kImageAdded = 3,
+  kPointAdded = 4,
+  kPointDeleted = 5,
+  kPointMerged = 6,
+  kObservationAdded = 7,
+  kObservationDeleted = 8,
+  kBulkUnknown = 9,
+};
+
+// A typed structural delta. Numeric camera/pose/point values deliberately do
+// not appear here: they are refreshed by each solve's dynamic-state overlay.
+struct ReconstructionStructureEvent {
+  ReconstructionStructureEventKind kind =
+      ReconstructionStructureEventKind::kBulkUnknown;
+  image_t image_id = kInvalidImageId;
+  camera_t old_camera_id = kInvalidCameraId;
+  camera_t new_camera_id = kInvalidCameraId;
+  point3D_t point3D_id = kInvalidPoint3DId;
+  point3D_t old_point3D_id1 = kInvalidPoint3DId;
+  point3D_t old_point3D_id2 = kInvalidPoint3DId;
+  point2D_t point2D_idx = kInvalidPoint2DIdx;
+  bool old_registration = false;
+  bool new_registration = false;
+  std::vector<TrackElement> old_track;
+  std::string reason;
+};
+
+struct ReconstructionStructureBatch {
+  uint64_t revision = 0;
+  std::vector<ReconstructionStructureEvent> events;
+};
+
+struct ReconstructionStructureReadResult {
+  bool complete = false;
+  bool gap = false;
+  uint64_t owner_epoch = 0;
+  uint64_t cursor = 0;
+  uint64_t current_revision = 0;
+  uint64_t oldest_retained_revision = 0;
+  std::vector<ReconstructionStructureBatch> batches;
+};
+
 // Reconstruction class holds all information about a single reconstructed
 // model. It is used by the mapping and bundle adjustment classes and can be
 // written to and read from disk.
@@ -72,6 +120,40 @@ class Reconstruction {
   };
 
   Reconstruction();
+
+  // RAII boundary for compound structural mutations. Nested public mutators
+  // contribute to the outer batch. A merge uses suppress_nested_events=true
+  // and publishes one composite PointMerged event after the operation succeeds.
+  class StructureMutationBatch {
+   public:
+    explicit StructureMutationBatch(
+        Reconstruction* reconstruction,
+        bool suppress_nested_events = false);
+    ~StructureMutationBatch();
+    StructureMutationBatch(const StructureMutationBatch&) = delete;
+    StructureMutationBatch& operator=(const StructureMutationBatch&) = delete;
+
+    void RecordComposite(ReconstructionStructureEvent event);
+    void Cancel() noexcept;
+
+   private:
+    Reconstruction* reconstruction_ = nullptr;
+    bool outer_ = false;
+    bool canceled_ = false;
+  };
+
+  // Mapper enables the bounded journal only after Load/SetUp and disables it
+  // before TearDown. owner_epoch is non-zero and never reused by the owner.
+  void BeginStructureJournal(uint64_t owner_epoch,
+                             size_t retained_batch_capacity = 4096);
+  void EndStructureJournal();
+  void MarkStructureUnknown(const std::string& reason);
+  ReconstructionStructureReadResult ReadStructureEventsSince(
+      uint64_t owner_epoch, uint64_t cursor) const;
+  inline uint64_t StructureOwnerEpoch() const;
+  inline uint64_t StructureRevision() const;
+  inline uint64_t OldestRetainedStructureRevision() const;
+  inline bool StructureJournalEnabled() const;
 
   // Get number of objects.
   inline size_t NumCameras() const;
@@ -395,6 +477,15 @@ class Reconstruction {
   void CreateImageDirs(const std::string& path) const;
 
  private:
+  friend class StructureMutationBatch;
+
+  bool BeginStructureMutationBatch(bool suppress_nested_events);
+  void FinishStructureMutationBatch(bool outer, bool commit);
+  void AbortStructureMutationBatch() noexcept;
+  void RecordStructureEvent(ReconstructionStructureEvent event,
+                            bool force = false);
+  void PublishStructureBatch();
+
   size_t FilterPoints3DWithSmallTriangulationAngle(
       const double min_tri_angle,
       const std::unordered_set<point3D_t>& point3D_ids);
@@ -443,6 +534,17 @@ class Reconstruction {
 
   // Total number of added 3D points, used to generate unique identifiers.
   point3D_t num_added_points3D_;
+
+  bool structure_journal_enabled_ = false;
+  uint64_t structure_owner_epoch_ = 0;
+  uint64_t structure_revision_ = 0;
+  uint64_t oldest_retained_structure_revision_ = 0;
+  size_t structure_journal_capacity_ = 0;
+  size_t structure_mutation_depth_ = 0;
+  bool structure_suppress_nested_events_ = false;
+  bool structure_batch_abort_requested_ = false;
+  std::vector<ReconstructionStructureEvent> pending_structure_events_;
+  std::deque<ReconstructionStructureBatch> structure_journal_;
 
 };
 
@@ -559,6 +661,22 @@ bool Reconstruction::ExistsImagePair(const image_t image_id1, const image_t imag
 
 bool Reconstruction::IsImageRegistered(const image_t image_id) const {
   return Image(image_id).IsRegistered();
+}
+
+uint64_t Reconstruction::StructureOwnerEpoch() const {
+  return structure_owner_epoch_;
+}
+
+uint64_t Reconstruction::StructureRevision() const {
+  return structure_revision_;
+}
+
+uint64_t Reconstruction::OldestRetainedStructureRevision() const {
+  return oldest_retained_structure_revision_;
+}
+
+bool Reconstruction::StructureJournalEnabled() const {
+  return structure_journal_enabled_;
 }
 
 template <bool kEstimateScale>

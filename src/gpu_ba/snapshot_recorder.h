@@ -7,11 +7,9 @@
 #include <unordered_map>
 #include <vector>
 
-#include "gpu_ba/snapshot.h"
+#include <ceres/ceres.h>
 
-namespace ceres {
-class Problem;
-}
+#include "gpu_ba/snapshot.h"
 
 namespace colmap {
 
@@ -29,6 +27,8 @@ bool ShouldCaptureSnapshot(const std::string& capture_mode,
 
 class SnapshotRecorder {
  public:
+  explicit SnapshotRecorder(bool compute_prepared_host_descriptor = false);
+
   void RecordVisualResidual(uint32_t image_id,
                             uint32_t point2D_idx,
                             uint64_t point3D_id,
@@ -47,12 +47,24 @@ class SnapshotRecorder {
                             uint64_t entity_id,
                             double* values);
 
+  bool Finalize(const BundleAdjustmentOptions& options,
+                const ceres::Solver::Options& effective_solver_options,
+                const BundleAdjustmentConfig& config,
+                const Reconstruction& reconstruction,
+                const ceres::Problem& problem,
+                BaKind ba_kind,
+                uint64_t ba_call_index,
+                Snapshot* snapshot,
+                std::string* error) const;
+
   bool FinalizeAndWrite(const BundleAdjustmentOptions& options,
+                        const ceres::Solver::Options& effective_solver_options,
                         const BundleAdjustmentConfig& config,
                         const Reconstruction& reconstruction,
                         const ceres::Problem& problem,
                         BaKind ba_kind,
                         uint64_t ba_call_index,
+                        Snapshot* snapshot,
                         SnapshotWriteResult* result,
                         std::string* error) const;
 
@@ -68,6 +80,10 @@ class SnapshotRecorder {
   std::vector<OrderEntrySnapshot> source_order_;
   std::vector<RecordedParameter> parameters_;
   std::unordered_map<double*, size_t> parameter_indices_;
+  bool compute_prepared_host_descriptor_ = false;
+  uint64_t residual_descriptor_identity_ = 1469598103934665603ull;
+  uint64_t residual_descriptor_items_ = 0;
+  uint64_t residual_descriptor_hash_updates_ = 0;
 };
 
 }  // namespace gpu_ba

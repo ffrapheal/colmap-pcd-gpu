@@ -51,6 +51,12 @@ bool QuaternionPlus(const std::array<double, 4>& quaternion,
                     const std::array<double, 3>& delta,
                     std::array<double, 4>* result);
 
+// Exact Ceres 1.14 QuaternionParameterization::Plus semantics. This keeps the
+// ambient product unnormalized and only special-cases an exactly zero delta.
+bool QuaternionPlusCeres14(const std::array<double, 4>& quaternion,
+                           const std::array<double, 3>& delta,
+                           std::array<double, 4>* result);
+
 bool EvaluateOpenCVVisual(const std::array<double, 4>& quaternion,
                           const std::array<double, 3>& translation,
                           const std::array<double, 3>& point,

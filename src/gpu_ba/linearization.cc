@@ -116,6 +116,33 @@ bool QuaternionPlus(const std::array<double, 4>& quaternion,
   return NormalizeQuaternion(product, result);
 }
 
+bool QuaternionPlusCeres14(const std::array<double, 4>& quaternion,
+                           const std::array<double, 3>& delta,
+                           std::array<double, 4>* result) {
+  const double squared_norm = delta[0] * delta[0] + delta[1] * delta[1] +
+                              delta[2] * delta[2];
+  if (!std::isfinite(squared_norm)) return false;
+  const double norm = std::sqrt(squared_norm);
+  if (norm == 0.0) {
+    *result = quaternion;
+    return AllFinite(*result);
+  }
+  const double sin_norm_by_norm = std::sin(norm) / norm;
+  const double dw = std::cos(norm);
+  const double dx = sin_norm_by_norm * delta[0];
+  const double dy = sin_norm_by_norm * delta[1];
+  const double dz = sin_norm_by_norm * delta[2];
+  const double w = quaternion[0];
+  const double x = quaternion[1];
+  const double y = quaternion[2];
+  const double z = quaternion[3];
+  *result = {{dw * w - dx * x - dy * y - dz * z,
+              dw * x + dx * w + dy * z - dz * y,
+              dw * y - dx * z + dy * w + dz * x,
+              dw * z + dx * y - dy * x + dz * w}};
+  return AllFinite(*result);
+}
+
 bool EvaluateOpenCVVisual(const std::array<double, 4>& quaternion,
                           const std::array<double, 3>& translation,
                           const std::array<double, 3>& point,

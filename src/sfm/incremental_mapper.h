@@ -156,6 +156,7 @@ class IncrementalMapper {
   };
 
   struct LocalBundleAdjustmentReport {
+    bool success = true;
     size_t num_merged_observations = 0;
     size_t num_completed_observations = 0;
     size_t num_filtered_observations = 0;
@@ -172,7 +173,13 @@ class IncrementalMapper {
   // Prepare the mapper for a new reconstruction, which might have existing
   // registered images (in which case `RegisterNextImage` must be called) or
   // which is empty (in which case `RegisterInitialImagePair` must be called).
-  void BeginReconstruction(Reconstruction* reconstruction);
+  void BeginReconstruction(
+      Reconstruction* reconstruction
+#ifdef GPU_BA_CUDA_ENABLED
+      , gpu_ba::CudaHostProblemStoreMode host_store_mode =
+            gpu_ba::CudaHostProblemStoreMode::kDisabled
+#endif
+  );
 
   // Cleanup the mapper after the current reconstruction is done. If the
   // model is discarded, the number of total and shared registered images will
@@ -266,6 +273,12 @@ class IncrementalMapper {
   void ClearLidarPoints();
   void LoadPointcloud(std::string& pointcloud_path, 
                       const lidar::PcdProjectionOptions& pp_options);
+#ifdef GPU_BA_CUDA_ENABLED
+  gpu_ba::CudaHostProblemStoreMode CudaHostStoreModeForTesting() const;
+  uint64_t CudaHostStoreOwnerEpochForTesting() const;
+  bool HasCudaHostProblemStoreForTesting() const;
+  gpu_ba::CudaHostStoreBinding CudaHostStoreBindingForTesting() const;
+#endif
 
  private:
   // Find seed images for incremental reconstruction. Suitable seed images have
@@ -345,6 +358,12 @@ class IncrementalMapper {
   std::shared_ptr<lidar::PointCloudProcess> lidar_pointcloud_process_;
   bool if_import_pose_prior_ = false;// if initial image pose guess exist
   std::map<uint32_t, std::vector<double>> existed_poses_;// existed initial image pose guess
+#ifdef GPU_BA_CUDA_ENABLED
+  gpu_ba::CudaHostProblemStoreMode gpu_ba_host_store_mode_ =
+      gpu_ba::CudaHostProblemStoreMode::kDisabled;
+  uint64_t gpu_ba_host_store_owner_epoch_ = 0;
+  std::unique_ptr<gpu_ba::GpuBaHostProblemStore> gpu_ba_host_problem_store_;
+#endif
 };
 
 }  // namespace colmap
