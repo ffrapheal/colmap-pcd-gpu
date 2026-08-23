@@ -2866,6 +2866,62 @@ BOOST_AUTO_TEST_CASE(DeviceControlRejectAndToleranceKeepCurrentBinding) {
       tolerance.runtime.persistent_device.steady_trial_state_d2h_bytes, 0);
 }
 
+BOOST_AUTO_TEST_CASE(DeviceStateUpdateStatusRecoveryAndFailClosed) {
+  Snapshot snapshot = LayerBSnapshot();
+  snapshot.metadata.max_num_iterations = 3;
+  snapshot.metadata.max_consecutive_invalid_steps = 3;
+  snapshot.metadata.function_tolerance = 0.0;
+  snapshot.metadata.gradient_tolerance = 0.0;
+  snapshot.metadata.parameter_tolerance = 0.0;
+
+  CudaFullLmOptions options;
+  options.max_num_iterations = 3;
+  options.max_num_consecutive_invalid_steps = 3;
+  options.function_tolerance = 0.0;
+  options.gradient_tolerance = 0.0;
+  options.parameter_tolerance = 0.0;
+  options.device_context_mode = CudaDeviceContextMode::kDeviceControl;
+  options.hot_kernel_mode = CudaHotKernelMode::kTransformed;
+  options.execution_profile = CudaExecutionProfile::kCompactControl;
+  options.performance_mode = true;
+  options.current_linearization_cache_mode =
+      CudaCurrentLinearizationCacheMode::kEnabled;
+
+  const std::string entry_hash = CudaFinalParametersBitwiseSha256(snapshot);
+  for (const uint32_t status : {4u, 8u}) {
+    CudaFullLmResult recovered;
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(
+        RunCustomCudaSolveWithStateUpdateStatusForTesting(
+            snapshot, options, status, &recovered, &error),
+        error);
+    BOOST_CHECK_EQUAL(recovered.invalid_steps, 1);
+    BOOST_CHECK_EQUAL(recovered.factorization_failures, 0);
+    BOOST_REQUIRE_GE(recovered.trace.size(), 3);
+    const CudaLmIteration& invalid = recovered.trace[1];
+    BOOST_CHECK(invalid.invalid);
+    BOOST_CHECK(invalid.factorization_success);
+    BOOST_CHECK(!invalid.accepted_decision);
+    BOOST_CHECK_LT(invalid.radius_after, invalid.radius_before);
+    BOOST_CHECK_EQUAL(invalid.trial_state_hash, invalid.current_state_hash);
+    BOOST_CHECK(!recovered.trace[2].invalid);
+    BOOST_CHECK_GE(
+        recovered.runtime.persistent_device.state_slot_invalidate_count, 1);
+  }
+
+  for (const uint32_t status : {1u, 2u}) {
+    CudaFullLmResult failed;
+    std::string error;
+    BOOST_CHECK(!RunCustomCudaSolveWithStateUpdateStatusForTesting(
+        snapshot, options, status, &failed, &error));
+    BOOST_CHECK(error.find("invalid mapping") != std::string::npos);
+    BOOST_CHECK_EQUAL(failed.invalid_steps, 0);
+    BOOST_CHECK_EQUAL(failed.factorization_failures, 0);
+    BOOST_CHECK_EQUAL(CudaFinalParametersBitwiseSha256(failed.final_state),
+                      entry_hash);
+  }
+}
+
 BOOST_AUTO_TEST_CASE(DeviceControlAuditMirrorMatchesDeviceStateOracle) {
   Snapshot snapshot = LayerBSnapshot();
   CudaFullLmOptions options;

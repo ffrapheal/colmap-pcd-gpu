@@ -14,10 +14,13 @@ namespace gpu_ba {
 struct Snapshot;
 struct CudaSolveProblem;
 struct CudaFullLmOptions;
+struct IndexedActiveSolveDescriptor;
+struct MapperStaticCatalogStableTables;
 struct PreparedHostSolveViewData;
 struct StaticProblemDataCatalog;
 struct GpuBaHostProblemStoreControl;
 struct PreparedHostStorePublication;
+struct PreparedIndexedCatalogPublication;
 
 enum class CudaHostProblemStoreMode : uint8_t {
   kDisabled = 0,
@@ -25,6 +28,7 @@ enum class CudaHostProblemStoreMode : uint8_t {
 };
 
 class GpuBaHostProblemStore;
+class PreparedIndexedActiveSolve;
 
 struct CudaHostProblemStoreLeaseTestResult {
   bool shutdown_reported_store_busy = false;
@@ -80,6 +84,15 @@ struct CudaHostProblemStoreRuntimeInfo {
   uint64_t schur_topology_builder_calls = 0;
   uint64_t schur_segment_plan_builder_calls = 0;
   uint64_t dynamic_state_refresh_calls = 0;
+  uint64_t indexed_catalog_full_graph_build_calls = 0;
+  uint64_t indexed_catalog_journal_apply_calls = 0;
+  uint64_t indexed_catalog_flatten_calls = 0;
+  uint64_t indexed_catalog_reconcile_calls = 0;
+  uint64_t indexed_catalog_export_calls = 0;
+  uint64_t indexed_active_materializer_calls = 0;
+  uint64_t indexed_full_graph_records_scanned = 0;
+  uint64_t indexed_estimated_impl_copy_bytes = 0;
+  uint64_t indexed_estimated_export_bytes = 0;
   uint64_t device_static_h2d_saved_calls = 0;
   uint64_t device_static_h2d_saved_bytes = 0;
   uint64_t dynamic_h2d_calls = 0;
@@ -155,6 +168,50 @@ class PreparedHostSolveView {
   CudaHostProblemStoreRuntimeInfo runtime_;
 };
 
+// Solve-local lease over the Mapper-owned indexed catalog. The descriptor and
+// exported flat tables are immutable for the lease lifetime and contain no
+// device pointers.
+class PreparedIndexedActiveSolve {
+ public:
+  PreparedIndexedActiveSolve();
+  ~PreparedIndexedActiveSolve();
+  PreparedIndexedActiveSolve(const PreparedIndexedActiveSolve&) = delete;
+  PreparedIndexedActiveSolve& operator=(const PreparedIndexedActiveSolve&) =
+      delete;
+  PreparedIndexedActiveSolve(PreparedIndexedActiveSolve&&) noexcept;
+  PreparedIndexedActiveSolve& operator=(
+      PreparedIndexedActiveSolve&&) noexcept;
+
+  bool valid() const noexcept;
+  const IndexedActiveSolveDescriptor* descriptor() const noexcept;
+  const MapperStaticCatalogStableTables* catalog_tables() const noexcept;
+  const CudaHostProblemStoreRuntimeInfo& runtime_info() const noexcept;
+  // publish is true only after CUDA success and Reconstruction commit. A
+  // failed solve releases the lease without advancing the indexed cursor.
+  bool Complete(bool publish,
+                bool device_cleanup_failed,
+                std::string* error) noexcept;
+
+ private:
+  friend bool PrepareCudaIndexedActiveSolve(
+      const CudaSolveProblem&,
+      const CudaFullLmOptions&,
+      const CudaHostStoreBinding&,
+      PreparedIndexedActiveSolve*,
+      std::string*);
+
+  void CancelIfActive() noexcept;
+
+  std::shared_ptr<const IndexedActiveSolveDescriptor> descriptor_;
+  std::shared_ptr<const MapperStaticCatalogStableTables> catalog_tables_;
+  std::shared_ptr<GpuBaHostProblemStoreControl> control_;
+  std::shared_ptr<PreparedIndexedCatalogPublication> publication_;
+  uint64_t lease_generation_ = 0;
+  uint64_t owner_epoch_ = 0;
+  bool active_ = false;
+  CudaHostProblemStoreRuntimeInfo runtime_;
+};
+
 class GpuBaHostProblemStore {
  public:
   GpuBaHostProblemStore(const Reconstruction* reconstruction,
@@ -178,6 +235,12 @@ class GpuBaHostProblemStore {
       std::string*);
   friend bool RunCudaHostProblemStoreLeaseLifetimeForTesting(
       CudaHostProblemStoreLeaseTestResult*, std::string*);
+  friend bool PrepareCudaIndexedActiveSolve(
+      const CudaSolveProblem&,
+      const CudaFullLmOptions&,
+      const CudaHostStoreBinding&,
+      PreparedIndexedActiveSolve*,
+      std::string*);
 
   std::shared_ptr<GpuBaHostProblemStoreControl> control_;
 };
@@ -192,6 +255,13 @@ bool PrepareCudaHostSolveView(
     const CudaHostStoreBinding& binding,
     PreparedHostSolveView* view,
     CudaHostProblemStoreRuntimeInfo* runtime,
+    std::string* error);
+
+bool PrepareCudaIndexedActiveSolve(
+    const CudaSolveProblem& problem,
+    const CudaFullLmOptions& options,
+    const CudaHostStoreBinding& binding,
+    PreparedIndexedActiveSolve* prepared,
     std::string* error);
 
 bool RunCudaHostProblemStoreLeaseLifetimeForTesting(

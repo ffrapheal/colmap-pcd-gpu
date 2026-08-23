@@ -161,7 +161,8 @@ bool BundleAdjustmentOptions::Check() const {
   CHECK(ba_cuda_host_problem_store == "disabled" ||
         ba_cuda_host_problem_store == "host_prepared_store");
   CHECK(ba_cuda_problem_source == gpu_ba::CudaProblemSource::kLegacySnapshot ||
-        ba_cuda_problem_source == gpu_ba::CudaProblemSource::kActiveSpec);
+        ba_cuda_problem_source == gpu_ba::CudaProblemSource::kActiveSpec ||
+        ba_cuda_problem_source == gpu_ba::CudaProblemSource::kIndexedCatalog);
   CHECK(ba_lidar_residual == "legacy_exact" ||
         ba_lidar_residual == "legacy_guarded" ||
         ba_lidar_residual == "signed");
@@ -1159,6 +1160,24 @@ void WriteExecutionTelemetry(const std::string& path,
        << value.host_store_schur_segment_plan_builder_calls
        << ",\"host_store_dynamic_state_refresh_calls\":"
        << value.host_store_dynamic_state_refresh_calls
+       << ",\"host_store_indexed_catalog_full_graph_build_calls\":"
+       << value.host_store_indexed_catalog_full_graph_build_calls
+       << ",\"host_store_indexed_catalog_journal_apply_calls\":"
+       << value.host_store_indexed_catalog_journal_apply_calls
+       << ",\"host_store_indexed_catalog_flatten_calls\":"
+       << value.host_store_indexed_catalog_flatten_calls
+       << ",\"host_store_indexed_catalog_reconcile_calls\":"
+       << value.host_store_indexed_catalog_reconcile_calls
+       << ",\"host_store_indexed_catalog_export_calls\":"
+       << value.host_store_indexed_catalog_export_calls
+       << ",\"host_store_indexed_active_materializer_calls\":"
+       << value.host_store_indexed_active_materializer_calls
+       << ",\"host_store_indexed_full_graph_records_scanned\":"
+       << value.host_store_indexed_full_graph_records_scanned
+       << ",\"host_store_indexed_estimated_impl_copy_bytes\":"
+       << value.host_store_indexed_estimated_impl_copy_bytes
+       << ",\"host_store_indexed_estimated_export_bytes\":"
+       << value.host_store_indexed_estimated_export_bytes
        << ",\"host_store_descriptor_identity\":"
        << value.host_store_descriptor_identity
        << ",\"host_store_descriptor_items\":"
@@ -1173,6 +1192,36 @@ void WriteExecutionTelemetry(const std::string& path,
        << value.host_store_dynamic_h2d_calls
        << ",\"host_store_dynamic_h2d_bytes\":"
        << value.host_store_dynamic_h2d_bytes
+       << ",\"cuda_host_build_cuda_layer_a_inputs_calls\":"
+       << value.cuda_host_build_cuda_layer_a_inputs_calls
+       << ",\"cuda_host_build_static_layout_calls\":"
+       << value.cuda_host_build_static_layout_calls
+       << ",\"cuda_host_build_cost_layout_calls\":"
+       << value.cuda_host_build_cost_layout_calls
+       << ",\"cuda_host_build_layer_b_topology_calls\":"
+       << value.cuda_host_build_layer_b_topology_calls
+       << ",\"cuda_host_build_layer_c_topology_calls\":"
+       << value.cuda_host_build_layer_c_topology_calls
+       << ",\"indexed_device_catalog_lookup_calls\":"
+       << value.indexed_device_catalog_lookup_calls
+       << ",\"indexed_device_catalog_reuse_calls\":"
+       << value.indexed_device_catalog_reuse_calls
+       << ",\"indexed_device_catalog_revision_rebinds\":"
+       << value.indexed_device_catalog_revision_rebinds
+       << ",\"indexed_device_catalog_full_upload_calls\":"
+       << value.indexed_device_catalog_full_upload_calls
+       << ",\"indexed_device_catalog_full_upload_bytes\":"
+       << value.indexed_device_catalog_full_upload_bytes
+       << ",\"indexed_device_catalog_patch_upload_calls\":"
+       << value.indexed_device_catalog_patch_upload_calls
+       << ",\"indexed_device_catalog_patch_upload_bytes\":"
+       << value.indexed_device_catalog_patch_upload_bytes
+       << ",\"indexed_device_catalog_invalidations\":"
+       << value.indexed_device_catalog_invalidations
+       << ",\"indexed_device_catalog_prefix_bytes\":"
+       << value.indexed_device_catalog_prefix_bytes
+       << ",\"indexed_device_catalog_arena_generation\":"
+       << value.indexed_device_catalog_arena_generation
        << ",\"host_store_host_resident_bytes\":"
        << value.host_store_host_resident_bytes
        << ",\"host_store_host_peak_bytes\":"
@@ -1276,6 +1325,24 @@ void CopyHostStoreRuntimeToExecution(
       source.schur_segment_plan_builder_calls;
   target->host_store_dynamic_state_refresh_calls =
       source.dynamic_state_refresh_calls;
+  target->host_store_indexed_catalog_full_graph_build_calls =
+      source.indexed_catalog_full_graph_build_calls;
+  target->host_store_indexed_catalog_journal_apply_calls =
+      source.indexed_catalog_journal_apply_calls;
+  target->host_store_indexed_catalog_flatten_calls =
+      source.indexed_catalog_flatten_calls;
+  target->host_store_indexed_catalog_reconcile_calls =
+      source.indexed_catalog_reconcile_calls;
+  target->host_store_indexed_catalog_export_calls =
+      source.indexed_catalog_export_calls;
+  target->host_store_indexed_active_materializer_calls =
+      source.indexed_active_materializer_calls;
+  target->host_store_indexed_full_graph_records_scanned =
+      source.indexed_full_graph_records_scanned;
+  target->host_store_indexed_estimated_impl_copy_bytes =
+      source.indexed_estimated_impl_copy_bytes;
+  target->host_store_indexed_estimated_export_bytes =
+      source.indexed_estimated_export_bytes;
   target->host_store_device_static_h2d_saved_calls =
       source.device_static_h2d_saved_calls;
   target->host_store_device_static_h2d_saved_bytes =
@@ -2040,6 +2107,11 @@ bool BundleAdjuster::Solve(Reconstruction* reconstruction) {
   const bool active_spec_requested =
       options_.ba_cuda_problem_source ==
       gpu_ba::CudaProblemSource::kActiveSpec;
+  const bool indexed_catalog_requested =
+      options_.ba_cuda_problem_source ==
+      gpu_ba::CudaProblemSource::kIndexedCatalog;
+  const bool typed_problem_requested =
+      active_spec_requested || indexed_catalog_requested;
 #ifdef GPU_BA_CUDA_ENABLED
   const bool custom_cuda_compiled = true;
 #else
@@ -2053,6 +2125,7 @@ bool BundleAdjuster::Solve(Reconstruction* reconstruction) {
   bool checkpoint_ready = false;
 #ifdef GPU_BA_CUDA_ENABLED
   gpu_ba::PreparedHostSolveView prepared_host_view;
+  gpu_ba::PreparedIndexedActiveSolve prepared_indexed_solve;
   bool host_store_device_cleanup_failed = false;
 #endif
 #ifdef GPU_BA_ENABLED
@@ -2072,6 +2145,16 @@ bool BundleAdjuster::Solve(Reconstruction* reconstruction) {
   };
   const auto finish = [&](const bool success) {
 #ifdef GPU_BA_CUDA_ENABLED
+    if (prepared_indexed_solve.valid()) {
+      std::string complete_error;
+      if (!prepared_indexed_solve.Complete(
+              false, host_store_device_cleanup_failed, &complete_error) &&
+          execution_result_.diagnostic_message.empty()) {
+        execution_result_.diagnostic_message = complete_error;
+      }
+      CopyHostStoreCommitStateToExecution(
+          prepared_indexed_solve.runtime_info(), &execution_result_);
+    }
     if (prepared_host_view.valid()) {
       std::string complete_error;
       if (!prepared_host_view.Complete(
@@ -2166,27 +2249,44 @@ bool BundleAdjuster::Solve(Reconstruction* reconstruction) {
     execution_result_.termination = "failure";
     return finish(false);
   }
-  if (active_spec_requested &&
+  if (typed_problem_requested &&
       (!custom_cuda_requested || !custom_cuda_compiled || capture_snapshot ||
        options_.ba_snapshot_capture != "none" ||
        !options_.ba_ceres_oracle_dir.empty() ||
        !options_.ba_compare_dir.empty())) {
     execution_result_.problem_source_effective = "invalid";
     execution_result_.problem_source_fallback_reason =
-        "ACTIVE_SPEC_REQUIRES_CUSTOM_CUDA_NO_CAPTURE_NO_ORACLE";
+        indexed_catalog_requested
+            ? "INDEXED_CATALOG_REQUIRES_CUSTOM_CUDA_NO_CAPTURE_NO_ORACLE"
+            : "ACTIVE_SPEC_REQUIRES_CUSTOM_CUDA_NO_CAPTURE_NO_ORACLE";
     execution_result_.executed_backend = "none";
     SetStableError(&execution_result_, StableBaError::kUnsupportedConfiguration);
     execution_result_.diagnostic_message =
-        "active_spec requires custom_cuda, snapshot_capture=none, and oracle "
-        "outputs disabled";
+        std::string(gpu_ba::CudaProblemSourceName(
+            options_.ba_cuda_problem_source)) +
+        " requires custom_cuda, snapshot_capture=none, and oracle outputs "
+        "disabled";
     execution_result_.termination = "failure";
     return finish(false);
   }
-  if (!active_spec_requested) {
+  if (indexed_catalog_requested &&
+      cuda_host_store_binding_.mode !=
+          gpu_ba::CudaHostProblemStoreMode::kHostPreparedStore) {
+    execution_result_.problem_source_effective = "invalid";
+    execution_result_.problem_source_fallback_reason =
+        "INDEXED_CATALOG_REQUIRES_MAPPER_HOST_STORE";
+    execution_result_.executed_backend = "none";
+    SetStableError(&execution_result_, StableBaError::kUnsupportedConfiguration);
+    execution_result_.diagnostic_message =
+        "indexed_catalog requires a Mapper-owned host_prepared_store binding";
+    execution_result_.termination = "failure";
+    return finish(false);
+  }
+  if (!typed_problem_requested) {
     problem_ = std::make_unique<ceres::Problem>();
     execution_result_.ceres_problem_created = true;
   }
-  if (!active_spec_requested &&
+  if (!typed_problem_requested &&
       (capture_snapshot || (custom_cuda_requested && custom_cuda_compiled))) {
     if (capture_snapshot && options_.ba_snapshot_dir.empty()) {
       LOG(ERROR) << "ba_snapshot_dir is required when snapshot capture is enabled";
@@ -2200,14 +2300,15 @@ bool BundleAdjuster::Solve(Reconstruction* reconstruction) {
         gpu_ba::CudaHostProblemStoreMode::kHostPreparedStore));
     execution_result_.snapshot_recorder_created = true;
   }
-  if (active_spec_requested) {
+  if (typed_problem_requested) {
     active_spec_builder_.reset(new gpu_ba::ActiveBaSolveSpecBuilder());
   }
 #else
-  if (active_spec_requested) {
+  if (typed_problem_requested) {
     execution_result_.problem_source_effective = "invalid";
     execution_result_.problem_source_fallback_reason =
-        "ACTIVE_SPEC_NOT_COMPILED";
+        indexed_catalog_requested ? "INDEXED_CATALOG_NOT_COMPILED"
+                                  : "ACTIVE_SPEC_NOT_COMPILED";
     SetStableError(&execution_result_, StableBaError::kUnsupportedConfiguration);
     execution_result_.termination = "failure";
     return finish(false);
@@ -2217,7 +2318,7 @@ bool BundleAdjuster::Solve(Reconstruction* reconstruction) {
 #endif
 
   ceres::LossFunction* loss_function =
-      active_spec_requested ? nullptr : options_.CreateLossFunction();
+      typed_problem_requested ? nullptr : options_.CreateLossFunction();
   const auto problem_source_prepare_start = std::chrono::steady_clock::now();
   const auto setup_start = std::chrono::steady_clock::now();
   if(options_.if_add_lidar_constraint && optimize_phrase_ == OptimazePhrase::Local) {
@@ -2235,7 +2336,7 @@ bool BundleAdjuster::Solve(Reconstruction* reconstruction) {
       std::chrono::duration<double, std::milli>(
           std::chrono::steady_clock::now() - setup_start).count();
 
-  const int scalar_residual_count = active_spec_requested
+  const int scalar_residual_count = typed_problem_requested
 #ifdef GPU_BA_ENABLED
       ? static_cast<int>(active_spec_builder_->ScalarResidualCount())
 #else
@@ -2259,7 +2360,7 @@ bool BundleAdjuster::Solve(Reconstruction* reconstruction) {
       CreateEffectiveBundleAdjustmentSolverOptions(
           options_, config_.NumImages(), scalar_residual_count);
 #ifdef GPU_BA_ENABLED
-  if (active_spec_requested) {
+  if (typed_problem_requested) {
     const auto active_spec_start = std::chrono::steady_clock::now();
     std::string active_spec_error;
     const bool forced_active_spec_failure =
@@ -2327,7 +2428,7 @@ bool BundleAdjuster::Solve(Reconstruction* reconstruction) {
   if (custom_cuda_requested) {
     const auto checkpoint_start = std::chrono::steady_clock::now();
     std::string checkpoint_error;
-    const bool checkpoint_ok = active_spec_requested
+    const bool checkpoint_ok = typed_problem_requested
 #ifdef GPU_BA_ENABLED
         ? BuildActiveSpecParameterCheckpoint(
               pre_setup_qvecs, active_spec, reconstruction,
@@ -2368,7 +2469,7 @@ bool BundleAdjuster::Solve(Reconstruction* reconstruction) {
     execution_result_.transaction_checkpoint_milliseconds =
         std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - checkpoint_start).count();
-    if (active_spec_requested) {
+    if (typed_problem_requested) {
       execution_result_.active_spec_checkpoint_milliseconds =
           execution_result_.transaction_checkpoint_milliseconds;
     }
@@ -2463,7 +2564,7 @@ bool BundleAdjuster::Solve(Reconstruction* reconstruction) {
     execution_result_.summary_source = "custom_cuda_projection";
     std::string cuda_error;
     const gpu_ba::CudaSolveProblem& cuda_problem =
-        active_spec_requested ? active_spec.problem
+        typed_problem_requested ? active_spec.problem
                               : static_cast<const gpu_ba::CudaSolveProblem&>(
                                     captured_snapshot);
     bool preflight_ok = ValidateCustomCudaProductionSupport(
@@ -2476,8 +2577,21 @@ bool BundleAdjuster::Solve(Reconstruction* reconstruction) {
       gpu_ba::CudaFullLmOptions cuda_options =
           CreateProductionCudaOptions(options_, solver_options);
       gpu_ba::CudaHostProblemStoreRuntimeInfo host_store_runtime;
-      if (cuda_host_store_binding_.mode !=
-          gpu_ba::CudaHostProblemStoreMode::kDisabled) {
+      if (indexed_catalog_requested) {
+        if (!gpu_ba::PrepareCudaIndexedActiveSolve(
+                cuda_problem, cuda_options, cuda_host_store_binding_,
+                &prepared_indexed_solve, &cuda_error)) {
+          preflight_ok = false;
+        } else {
+          cuda_options.indexed_active_solve =
+              prepared_indexed_solve.descriptor();
+          cuda_options.indexed_catalog_tables =
+              prepared_indexed_solve.catalog_tables();
+        }
+        CopyHostStoreRuntimeToExecution(prepared_indexed_solve.runtime_info(),
+                                        &execution_result_);
+      } else if (cuda_host_store_binding_.mode !=
+                 gpu_ba::CudaHostProblemStoreMode::kDisabled) {
         if (!gpu_ba::PrepareCudaHostSolveView(
                 cuda_problem, cuda_options, cuda_host_store_binding_,
                 &prepared_host_view, &host_store_runtime, &cuda_error)) {
@@ -2506,7 +2620,7 @@ bool BundleAdjuster::Solve(Reconstruction* reconstruction) {
           cuda_result.initial_cost = std::numeric_limits<double>::quiet_NaN();
           cuda_result.final_cost = std::numeric_limits<double>::infinity();
         } else {
-          cuda_ok = active_spec_requested
+          cuda_ok = typed_problem_requested
               ? gpu_ba::RunCustomCudaSolve(
                     active_spec.problem, cuda_options, &cuda_result, &cuda_error)
               : gpu_ba::RunCustomCudaSolve(
@@ -2524,7 +2638,7 @@ bool BundleAdjuster::Solve(Reconstruction* reconstruction) {
     execution_result_.problem_source_prepare_and_cuda_wall_seconds =
         std::chrono::duration<double>(std::chrono::steady_clock::now() -
                                       problem_source_prepare_start).count();
-    if (active_spec_requested) {
+    if (typed_problem_requested) {
       execution_result_.fast_cpu_preparation_milliseconds =
           execution_result_.bundle_adjuster_setup_milliseconds +
           execution_result_.active_spec_build_milliseconds +
@@ -2592,6 +2706,36 @@ bool BundleAdjuster::Solve(Reconstruction* reconstruction) {
         precision_runtime.mixed_full_array_d2h_bytes;
     execution_result_.mixed_double_edge_materialization_bytes =
         precision_runtime.mixed_double_edge_materialization_bytes;
+    execution_result_.cuda_host_build_cuda_layer_a_inputs_calls =
+        precision_runtime.host_build_cuda_layer_a_inputs_calls;
+    execution_result_.cuda_host_build_static_layout_calls =
+        precision_runtime.host_build_static_layout_calls;
+    execution_result_.cuda_host_build_cost_layout_calls =
+        precision_runtime.host_build_cost_layout_calls;
+    execution_result_.cuda_host_build_layer_b_topology_calls =
+        precision_runtime.host_build_layer_b_topology_calls;
+    execution_result_.cuda_host_build_layer_c_topology_calls =
+        precision_runtime.host_build_layer_c_topology_calls;
+    execution_result_.indexed_device_catalog_lookup_calls =
+        precision_runtime.indexed_device_catalog_lookup_calls;
+    execution_result_.indexed_device_catalog_reuse_calls =
+        precision_runtime.indexed_device_catalog_reuse_calls;
+    execution_result_.indexed_device_catalog_revision_rebinds =
+        precision_runtime.indexed_device_catalog_revision_rebinds;
+    execution_result_.indexed_device_catalog_full_upload_calls =
+        precision_runtime.indexed_device_catalog_full_upload_calls;
+    execution_result_.indexed_device_catalog_full_upload_bytes =
+        precision_runtime.indexed_device_catalog_full_upload_bytes;
+    execution_result_.indexed_device_catalog_patch_upload_calls =
+        precision_runtime.indexed_device_catalog_patch_upload_calls;
+    execution_result_.indexed_device_catalog_patch_upload_bytes =
+        precision_runtime.indexed_device_catalog_patch_upload_bytes;
+    execution_result_.indexed_device_catalog_invalidations =
+        precision_runtime.indexed_device_catalog_invalidations;
+    execution_result_.indexed_device_catalog_prefix_bytes =
+        precision_runtime.indexed_device_catalog_prefix_bytes;
+    execution_result_.indexed_device_catalog_arena_generation =
+        precision_runtime.indexed_device_catalog_arena_generation;
     execution_result_.arithmetic_precision_effective =
         precision_runtime.arithmetic_precision_effective;
     execution_result_.hessian_backend_effective =
@@ -2645,7 +2789,7 @@ bool BundleAdjuster::Solve(Reconstruction* reconstruction) {
         ++cuda_result.final_state.images.front().camera_id;
       }
       std::string commit_error;
-      const bool commit_ok = active_spec_requested
+      const bool commit_ok = typed_problem_requested
           ? gpu_ba::ValidateAndCommitActiveBaState(
                 active_spec, cuda_result.final_state, reconstruction,
                 &commit_error)
@@ -2664,6 +2808,25 @@ bool BundleAdjuster::Solve(Reconstruction* reconstruction) {
         }
         LOG(ERROR) << "Custom CUDA BA commit failed: " << commit_error;
         return finish(false);
+      }
+      if (prepared_indexed_solve.valid()) {
+        std::string complete_error;
+        if (!prepared_indexed_solve.Complete(
+                true, host_store_device_cleanup_failed, &complete_error)) {
+          SetStableError(&execution_result_,
+                         StableBaError::kCommitIntegrityError);
+          execution_result_.diagnostic_message = complete_error;
+          execution_result_.termination = "failure";
+          std::string restore_error;
+          if (!restore_transaction(true, &restore_error)) {
+            SetStableError(&execution_result_,
+                           StableBaError::kTransactionRestoreFailed);
+            execution_result_.diagnostic_message = restore_error;
+          }
+          return finish(false);
+        }
+        CopyHostStoreCommitStateToExecution(
+            prepared_indexed_solve.runtime_info(), &execution_result_);
       }
       if (prepared_host_view.valid()) {
         std::string complete_error;
@@ -2716,7 +2879,7 @@ bool BundleAdjuster::Solve(Reconstruction* reconstruction) {
       return finish(false);
     }
 
-    if (active_spec_requested && !preflight_ok) {
+    if (typed_problem_requested && !preflight_ok) {
       SetStableError(&execution_result_,
                      StableBaError::kUnsupportedConfiguration);
       execution_result_.diagnostic_message = cuda_error;
@@ -2740,7 +2903,7 @@ bool BundleAdjuster::Solve(Reconstruction* reconstruction) {
       execution_result_.termination = "failure";
       return finish(false);
     }
-    if (active_spec_requested) {
+    if (typed_problem_requested) {
       problem_ = std::make_unique<ceres::Problem>();
       execution_result_.ceres_problem_created = true;
       active_spec_builder_.reset();

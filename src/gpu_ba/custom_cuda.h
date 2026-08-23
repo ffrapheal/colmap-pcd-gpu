@@ -14,6 +14,9 @@
 namespace colmap {
 namespace gpu_ba {
 
+struct IndexedActiveSolveDescriptor;
+struct MapperStaticCatalogStableTables;
+
 // These flat records are the host/device ABI for the first custom_cuda layer.
 // They intentionally contain only fixed-size IEEE-754 binary64 arrays so the
 // kernel does not depend on Eigen, Ceres, or STL layout.
@@ -917,6 +920,11 @@ struct CudaFullLmOptions {
   // Non-owning solve-local prepared view. Standalone and replay leave this
   // null. Its host data is immutable and contains no CUDA pointer.
   const PreparedHostSolveView* prepared_host_view = nullptr;
+  // Phase 11b-b internal indexed inputs. Both pointers must be present or
+  // absent together. Their host lifetime covers RunCustomCudaSolve; neither
+  // object contains a device pointer.
+  const IndexedActiveSolveDescriptor* indexed_active_solve = nullptr;
+  const MapperStaticCatalogStableTables* indexed_catalog_tables = nullptr;
 };
 
 // Phase 7.2a structural counters. These fields audit resource ownership and
@@ -1255,6 +1263,11 @@ struct CudaPersistentDeviceRuntimeInfo {
   uint64_t unified_problem_builder_calls = 0;
   uint64_t unified_problem_builder_traversals = 0;
   uint64_t independent_cost_order_rebuilds = 0;
+  uint64_t host_build_cuda_layer_a_inputs_calls = 0;
+  uint64_t host_build_static_layout_calls = 0;
+  uint64_t host_build_cost_layout_calls = 0;
+  uint64_t host_build_layer_b_topology_calls = 0;
+  uint64_t host_build_layer_c_topology_calls = 0;
   uint64_t compact_visual_record_bytes = 0;
   uint64_t public_visual_record_bytes = 0;
   uint64_t compact_layer_a_slot_bytes = 0;
@@ -1266,6 +1279,18 @@ struct CudaPersistentDeviceRuntimeInfo {
   uint64_t scalar_factor_status_packet_calls = 0;
   uint64_t scalar_trial_packet_calls = 0;
   uint64_t redundant_synchronization_calls = 0;
+  // Phase 11b-b indexed catalog ownership. These are structural counters and
+  // remain outside semantic/execution hashes.
+  uint64_t indexed_device_catalog_lookup_calls = 0;
+  uint64_t indexed_device_catalog_reuse_calls = 0;
+  uint64_t indexed_device_catalog_revision_rebinds = 0;
+  uint64_t indexed_device_catalog_full_upload_calls = 0;
+  uint64_t indexed_device_catalog_full_upload_bytes = 0;
+  uint64_t indexed_device_catalog_patch_upload_calls = 0;
+  uint64_t indexed_device_catalog_patch_upload_bytes = 0;
+  uint64_t indexed_device_catalog_invalidations = 0;
+  uint64_t indexed_device_catalog_prefix_bytes = 0;
+  uint64_t indexed_device_catalog_arena_generation = 0;
 };
 
 struct CudaFullLmRuntimeInfo {
@@ -1857,6 +1882,16 @@ bool RunCudaMixedPoseDampingForTesting(
     std::string* error);
 
 bool RunCudaMixedLayerACastCompatibilityForTesting(std::string* error);
+
+// Injects one device-state status value after the production update kernels.
+// This exercises the real rollback/controller path without changing any
+// production solve that does not call this test-only entry point.
+bool RunCustomCudaSolveWithStateUpdateStatusForTesting(
+    const Snapshot& snapshot,
+    const CudaFullLmOptions& options,
+    uint32_t status,
+    CudaFullLmResult* result,
+    std::string* error);
 
 bool RunCudaSchurSolveBackwardErrorZeroDimensionForTesting(
     double* value,
