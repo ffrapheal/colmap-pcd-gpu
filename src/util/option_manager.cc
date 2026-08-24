@@ -519,6 +519,8 @@ void OptionManager::AddMapperOptions() {
                               &mapper->ba_cuda_host_problem_store);
   AddAndRegisterDefaultOption("Mapper.ba_cuda_problem_source",
                               &mapper->ba_cuda_problem_source);
+  AddAndRegisterDefaultOption("Mapper.ba_cuda_prepared_selection_cache",
+                              &mapper->ba_cuda_prepared_selection_cache);
   AddAndRegisterDefaultOption("Mapper.ba_lidar_residual",
                               &mapper->ba_lidar_residual);
   AddAndRegisterDefaultOption("Mapper.ba_telemetry_path",

@@ -63,6 +63,7 @@ struct IncrementalMapperOptions {
   std::string ba_cuda_schur_mode = "deterministic";
   std::string ba_cuda_host_problem_store = "disabled";
   std::string ba_cuda_problem_source = "legacy_snapshot";
+  bool ba_cuda_prepared_selection_cache = false;
   std::string ba_lidar_residual = "legacy_exact";
   std::string ba_telemetry_path;
 

@@ -70,6 +70,10 @@ void ConfigureGpuBaOptions(const IncrementalMapperOptions& source,
   target->ba_cuda_host_problem_store = source.ba_cuda_host_problem_store;
   CHECK(gpu_ba::ParseCudaProblemSource(source.ba_cuda_problem_source,
                                        &target->ba_cuda_problem_source));
+  target->ba_cuda_prepared_selection_cache =
+      source.ba_cuda_prepared_selection_cache
+          ? gpu_ba::CudaPreparedSelectionCacheMode::kEnabled
+          : gpu_ba::CudaPreparedSelectionCacheMode::kDisabled;
   target->ba_lidar_residual = source.ba_lidar_residual;
   target->ba_telemetry_path = source.ba_telemetry_path;
 }
