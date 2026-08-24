@@ -4,9 +4,11 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
+#include "gpu_ba/host_ba_graph.h"
 #include "gpu_ba/linearization.h"
 #include "gpu_ba/snapshot.h"
 #include "gpu_ba/host_problem_store.h"
@@ -16,6 +18,10 @@ namespace gpu_ba {
 
 struct IndexedActiveSolveDescriptor;
 struct MapperStaticCatalogStableTables;
+struct CudaLayerBOptions;
+struct NativePreparationComparisonResult;
+enum class CudaHotKernelMode : uint8_t;
+enum class CudaSchurContributionBackend : uint8_t;
 
 // These flat records are the host/device ABI for the first custom_cuda layer.
 // They intentionally contain only fixed-size IEEE-754 binary64 arrays so the
@@ -61,6 +67,63 @@ struct CudaLidarOutput {
   uint8_t near_zero = 0;
   uint8_t guarded = 0;
   uint8_t finite = 0;
+};
+
+// Temporary adapter from the VS1 native contracts to the established kernel
+// ABI. It owns packed kernel inputs and solve-local topology only; it never
+// owns semantic capture records or a graph-store publication.
+class LegacyKernelInputBundle {
+ public:
+  struct Impl;
+
+  LegacyKernelInputBundle();
+  ~LegacyKernelInputBundle();
+  LegacyKernelInputBundle(LegacyKernelInputBundle&& other) noexcept;
+  LegacyKernelInputBundle& operator=(LegacyKernelInputBundle&& other) noexcept;
+  LegacyKernelInputBundle(const LegacyKernelInputBundle&) = delete;
+  LegacyKernelInputBundle& operator=(const LegacyKernelInputBundle&) = delete;
+
+  const std::vector<CudaVisualInput>& visual() const noexcept;
+  const std::vector<CudaLidarInput>& lidar() const noexcept;
+  const BaSolveResult::Runtime& runtime() const noexcept;
+
+ private:
+  friend bool BuildCudaLayerAInputs(const NativeHostSolveView&,
+                                    const ActiveStateBuffer&,
+                                    LegacyKernelInputBundle*,
+                                    std::string*);
+  friend bool BuildStaticLayout(const NativeHostSolveView&,
+                                const ActiveStateBuffer&,
+                                LegacyKernelInputBundle*,
+                                std::string*);
+  friend bool BuildCostLayout(const NativeHostSolveView&,
+                              LegacyKernelInputBundle*,
+                              std::string*);
+  friend bool BuildLayerBTopology(const NativeHostSolveView&,
+                                  LegacyKernelInputBundle*,
+                                  std::string*);
+  friend bool BuildLayerCTopology(const NativeHostSolveView&,
+                                  LegacyKernelInputBundle*,
+                                  std::string*);
+  friend bool BuildLegacyKernelInputBundle(const NativeHostSolveView&,
+                                           const ActiveStateBuffer&,
+                                           LegacyKernelInputBundle*,
+                                           std::string*);
+  friend bool RunCustomCudaSolve(const NativeCudaSolveRequest&,
+                                 BaSolveResult*,
+                                 std::string*);
+  friend bool CompareNativePreparationToLegacyForTesting(
+      const Snapshot&,
+      const NativeHostSolveView&,
+      const ActiveStateBuffer&,
+      const CudaLayerBOptions&,
+      uint64_t,
+      CudaHotKernelMode,
+      CudaSchurContributionBackend,
+      uint32_t,
+      NativePreparationComparisonResult*,
+      std::string*);
+  std::unique_ptr<Impl> impl_;
 };
 
 enum class CudaMemoryMode : uint8_t {
@@ -1479,6 +1542,65 @@ bool BuildCudaLayerAInputs(const Snapshot& snapshot,
                            std::vector<CudaLidarInput>* lidar,
                            std::string* error);
 
+// VS1 native preparation overloads. All five consume the solve-owned view and
+// pinned graph lease directly. The LegacyKernelInputBundle is explicitly
+// temporary while the unchanged CUDA kernels retain their current flat ABI.
+bool BuildCudaLayerAInputs(const NativeHostSolveView& view,
+                           const ActiveStateBuffer& state,
+                           LegacyKernelInputBundle* output,
+                           std::string* error);
+bool BuildStaticLayout(const NativeHostSolveView& view,
+                       const ActiveStateBuffer& state,
+                       LegacyKernelInputBundle* output,
+                       std::string* error);
+bool BuildCostLayout(const NativeHostSolveView& view,
+                     LegacyKernelInputBundle* output,
+                     std::string* error);
+bool BuildLayerBTopology(const NativeHostSolveView& view,
+                         LegacyKernelInputBundle* output,
+                         std::string* error);
+bool BuildLayerCTopology(const NativeHostSolveView& view,
+                         LegacyKernelInputBundle* output,
+                         std::string* error);
+bool BuildLegacyKernelInputBundle(const NativeHostSolveView& view,
+                                  const ActiveStateBuffer& state,
+                                  LegacyKernelInputBundle* output,
+                                  std::string* error);
+// Test-only host copy. Production final state is downloaded from the current
+// device slot by RunCustomCudaSolve(NativeCudaSolveRequest).
+bool CopyActiveStateForTesting(const NativeHostSolveView& view,
+                               const ActiveStateBuffer& state,
+                               DenseActiveState* output,
+                               std::string* error);
+
+struct NativePreparationComparisonResult {
+  uint64_t visual_count = 0;
+  uint64_t lidar_count = 0;
+  uint64_t cost_entry_count = 0;
+  uint64_t pose_adjacency_count = 0;
+  uint64_t point_adjacency_count = 0;
+  uint64_t edge_adjacency_count = 0;
+  uint64_t pair_contribution_count = 0;
+  bool source_indices_dense = false;
+  bool cost_entries_exact = false;
+  bool layer_b_exact = false;
+  bool layer_c_exact = false;
+};
+
+// Uses the production legacy host preparer and the native preparer on the
+// same immutable entry values. No CUDA work or solve is performed.
+bool CompareNativePreparationToLegacyForTesting(
+    const Snapshot& legacy,
+    const NativeHostSolveView& native_view,
+    const ActiveStateBuffer& native_state,
+    const CudaLayerBOptions& options,
+    uint64_t pair_chunk_limit_bytes,
+    CudaHotKernelMode hot_kernel_mode,
+    CudaSchurContributionBackend schur_backend,
+    uint32_t schur_segment_size,
+    NativePreparationComparisonResult* result,
+    std::string* error);
+
 bool BuildCudaLayerAInputs(const Snapshot& snapshot,
                            CudaResidualOrder order,
                            std::vector<CudaVisualInput>* visual,
@@ -1538,6 +1660,9 @@ bool RunCustomCudaSolve(const Snapshot& snapshot,
 bool RunCustomCudaSolve(const CudaSolveProblem& problem,
                         const CudaFullLmOptions& options,
                         CudaFullLmResult* result,
+                        std::string* error);
+bool RunCustomCudaSolve(const NativeCudaSolveRequest& request,
+                        BaSolveResult* result,
                         std::string* error);
 
 // Internal dispatch target for explicit Phase 10.1a precision experiments.

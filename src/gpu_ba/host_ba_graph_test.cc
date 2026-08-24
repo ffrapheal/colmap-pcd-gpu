@@ -1,0 +1,403 @@
+#define TEST_NAME "gpu_ba/host_ba_graph"
+#include "util/testing.h"
+
+#include <cmath>
+#include <string>
+
+#include "gpu_ba/custom_cuda.h"
+#include "gpu_ba/host_ba_graph.h"
+
+namespace colmap {
+namespace gpu_ba {
+namespace {
+
+HostBaGraphColdInput MakeGraph() {
+  HostBaGraphColdInput input;
+  input.owner_epoch = 101;
+  input.topology_revision = 1;
+  input.cameras.push_back({7, 4, 1920, 1080, 8});
+  input.images.push_back({20, 7, true});
+  input.images.push_back({21, 7, true});
+  input.points.push_back({30});
+  input.observations.push_back({20, 0, 30, {{100.0, 200.0}}});
+  input.observations.push_back({21, 1, 30, {{110.0, 210.0}}});
+  return input;
+}
+
+DenseActiveState MakeState() {
+  DenseActiveState state;
+  state.owner_epoch = 101;
+  state.state_generation = 9;
+  DenseCameraState camera;
+  camera.camera_slot = 0;
+  camera.state_generation = 9;
+  camera.parameters = {1000.0, 1000.0, 960.0, 540.0,
+                       0.01,   -0.01,  0.001, -0.001};
+  state.cameras.push_back(camera);
+  DenseImageState image;
+  image.image_slot = 0;
+  image.state_generation = 9;
+  image.quaternion = {{2.0, 0.0, 0.0, 0.0}};
+  image.translation = {{0.1, 0.2, 0.3}};
+  state.images.push_back(image);
+  image.image_slot = 1;
+  image.quaternion = {{0.0, 2.0, 0.0, 0.0}};
+  image.translation = {{0.4, 0.5, 0.6}};
+  state.images.push_back(image);
+  DensePointState point;
+  point.point_slot = 0;
+  point.state_generation = 9;
+  point.xyz = {{1.0, 2.0, 3.0}};
+  state.points.push_back(point);
+  return state;
+}
+
+BaSolveIntent MakeIntent(const CatalogReadLease& lease) {
+  BaSolveIntent intent;
+  intent.owner_epoch = lease.owner_epoch();
+  intent.catalog_revision = lease.topology_revision();
+  intent.catalog_generation = lease.generation();
+  intent.selection_revision = 4;
+  intent.kind = BaKind::kLocal;
+  intent.config.resolved = true;
+  intent.config.config_generation = 8;
+  intent.config.arithmetic_precision =
+      CudaArithmeticPrecision::kFp32MixedStable;
+  intent.config.hessian_backend =
+      CudaHessianAssemblyBackend::kObservationSegmented;
+  intent.config.schur_backend =
+      CudaSchurContributionBackend::kSegmentedTransformed;
+  intent.config.hot_kernel = CudaHotKernelMode::kTransformed;
+  intent.config.execution_profile = CudaExecutionProfile::kCompactControl;
+  intent.config.residual_order = CudaResidualOrder::kCanonical;
+  intent.config.loss_mode = CudaLossMode::kSoftL1;
+  intent.config.loss_scale = 1.0;
+  intent.active_image_slots.push_back(0);
+  intent.explicit_variable_point_slots.push_back(0);
+  intent.translation_subsets.push_back({0, 2, {0, 0, 0}});
+  CameraParameterPolicy camera;
+  camera.camera_slot = 0;
+  camera.constant = true;
+  intent.camera_policies.push_back(camera);
+  LidarConstraintRecord lidar;
+  lidar.point_slot = 0;
+  lidar.constraint_slot = 3;
+  lidar.physical_identity = 900;
+  lidar.lidar_type = 1;
+  lidar.plane = {{0.0, 0.0, 1.0, -3.0}};
+  lidar.lidar_xyz = {{1.0, 2.0, 3.0}};
+  lidar.weight = 2.0;
+  lidar.search_range = 0.2;
+  lidar.point_state_generation = 9;
+  intent.lidar.lidar_map_generation = 11;
+  intent.lidar.match_config_generation = 12;
+  intent.lidar.constraints.push_back(lidar);
+  intent.source_insertion_order = {
+      {ResidualKind::kVisual, 0},
+      {ResidualKind::kVisual, 1},
+      {ResidualKind::kLidar, 3}};
+  return intent;
+}
+
+BOOST_AUTO_TEST_CASE(ColdBuildLeaseAndNativeView) {
+  HostBaGraphStore store(101);
+  HostBaGraphUpdateResult update;
+  std::string error;
+  BOOST_REQUIRE_MESSAGE(store.ColdBuild(MakeGraph(), &update, &error), error);
+  BOOST_CHECK(update.published);
+  BOOST_CHECK_EQUAL(store.generation(), 1);
+  const CatalogReadLease lease = store.AcquireReadLease();
+  BOOST_REQUIRE(lease.valid());
+  BOOST_CHECK(store.IsCurrent(lease));
+  BOOST_CHECK_EQUAL(lease.images().size, 2);
+  BOOST_CHECK_EQUAL(lease.points()[0].track_length, 2);
+
+  DenseActiveState state = MakeState();
+  const DenseActiveState entry_state = state;
+  BaSolveIntent intent = MakeIntent(lease);
+  NativeHostSolveMaterializer materializer;
+  NativeHostSolveView view;
+  ActiveStateBuffer active_state;
+  NativeHostSolvePreparationRuntime runtime;
+  BOOST_REQUIRE_MESSAGE(materializer.Materialize(lease, intent, state, &view,
+                                                 &active_state, &runtime,
+                                                 &error),
+                        error);
+  BOOST_CHECK_EQUAL(view.active_image_slots.size(), 1);
+  BOOST_CHECK_EQUAL(view.boundary_image_slots.size(), 1);
+  BOOST_CHECK_EQUAL(view.visual_observation_slots.size(), 2);
+  BOOST_CHECK_EQUAL(view.active_point_slots.size(), 1);
+  BOOST_CHECK_EQUAL(view.lidar.constraints.size(), 1);
+  BOOST_CHECK_EQUAL(view.residual_ordinals.size(), 3);
+  BOOST_CHECK(view.residual_ordinals[0].kind == ResidualKind::kVisual);
+  BOOST_CHECK(view.residual_ordinals[1].kind == ResidualKind::kVisual);
+  BOOST_CHECK(view.residual_ordinals[2].kind == ResidualKind::kLidar);
+  for (size_t i = 0; i < view.residual_ordinals.size(); ++i) {
+    BOOST_CHECK_EQUAL(view.residual_ordinals[i].source_insertion_index, i);
+    BOOST_CHECK_EQUAL(view.residual_ordinals[i].execution_ordinal, i);
+  }
+  BOOST_CHECK_NE(view.residual_ordinals[0].physical_identity,
+                 view.residual_ordinals[0].source_insertion_index);
+  BOOST_REQUIRE_EQUAL(view.parameter_ordinals.size(), 4);
+  BOOST_CHECK(view.parameter_ordinals[0].kind == ParameterKind::kQuaternion);
+  BOOST_CHECK(view.parameter_ordinals[1].kind == ParameterKind::kTranslation);
+  BOOST_CHECK_EQUAL(view.parameter_ordinals[1].translation_subset_mask, 2);
+  BOOST_CHECK_EQUAL(view.parameter_ordinals[1].tangent_size, 2);
+  BOOST_CHECK(view.parameter_ordinals[2].kind == ParameterKind::kPoint3D);
+  BOOST_CHECK(view.parameter_ordinals[3].kind == ParameterKind::kCamera);
+  BOOST_REQUIRE_EQUAL(active_state.images.size(), 2);
+  BOOST_CHECK_EQUAL(active_state.images[0].quaternion[0], 1.0);
+  BOOST_CHECK_EQUAL(active_state.images[1].quaternion[1], 1.0);
+  BOOST_CHECK_EQUAL(state.images[0].quaternion[0],
+                    entry_state.images[0].quaternion[0]);
+  BOOST_CHECK_EQUAL(state.images[1].quaternion[1],
+                    entry_state.images[1].quaternion[1]);
+  BOOST_CHECK_EQUAL(runtime.quaternion_normalizations, 2);
+}
+
+BOOST_AUTO_TEST_CASE(TransactionNoopReassignAndFailureDoNotPartiallyPublish) {
+  HostBaGraphStore store(101);
+  HostBaGraphUpdateResult update;
+  std::string error;
+  BOOST_REQUIRE(store.ColdBuild(MakeGraph(), &update, &error));
+  const CatalogReadLease generation1 = store.AcquireReadLease();
+
+  CoalescedBaGraphMutation noop;
+  noop.owner_epoch = 101;
+  noop.revision_before = 1;
+  noop.revision_after = 2;
+  noop.observation_upserts.push_back({20, 99, 30, {{1.0, 2.0}}});
+  noop.tombstone_observations.push_back({20, 99});
+  BOOST_REQUIRE_MESSAGE(store.ApplyCoalescedMutation(noop, &update, &error),
+                        error);
+  BOOST_CHECK(update.semantic_noop);
+  BOOST_CHECK_EQUAL(store.generation(), 1);
+  BOOST_CHECK_EQUAL(store.topology_revision(), 2);
+  BOOST_CHECK(!store.IsCurrent(generation1));
+
+  CoalescedBaGraphMutation invalid;
+  invalid.owner_epoch = 101;
+  invalid.revision_before = 2;
+  invalid.revision_after = 3;
+  invalid.observation_upserts.push_back({20, 2, 999, {{3.0, 4.0}}});
+  BOOST_CHECK(!store.ApplyCoalescedMutation(invalid, &update, &error));
+  BOOST_CHECK(!update.published);
+  BOOST_CHECK_EQUAL(store.topology_revision(), 2);
+  BOOST_CHECK_EQUAL(store.generation(), 1);
+
+  CoalescedBaGraphMutation reassign;
+  reassign.owner_epoch = 101;
+  reassign.revision_before = 2;
+  reassign.revision_after = 3;
+  reassign.camera_upserts.push_back({8, 4, 1920, 1080, 8});
+  reassign.image_upserts.push_back({21, 8, true});
+  reassign.point_upserts.push_back({31});
+  reassign.observation_upserts.push_back(
+      {21, 1, 31, {{110.0, 210.0}}});
+  BOOST_REQUIRE_MESSAGE(
+      store.ApplyCoalescedMutation(reassign, &update, &error), error);
+  const CatalogReadLease generation2 = store.AcquireReadLease();
+  BOOST_REQUIRE_EQUAL(generation2.points().size, 2);
+  BOOST_CHECK_EQUAL(generation2.points()[0].track_length, 1);
+  BOOST_CHECK_EQUAL(generation2.points()[1].track_length, 1);
+  BOOST_CHECK_EQUAL(generation2.FindObservation(21, 1)->point_slot, 1);
+  BOOST_CHECK_EQUAL(generation2.FindObservation(21, 1)->camera_slot, 1);
+
+  BaSolveIntent stale = MakeIntent(generation2);
+  stale.catalog_generation = 1;
+  DenseActiveState state = MakeState();
+  DensePointState point31;
+  point31.point_slot = 1;
+  point31.state_generation = 9;
+  point31.xyz = {{2.0, 3.0, 4.0}};
+  state.points.push_back(point31);
+  NativeHostSolveMaterializer materializer;
+  NativeHostSolveView view;
+  ActiveStateBuffer active;
+  NativeHostSolvePreparationRuntime runtime;
+  BOOST_CHECK(!materializer.Materialize(generation2, stale, state, &view,
+                                        &active, &runtime, &error));
+
+  CoalescedBaGraphMutation erase;
+  erase.owner_epoch = 101;
+  erase.revision_before = 3;
+  erase.revision_after = 4;
+  erase.tombstone_point_ids.push_back(31);
+  BOOST_REQUIRE(store.ApplyCoalescedMutation(erase, &update, &error));
+  BOOST_CHECK(!store.AcquireReadLease().points()[1].header.alive);
+  CoalescedBaGraphMutation revive;
+  revive.owner_epoch = 101;
+  revive.revision_before = 4;
+  revive.revision_after = 5;
+  revive.point_upserts.push_back({31});
+  revive.observation_upserts.push_back({21, 1, 31, {{110.0, 210.0}}});
+  BOOST_REQUIRE(store.ApplyCoalescedMutation(revive, &update, &error));
+  BOOST_CHECK(store.AcquireReadLease().points()[1].header.alive);
+  BOOST_CHECK_EQUAL(store.AcquireReadLease().FindObservation(21, 1)->point_slot,
+                    1);
+
+  CoalescedBaGraphMutation full_rebuild;
+  full_rebuild.owner_epoch = 101;
+  full_rebuild.revision_before = 5;
+  full_rebuild.revision_after = 6;
+  full_rebuild.force_full_rebuild = true;
+  BOOST_CHECK(!store.ApplyCoalescedMutation(full_rebuild, &update, &error));
+  BOOST_CHECK(update.full_rebuild_required);
+  BOOST_CHECK_EQUAL(store.topology_revision(), 5);
+
+  HostBaGraphColdInput invalid_rebuild = MakeGraph();
+  invalid_rebuild.topology_revision = 6;
+  invalid_rebuild.cameras.clear();
+  BOOST_CHECK(!store.ColdBuild(invalid_rebuild, &update, &error));
+  BOOST_CHECK_EQUAL(store.topology_revision(), 5);
+  HostBaGraphColdInput rebuild = MakeGraph();
+  rebuild.topology_revision = 6;
+  BOOST_REQUIRE_MESSAGE(store.ColdBuild(rebuild, &update, &error), error);
+  BOOST_CHECK(update.full_rebuild);
+  BOOST_CHECK_EQUAL(store.topology_revision(), 6);
+  BOOST_CHECK_GT(store.generation(), generation2.generation());
+}
+
+BOOST_AUTO_TEST_CASE(OwnerIsolationAndCascadingTombstone) {
+  HostBaGraphStore first(101);
+  HostBaGraphStore second(202);
+  HostBaGraphUpdateResult update;
+  std::string error;
+  BOOST_REQUIRE(first.ColdBuild(MakeGraph(), &update, &error));
+  HostBaGraphColdInput other = MakeGraph();
+  other.owner_epoch = 202;
+  BOOST_REQUIRE(second.ColdBuild(other, &update, &error));
+  BOOST_CHECK(!second.IsCurrent(first.AcquireReadLease()));
+
+  CoalescedBaGraphMutation mutation;
+  mutation.owner_epoch = 101;
+  mutation.revision_before = 1;
+  mutation.revision_after = 2;
+  mutation.tombstone_point_ids.push_back(30);
+  BOOST_REQUIRE_MESSAGE(first.ApplyCoalescedMutation(mutation, &update, &error),
+                        error);
+  const CatalogReadLease lease = first.AcquireReadLease();
+  BOOST_CHECK(!lease.points()[0].header.alive);
+  BOOST_CHECK(!lease.observations()[0].header.alive);
+  BOOST_CHECK(!lease.observations()[1].header.alive);
+  BOOST_CHECK_EQUAL(update.cascaded_observation_tombstones, 2);
+}
+
+BOOST_AUTO_TEST_CASE(GlobalWholeAndSelectionRevisionRemainExplicitIdentity) {
+  HostBaGraphStore store(101);
+  HostBaGraphUpdateResult update;
+  std::string error;
+  BOOST_REQUIRE(store.ColdBuild(MakeGraph(), &update, &error));
+  const CatalogReadLease lease = store.AcquireReadLease();
+  DenseActiveState state = MakeState();
+  NativeHostSolveMaterializer materializer;
+  for (const BaKind kind : {BaKind::kGlobal, BaKind::kWhole}) {
+    BaSolveIntent intent = MakeIntent(lease);
+    intent.kind = kind;
+    intent.selection_revision += static_cast<uint8_t>(kind);
+    intent.active_image_slots.push_back(1);
+    intent.explicit_variable_point_slots.clear();
+    intent.fixed_pose_slots.push_back(0);
+    NativeHostSolveView view;
+    ActiveStateBuffer active;
+    NativeHostSolvePreparationRuntime runtime;
+    BOOST_REQUIRE_MESSAGE(materializer.Materialize(
+                              lease, intent, state, &view, &active, &runtime,
+                              &error),
+                          error);
+    BOOST_CHECK(view.kind == kind);
+    BOOST_CHECK_EQUAL(view.identity.selection_revision,
+                      intent.selection_revision);
+    BOOST_CHECK(view.boundary_image_slots.empty());
+    BOOST_CHECK_EQUAL(view.active_image_slots.size(), 2);
+    BOOST_CHECK_EQUAL(view.fixed.images[0].pose_constant, 1);
+    BOOST_CHECK_EQUAL(view.fixed.points[0].constant, 0);
+  }
+}
+
+BOOST_AUTO_TEST_CASE(ReadLeasePinsPublicationPastStoreLifetime) {
+  CatalogReadLease lease;
+  {
+    HostBaGraphStore store(101);
+    HostBaGraphUpdateResult update;
+    std::string error;
+    BOOST_REQUIRE(store.ColdBuild(MakeGraph(), &update, &error));
+    lease = store.AcquireReadLease();
+  }
+  BOOST_REQUIRE(lease.valid());
+  BOOST_CHECK_EQUAL(lease.owner_epoch(), 101);
+  BOOST_CHECK_EQUAL(lease.observations().size, 2);
+  BOOST_CHECK_EQUAL(lease.FindObservation(21, 1)->point_slot, 0);
+}
+
+BOOST_AUTO_TEST_CASE(StateGenerationAndVariableCameraFailClosed) {
+  HostBaGraphStore store(101);
+  HostBaGraphUpdateResult update;
+  std::string error;
+  BOOST_REQUIRE(store.ColdBuild(MakeGraph(), &update, &error));
+  const CatalogReadLease lease = store.AcquireReadLease();
+  DenseActiveState state = MakeState();
+  BaSolveIntent intent = MakeIntent(lease);
+  NativeHostSolveMaterializer materializer;
+  NativeHostSolveView view;
+  ActiveStateBuffer active;
+  NativeHostSolvePreparationRuntime runtime;
+
+  state.images[0].state_generation -= 1;
+  BOOST_CHECK(!materializer.Materialize(lease, intent, state, &view, &active,
+                                        &runtime, &error));
+  BOOST_CHECK(error.find("state slot invalid") != std::string::npos);
+
+  state = MakeState();
+  intent.camera_policies[0].constant = false;
+  error.clear();
+  BOOST_CHECK(!materializer.Materialize(lease, intent, state, &view, &active,
+                                        &runtime, &error));
+  BOOST_CHECK(error.find("does not support variable cameras") !=
+              std::string::npos);
+}
+
+BOOST_AUTO_TEST_CASE(NonemptyResidualSelectionRequiresExplicitSourceOrder) {
+  HostBaGraphStore store(101);
+  HostBaGraphUpdateResult update;
+  std::string error;
+  BOOST_REQUIRE(store.ColdBuild(MakeGraph(), &update, &error));
+  const CatalogReadLease lease = store.AcquireReadLease();
+  BaSolveIntent intent = MakeIntent(lease);
+  intent.source_insertion_order.clear();
+  DenseActiveState state = MakeState();
+  NativeHostSolveMaterializer materializer;
+  NativeHostSolveView view;
+  ActiveStateBuffer active;
+  NativeHostSolvePreparationRuntime runtime;
+  BOOST_CHECK(!materializer.Materialize(lease, intent, state, &view, &active,
+                                        &runtime, &error));
+  BOOST_CHECK(error.find("explicitly cover every residual") !=
+              std::string::npos);
+
+  const auto rejected = [&](const std::vector<BaSolveIntent::ResidualSelection>&
+                                order) {
+    BaSolveIntent candidate = MakeIntent(lease);
+    candidate.source_insertion_order = order;
+    NativeHostSolveView candidate_view;
+    ActiveStateBuffer candidate_state;
+    NativeHostSolvePreparationRuntime candidate_runtime;
+    error.clear();
+    return !materializer.Materialize(
+        lease, candidate, state, &candidate_view, &candidate_state,
+        &candidate_runtime, &error);
+  };
+  BOOST_CHECK(rejected({{ResidualKind::kVisual, 0},
+                        {ResidualKind::kVisual, 0},
+                        {ResidualKind::kLidar, 3}}));
+  BOOST_CHECK(rejected({{ResidualKind::kVisual, 0},
+                        {ResidualKind::kVisual, 99},
+                        {ResidualKind::kLidar, 3}}));
+  BOOST_CHECK(rejected({{ResidualKind::kLidar, 0},
+                        {ResidualKind::kVisual, 1},
+                        {ResidualKind::kVisual, 0}}));
+}
+
+}  // namespace
+}  // namespace gpu_ba
+}  // namespace colmap
