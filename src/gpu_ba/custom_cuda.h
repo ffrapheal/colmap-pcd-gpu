@@ -37,6 +37,12 @@ class DeviceBaProblemStoreHandle final {
   CreateDeviceBaProblemStore(uint64_t);
   friend bool FailNextDeviceBaProblemStorePublishForTesting(
       const std::shared_ptr<DeviceBaProblemStoreHandle>&, std::string*);
+  friend bool FailNextDeviceBaProblemStoreContextQueryForTesting(
+      const std::shared_ptr<DeviceBaProblemStoreHandle>&, std::string*);
+  friend bool GetDeviceBaProblemStoreContextQueryCountForTesting(
+      const std::shared_ptr<DeviceBaProblemStoreHandle>&,
+      uint64_t*,
+      std::string*);
   friend bool RunCustomCudaSolve(const NativeCudaSolveRequest&,
                                  BaSolveResult*,
                                  std::string*);
@@ -49,6 +55,13 @@ std::shared_ptr<DeviceBaProblemStoreHandle> CreateDeviceBaProblemStore(
     uint64_t owner_epoch);
 bool FailNextDeviceBaProblemStorePublishForTesting(
     const std::shared_ptr<DeviceBaProblemStoreHandle>& store,
+    std::string* error);
+bool FailNextDeviceBaProblemStoreContextQueryForTesting(
+    const std::shared_ptr<DeviceBaProblemStoreHandle>& store,
+    std::string* error);
+bool GetDeviceBaProblemStoreContextQueryCountForTesting(
+    const std::shared_ptr<DeviceBaProblemStoreHandle>& store,
+    uint64_t* query_count,
     std::string* error);
 
 // These flat records are the host/device ABI for the first custom_cuda layer.

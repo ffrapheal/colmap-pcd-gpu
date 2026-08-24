@@ -745,6 +745,19 @@ bool MarkCudaResourcePoolRetained(const uintptr_t handle,
   return true;
 }
 
+void AbandonCudaResourceWithoutTeardown(
+    const uintptr_t handle, const CudaTeardownType type) noexcept {
+  CudaResourceOwnershipEntry* entry = FindCudaResource(handle, type);
+  if (entry == nullptr) return;
+  // The allocation's driver context could not be proven current. Mark the
+  // registry entry quarantined and inactive rather than issuing cudaFree in a
+  // potentially unrelated context. A destroyed CUDA context already owns the
+  // physical reclamation; a live but unverifiable context is intentionally
+  // leaked instead of risking cross-context memory corruption.
+  entry->active = false;
+  entry->quarantined = true;
+}
+
 bool ShouldInjectCleanupFailure(const CudaTeardownType type) noexcept {
   if (!g_cuda_cleanup_test_injection_active ||
       g_cuda_cleanup_test_injection_consumed ||
@@ -2591,7 +2604,6 @@ constexpr uint32_t kDeviceBaProblemStoreAbiVersion = 1;
 struct DeviceBaProblemStoreAllocation {
   int device = -1;
   uintptr_t cuda_context = 0;
-  uint64_t context_incarnation = 0;
   uint64_t owner_epoch = 0;
   uint64_t topology_revision = 0;
   uint64_t catalog_generation = 0;
@@ -2616,8 +2628,32 @@ struct DeviceBaProblemStoreAllocation {
   size_t observation_count = 0;
   size_t image_incidence_count = 0;
   size_t point_incidence_count = 0;
+  CudaResourceHealth creation_resource_health = CudaResourceHealth::kClean;
+  // This is only a revalidation cache token. Allocation ownership is bound to
+  // cuda_context and verified with driver pointer attributes whenever the
+  // RuntimePool entry changes.
+  uint64_t last_validated_pool_entry_incarnation = 0;
+  std::atomic<bool> abandon_cleanup{false};
+
+  void QuarantineCleanup() noexcept { abandon_cleanup.store(true); }
 
   ~DeviceBaProblemStoreAllocation() noexcept {
+    if (abandon_cleanup.load()) {
+      const auto abandon = [](void* pointer) {
+        if (pointer != nullptr) {
+          AbandonCudaResourceWithoutTeardown(
+              reinterpret_cast<uintptr_t>(pointer),
+              CudaTeardownType::kAllocation);
+        }
+      };
+      abandon(point_incidence);
+      abandon(image_incidence);
+      abandon(observations);
+      abandon(points);
+      abandon(images);
+      abandon(cameras);
+      return;
+    }
     if (device >= 0) CleanupCudaSetDevice(device);
     const auto release = [this](void* pointer) {
       if (pointer != nullptr) CleanupCudaFree(pointer, device);
@@ -2653,7 +2689,59 @@ struct DeviceBaProblemStoreState {
   bool recoverable = true;
   uint64_t publish_generation = 0;
   uint64_t fail_next_publish_for_testing = 0;
+  uint64_t fail_next_context_query_for_testing = 0;
+  uint64_t context_query_count_for_testing = 0;
 };
+
+bool DeviceBaPointerBelongsToContext(const void* pointer,
+                                     const uintptr_t expected_context,
+                                     uint64_t* query_count,
+                                     std::string* error) {
+  if (pointer == nullptr) return true;
+  if (query_count != nullptr) {
+    *query_count = SaturatingAdd(*query_count, uint64_t{1});
+  }
+  CUcontext pointer_context = nullptr;
+  const CUresult status = cuPointerGetAttribute(
+      &pointer_context, CU_POINTER_ATTRIBUTE_CONTEXT,
+      static_cast<CUdeviceptr>(reinterpret_cast<uintptr_t>(pointer)));
+  if (status != CUDA_SUCCESS || pointer_context == nullptr) {
+    const char* status_name = nullptr;
+    cuGetErrorName(status, &status_name);
+    *error = std::string("DeviceBaProblemStore pointer context query failed: ") +
+        (status_name == nullptr ? std::to_string(static_cast<int>(status))
+                                : status_name);
+    return false;
+  }
+  if (reinterpret_cast<uintptr_t>(pointer_context) != expected_context) {
+    *error = "DeviceBaProblemStore pointer belongs to a different CUDA context";
+    return false;
+  }
+  return true;
+}
+
+bool ValidateDeviceBaProblemStoreContext(
+    const DeviceBaProblemStoreAllocation& allocation,
+    const uintptr_t expected_context,
+    uint64_t* query_count,
+    std::string* error) {
+  if (expected_context == 0 || allocation.cuda_context != expected_context) {
+    *error = "DeviceBaProblemStore CUDA context identity mismatch";
+    return false;
+  }
+  const std::array<const void*, 6> pointers = {
+      allocation.cameras, allocation.images, allocation.points,
+      allocation.observations, allocation.image_incidence,
+      allocation.point_incidence};
+  for (const void* pointer : pointers) {
+    if (pointer == nullptr) continue;
+    if (!DeviceBaPointerBelongsToContext(
+            pointer, expected_context, query_count, error)) {
+      return false;
+    }
+  }
+  return true;
+}
 
 size_t DeviceBaGeometricCapacity(const size_t required,
                                  const size_t current) {
@@ -2927,8 +3015,14 @@ bool EnsureDeviceBaProblemStore(
       runtime == nullptr || pinned == nullptr || view == nullptr ||
       resident_bytes == nullptr || error == nullptr ||
       catalog.owner_epoch() == 0 || catalog.generation() == 0 ||
-      catalog.abi_version() != kHostBaGraphAbiVersion) {
+      catalog.abi_version() != kHostBaGraphAbiVersion ||
+      !pooled->key.valid || pooled->key.context == 0) {
     if (error != nullptr) *error = "DeviceBaProblemStore bind is invalid";
+    return false;
+  }
+  if (g_cuda_resource_health != CudaResourceHealth::kClean ||
+      pooled->externally_cleared) {
+    *error = "DeviceBaProblemStore resource health does not permit reuse";
     return false;
   }
   const auto cameras = catalog.cameras();
@@ -2949,13 +3043,45 @@ bool EnsureDeviceBaProblemStore(
   ++runtime->native_device_store_lookup_calls;
   std::lock_guard<std::mutex> lock(store->mutex);
   std::shared_ptr<DeviceBaProblemStoreAllocation> current = store->published;
+  bool pointer_context_matches = false;
+  if (current != nullptr && !current->abandon_cleanup.load()) {
+    if (current->device != pooled->device ||
+        current->cuda_context != pooled->key.context) {
+      *error = "DeviceBaProblemStore CUDA device/context identity mismatch";
+      current->QuarantineCleanup();
+      store->valid = false;
+      ++runtime->native_device_store_invalidations;
+      return false;
+    }
+    if (current->last_validated_pool_entry_incarnation !=
+        pooled->context_incarnation) {
+      if (store->fail_next_context_query_for_testing != 0) {
+        --store->fail_next_context_query_for_testing;
+        current->QuarantineCleanup();
+        store->valid = false;
+        ++runtime->native_device_store_invalidations;
+        *error = "DeviceBaProblemStore pointer context query failure injected";
+        return false;
+      }
+      if (!ValidateDeviceBaProblemStoreContext(
+              *current, pooled->key.context,
+              &store->context_query_count_for_testing, error)) {
+        current->QuarantineCleanup();
+        store->valid = false;
+        ++runtime->native_device_store_invalidations;
+        return false;
+      }
+      current->last_validated_pool_entry_incarnation =
+          pooled->context_incarnation;
+    }
+    pointer_context_matches = true;
+  }
   const bool physical_match =
-      current != nullptr && current->device == pooled->device &&
-      current->cuda_context == pooled->key.context &&
-      current->context_incarnation == pooled->context_incarnation &&
+      current != nullptr && pointer_context_matches &&
       current->owner_epoch == catalog.owner_epoch() &&
       current->abi_version == kDeviceBaProblemStoreAbiVersion &&
-      current->static_storage_precision == precision;
+      current->static_storage_precision == precision &&
+      current->creation_resource_health == g_cuda_resource_health;
   if (store->valid && physical_match &&
       current->topology_revision == catalog.topology_revision() &&
       current->catalog_generation == catalog.generation()) {
@@ -3058,9 +3184,9 @@ bool EnsureDeviceBaProblemStore(
     }
     pending->device = pooled->device;
     pending->cuda_context = pooled->key.context;
-    pending->context_incarnation = pooled->context_incarnation;
     pending->owner_epoch = catalog.owner_epoch();
     pending->static_storage_precision = precision;
+    pending->creation_resource_health = g_cuda_resource_health;
     pending->camera_capacity = camera_capacity;
     pending->image_capacity = image_capacity;
     pending->point_capacity = point_capacity;
@@ -3086,6 +3212,16 @@ bool EnsureDeviceBaProblemStore(
       ++runtime->native_device_store_invalidations;
       return false;
     }
+    if (!ValidateDeviceBaProblemStoreContext(
+            *pending, pooled->key.context,
+            &store->context_query_count_for_testing, error)) {
+      pending->QuarantineCleanup();
+      store->valid = false;
+      ++runtime->native_device_store_invalidations;
+      return false;
+    }
+    pending->last_validated_pool_entry_incarnation =
+        pooled->context_incarnation;
   }
 
   uint64_t transfer_bytes = 0;
@@ -10567,6 +10703,38 @@ bool FailNextDeviceBaProblemStorePublishForTesting(
       store->state_);
   std::lock_guard<std::mutex> lock(state->mutex);
   ++state->fail_next_publish_for_testing;
+  error->clear();
+  return true;
+}
+
+bool FailNextDeviceBaProblemStoreContextQueryForTesting(
+    const std::shared_ptr<DeviceBaProblemStoreHandle>& store,
+    std::string* error) {
+  if (error == nullptr || store == nullptr || store->state_ == nullptr) {
+    if (error != nullptr) *error = "invalid DeviceBaProblemStore test handle";
+    return false;
+  }
+  const auto state = std::static_pointer_cast<DeviceBaProblemStoreState>(
+      store->state_);
+  std::lock_guard<std::mutex> lock(state->mutex);
+  ++state->fail_next_context_query_for_testing;
+  error->clear();
+  return true;
+}
+
+bool GetDeviceBaProblemStoreContextQueryCountForTesting(
+    const std::shared_ptr<DeviceBaProblemStoreHandle>& store,
+    uint64_t* query_count,
+    std::string* error) {
+  if (error == nullptr || query_count == nullptr || store == nullptr ||
+      store->state_ == nullptr) {
+    if (error != nullptr) *error = "invalid DeviceBaProblemStore test handle";
+    return false;
+  }
+  const auto state = std::static_pointer_cast<DeviceBaProblemStoreState>(
+      store->state_);
+  std::lock_guard<std::mutex> lock(state->mutex);
+  *query_count = state->context_query_count_for_testing;
   error->clear();
   return true;
 }

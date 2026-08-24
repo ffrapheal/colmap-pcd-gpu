@@ -667,6 +667,21 @@ BOOST_AUTO_TEST_CASE(
   BOOST_REQUIRE_MESSAGE(run_native(options, &cold), error);
   BOOST_CHECK_EQUAL(cold.runtime.device_store_full_upload_calls, 1);
   const uint64_t cold_generation = cold.runtime.device_store_generation;
+  uint64_t cold_context_queries = 0;
+  BOOST_REQUIRE_MESSAGE(GetDeviceBaProblemStoreContextQueryCountForTesting(
+                            fixture.device_store, &cold_context_queries, &error),
+                        error);
+  BOOST_CHECK_EQUAL(cold_context_queries, 6);
+  BaSolveResult unchanged_hot;
+  BOOST_REQUIRE_MESSAGE(run_native(options, &unchanged_hot), error);
+  BOOST_CHECK_EQUAL(unchanged_hot.runtime.device_store_reuse_calls, 1);
+  BOOST_CHECK_EQUAL(unchanged_hot.runtime.device_store_full_upload_calls, 0);
+  uint64_t unchanged_hot_context_queries = 0;
+  BOOST_REQUIRE_MESSAGE(GetDeviceBaProblemStoreContextQueryCountForTesting(
+                            fixture.device_store,
+                            &unchanged_hot_context_queries, &error),
+                        error);
+  BOOST_CHECK_EQUAL(unchanged_hot_context_queries, cold_context_queries);
 
   view = NativeHostSolveView();
   fixture.lease = CatalogReadLease();
@@ -726,14 +741,50 @@ BOOST_AUTO_TEST_CASE(
   BOOST_CHECK_EQUAL(grown.runtime.device_store_growth_d2d_calls, 1);
   BOOST_CHECK_GT(grown.runtime.device_store_growth_d2d_bytes, 0);
   BOOST_CHECK_EQUAL(grown.initial_cost, patched.initial_cost);
+  uint64_t growth_context_queries = 0;
+  BOOST_REQUIRE_MESSAGE(GetDeviceBaProblemStoreContextQueryCountForTesting(
+                            fixture.device_store, &growth_context_queries,
+                            &error),
+                        error);
 
   BOOST_REQUIRE_MESSAGE(ResetCudaRuntimePoolForTesting(&error), error);
+  BaSolveResult pool_reset_reuse;
+  BOOST_REQUIRE_MESSAGE(run_native(options, &pool_reset_reuse), error);
+  BOOST_CHECK_EQUAL(pool_reset_reuse.runtime.device_store_reuse_calls, 1);
+  BOOST_CHECK_EQUAL(pool_reset_reuse.runtime.device_store_full_upload_calls, 0);
+  BOOST_CHECK_EQUAL(pool_reset_reuse.runtime.device_store_full_upload_bytes, 0);
+  BOOST_CHECK_EQUAL(pool_reset_reuse.runtime.device_store_patch_upload_calls, 0);
+  BOOST_CHECK_EQUAL(pool_reset_reuse.runtime.device_store_patch_upload_bytes, 0);
+  BOOST_CHECK_EQUAL(pool_reset_reuse.runtime.device_store_growth_d2d_calls, 0);
+  BOOST_CHECK_EQUAL(pool_reset_reuse.runtime.device_store_generation,
+                    grown.runtime.device_store_generation);
+  uint64_t reset_context_queries = 0;
+  BOOST_REQUIRE_MESSAGE(GetDeviceBaProblemStoreContextQueryCountForTesting(
+                            fixture.device_store, &reset_context_queries,
+                            &error),
+                        error);
+  BOOST_CHECK_EQUAL(reset_context_queries, growth_context_queries + 6);
+
+  BOOST_REQUIRE_MESSAGE(ResetCudaRuntimePoolForTesting(&error), error);
+  BOOST_REQUIRE_MESSAGE(FailNextDeviceBaProblemStoreContextQueryForTesting(
+                            fixture.device_store, &error),
+                        error);
+  BaSolveResult context_query_failure;
+  BOOST_CHECK(!run_native(options, &context_query_failure));
+  BOOST_CHECK(error.find("pointer context query failure injected") !=
+              std::string::npos);
   BaSolveResult context_recovery;
   BOOST_REQUIRE_MESSAGE(run_native(options, &context_recovery), error);
   BOOST_CHECK_EQUAL(context_recovery.runtime.device_store_reuse_calls, 0);
   BOOST_CHECK_EQUAL(context_recovery.runtime.device_store_full_upload_calls, 1);
   BOOST_CHECK_GT(context_recovery.runtime.device_store_generation,
-                 grown.runtime.device_store_generation);
+                 pool_reset_reuse.runtime.device_store_generation);
+  uint64_t recovery_context_queries = 0;
+  BOOST_REQUIRE_MESSAGE(GetDeviceBaProblemStoreContextQueryCountForTesting(
+                            fixture.device_store, &recovery_context_queries,
+                            &error),
+                        error);
+  BOOST_CHECK_EQUAL(recovery_context_queries, reset_context_queries + 6);
 
   CudaFullLmOptions tiny_budget = options;
   tiny_budget.layer_c.layer_b.memory_budget_override_bytes = 1;
