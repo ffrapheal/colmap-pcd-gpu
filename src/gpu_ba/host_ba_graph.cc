@@ -1524,25 +1524,6 @@ struct ResidualCandidate {
   uint64_t point3D_id = 0;
 };
 
-bool AddParameterIfFirst(
-    const ParameterOrdinal& parameter,
-    std::unordered_map<ParameterIdentityKey, size_t, ParameterIdentityKeyHash>*
-        seen,
-    NativeHostSolveView* view,
-    std::string* error) {
-  const ParameterIdentityKey key{parameter.kind, parameter.entity_slot};
-  if (!seen->emplace(key, view->parameter_ordinals.size()).second) return true;
-  if (parameter.ambient_size < parameter.tangent_size) {
-    return SetError("native parameter tangent dimension exceeds ambient",
-                    error);
-  }
-  view->parameter_ordinals.push_back(parameter);
-  view->ambient_parameter_count += parameter.ambient_size;
-  if (!parameter.constant)
-    view->effective_parameter_count += parameter.tangent_size;
-  return true;
-}
-
 }  // namespace
 
 const std::vector<uint32_t>& NativeHostSolveView::ActiveCameraSlots()
@@ -2011,6 +1992,16 @@ bool NativeHostSolveMaterializer::Materialize(
       return SetError("native point policy is invalid", error);
     }
   }
+  view->fixed.images.reserve(view->active_image_slots.size() +
+                             view->boundary_image_slots.size());
+  view->fixed.cameras.reserve(view->active_camera_slots.size());
+  view->fixed.points.reserve(view->active_point_slots.size());
+  std::vector<uint32_t> image_policy_indices(images.size,
+                                             kBaGraphInvalidSlot);
+  std::vector<uint32_t> camera_policy_indices(cameras.size,
+                                              kBaGraphInvalidSlot);
+  std::vector<uint32_t> point_policy_indices(points.size,
+                                             kBaGraphInvalidSlot);
   for (const uint32_t slot : view->active_image_slots) {
     ImageFixedPolicyResult policy;
     policy.image_slot = slot;
@@ -2030,6 +2021,8 @@ bool NativeHostSolveMaterializer::Materialize(
                               : 3 + 3 - static_cast<uint32_t>(
                                             __builtin_popcount(
                                                 policy.translation_subset_mask));
+    image_policy_indices[slot] =
+        static_cast<uint32_t>(view->fixed.images.size());
     view->fixed.images.push_back(policy);
   }
   for (const uint32_t slot : view->boundary_image_slots) {
@@ -2037,6 +2030,8 @@ bool NativeHostSolveMaterializer::Materialize(
     policy.image_slot = slot;
     policy.pose_constant = 1;
     policy.boundary_pose = 1;
+    image_policy_indices[slot] =
+        static_cast<uint32_t>(view->fixed.images.size());
     view->fixed.images.push_back(policy);
   }
   for (const uint32_t slot : view->active_camera_slots) {
@@ -2068,16 +2063,23 @@ bool NativeHostSolveMaterializer::Materialize(
       result.constant = 1;
       result.tangent_size = camera.parameter_count;
     }
+    camera_policy_indices[slot] =
+        static_cast<uint32_t>(view->fixed.cameras.size());
     view->fixed.cameras.push_back(std::move(result));
   }
-  std::unordered_map<uint32_t, uint32_t> selected_point_observations;
-  selected_point_observations.reserve(view->active_point_slots.size());
+  std::vector<uint32_t> selected_point_observations(points.size, 0);
   for (const uint32_t observation_slot : view->visual_observation_slots) {
     if (observation_slot >= observations.size) {
       return SetError("native visual selection contains an invalid slot",
                       error);
     }
-    ++selected_point_observations[observations[observation_slot].point_slot];
+    const uint32_t point_slot = observations[observation_slot].point_slot;
+    if (point_slot >= selected_point_observations.size() ||
+        selected_point_observations[point_slot] ==
+            std::numeric_limits<uint32_t>::max()) {
+      return SetError("native selected point observation count overflow", error);
+    }
+    ++selected_point_observations[point_slot];
   }
   for (const uint32_t slot : view->active_point_slots) {
     PointFixedPolicyResult result;
@@ -2092,9 +2094,7 @@ bool NativeHostSolveMaterializer::Materialize(
       result.has_search_range = policy->has_search_range ? 1 : 0;
       result.search_range = policy->search_range;
     }
-    const auto selected = selected_point_observations.find(slot);
-    const uint32_t selected_count =
-        selected == selected_point_observations.end() ? 0 : selected->second;
+    const uint32_t selected_count = selected_point_observations[slot];
     if (points[slot].track_length > selected_count) result.constant = 1;
     if (explicit_variable_point_slots.count(slot) != 0) {
       if (policy != nullptr && policy->constant) {
@@ -2110,6 +2110,8 @@ bool NativeHostSolveMaterializer::Materialize(
       }
       result.constant = 1;
     }
+    point_policy_indices[slot] =
+        static_cast<uint32_t>(view->fixed.points.size());
     view->fixed.points.push_back(result);
   }
 
@@ -2192,6 +2194,7 @@ bool NativeHostSolveMaterializer::Materialize(
                                 rhs.source_insertion_index);
               });
   }
+  view->residual_ordinals.reserve(residuals.size());
   for (size_t i = 0; i < residuals.size(); ++i) {
     ResidualOrdinal ordinal;
     ordinal.execution_ordinal = i;
@@ -2202,28 +2205,62 @@ bool NativeHostSolveMaterializer::Materialize(
     view->residual_ordinals.push_back(ordinal);
   }
 
-  std::unordered_map<ParameterIdentityKey, size_t, ParameterIdentityKeyHash>
-      parameters;
-  parameters.reserve(view->active_image_slots.size() * 2 +
-                     view->active_point_slots.size() +
-                     view->active_camera_slots.size());
+  view->parameter_ordinals.reserve(view->active_image_slots.size() * 2 +
+                                   view->active_point_slots.size() +
+                                   view->active_camera_slots.size());
   const auto image_policy = [&](const uint32_t slot)
       -> const ImageFixedPolicyResult* {
-    for (const auto& value : view->fixed.images)
-      if (value.image_slot == slot) return &value;
-    return nullptr;
+    if (slot >= image_policy_indices.size()) return nullptr;
+    const uint32_t index = image_policy_indices[slot];
+    return index == kBaGraphInvalidSlot ? nullptr : &view->fixed.images[index];
   };
   const auto point_policy = [&](const uint32_t slot)
       -> const PointFixedPolicyResult* {
-    for (const auto& value : view->fixed.points)
-      if (value.point_slot == slot) return &value;
-    return nullptr;
+    if (slot >= point_policy_indices.size()) return nullptr;
+    const uint32_t index = point_policy_indices[slot];
+    return index == kBaGraphInvalidSlot ? nullptr : &view->fixed.points[index];
   };
   const auto camera_policy = [&](const uint32_t slot)
       -> const CameraFixedPolicyResult* {
-    for (const auto& value : view->fixed.cameras)
-      if (value.camera_slot == slot) return &value;
-    return nullptr;
+    if (slot >= camera_policy_indices.size()) return nullptr;
+    const uint32_t index = camera_policy_indices[slot];
+    return index == kBaGraphInvalidSlot ? nullptr
+                                        : &view->fixed.cameras[index];
+  };
+  std::vector<uint8_t> quaternion_seen(images.size, 0);
+  std::vector<uint8_t> translation_seen(images.size, 0);
+  std::vector<uint8_t> point_seen(points.size, 0);
+  std::vector<uint8_t> camera_seen(cameras.size, 0);
+  const auto add_parameter_if_first = [&](const ParameterOrdinal& parameter) {
+    std::vector<uint8_t>* seen = nullptr;
+    switch (parameter.kind) {
+      case ParameterKind::kQuaternion:
+        seen = &quaternion_seen;
+        break;
+      case ParameterKind::kTranslation:
+        seen = &translation_seen;
+        break;
+      case ParameterKind::kPoint3D:
+        seen = &point_seen;
+        break;
+      case ParameterKind::kCamera:
+        seen = &camera_seen;
+        break;
+    }
+    if (seen == nullptr || parameter.entity_slot >= seen->size()) {
+      return SetError("native parameter entity slot is invalid", error);
+    }
+    if ((*seen)[parameter.entity_slot] != 0) return true;
+    if (parameter.ambient_size < parameter.tangent_size) {
+      return SetError("native parameter tangent dimension exceeds ambient",
+                      error);
+    }
+    (*seen)[parameter.entity_slot] = 1;
+    view->parameter_ordinals.push_back(parameter);
+    view->ambient_parameter_count += parameter.ambient_size;
+    if (!parameter.constant)
+      view->effective_parameter_count += parameter.tangent_size;
+    return true;
   };
   for (const ResidualCandidate& residual : residuals) {
     if (residual.kind == ResidualKind::kVisual) {
@@ -2249,8 +2286,7 @@ bool NativeHostSolveMaterializer::Materialize(
         quaternion.entity_slot = observation.image_slot;
         quaternion.ambient_size = 4;
         quaternion.tangent_size = 3;
-        if (!AddParameterIfFirst(quaternion, &parameters, view, error))
-          return false;
+        if (!add_parameter_if_first(quaternion)) return false;
         ParameterOrdinal translation;
         translation.ordinal = view->parameter_ordinals.size();
         translation.kind = ParameterKind::kTranslation;
@@ -2260,8 +2296,7 @@ bool NativeHostSolveMaterializer::Materialize(
             image->translation_subset_mask;
         translation.tangent_size = image->tangent_size - 3;
         translation.constant = translation.tangent_size == 0 ? 1 : 0;
-        if (!AddParameterIfFirst(translation, &parameters, view, error))
-          return false;
+        if (!add_parameter_if_first(translation)) return false;
       }
       ParameterOrdinal point_parameter;
       point_parameter.ordinal = view->parameter_ordinals.size();
@@ -2270,8 +2305,7 @@ bool NativeHostSolveMaterializer::Materialize(
       point_parameter.ambient_size = 3;
       point_parameter.tangent_size = 3;
       point_parameter.constant = point->constant;
-      if (!AddParameterIfFirst(point_parameter, &parameters, view, error))
-        return false;
+      if (!add_parameter_if_first(point_parameter)) return false;
       ParameterOrdinal camera_parameter;
       camera_parameter.ordinal = view->parameter_ordinals.size();
       camera_parameter.kind = ParameterKind::kCamera;
@@ -2279,8 +2313,7 @@ bool NativeHostSolveMaterializer::Materialize(
       camera_parameter.ambient_size = camera->ambient_size;
       camera_parameter.tangent_size = camera->tangent_size;
       camera_parameter.constant = camera->constant;
-      if (!AddParameterIfFirst(camera_parameter, &parameters, view, error))
-        return false;
+      if (!add_parameter_if_first(camera_parameter)) return false;
     } else {
       const auto lidar = lidar_by_slot.find(residual.source_slot);
       if (lidar == lidar_by_slot.end()) {
@@ -2299,8 +2332,7 @@ bool NativeHostSolveMaterializer::Materialize(
       point_parameter.ambient_size = 3;
       point_parameter.tangent_size = 3;
       point_parameter.constant = point->constant;
-      if (!AddParameterIfFirst(point_parameter, &parameters, view, error))
-        return false;
+      if (!add_parameter_if_first(point_parameter)) return false;
     }
   }
   for (size_t i = 0; i < view->parameter_ordinals.size(); ++i)
@@ -2312,6 +2344,10 @@ bool NativeHostSolveMaterializer::Materialize(
   active_state->owner_epoch = catalog.owner_epoch();
   active_state->catalog_generation = catalog.generation();
   active_state->state_generation = gathered_state.state_generation;
+  active_state->cameras.reserve(view->active_camera_slots.size());
+  active_state->images.reserve(view->active_image_slots.size() +
+                               view->boundary_image_slots.size());
+  active_state->points.reserve(view->active_point_slots.size());
   for (const uint32_t slot : view->active_camera_slots) {
     if (camera_state_stamps_[slot] != stamp) {
       return SetError("native solve is missing active camera state", error);
