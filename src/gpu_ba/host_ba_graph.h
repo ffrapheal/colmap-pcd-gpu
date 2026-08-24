@@ -170,6 +170,10 @@ struct HostBaGraphUpdateResult {
   uint64_t adjacency_nodes_visited = 0;
   uint64_t adjacency_nodes_appended = 0;
   uint64_t full_catalog_scans = 0;
+  uint64_t capacity_growth_events = 0;
+  uint64_t capacity_growth_copy_bytes = 0;
+  uint64_t hash_rehash_events = 0;
+  uint64_t hash_rehash_entries = 0;
   bool published = false;
   bool semantic_noop = false;
   bool full_rebuild = false;
@@ -217,6 +221,8 @@ class CatalogReadLease {
 
 // Single-writer Mapper-lifetime structure store. Dynamic parameter values are
 // intentionally absent; a lease pins one immutable structural generation.
+// Normal mutations are amortized O(delta + touched lifetime adjacency). Rare
+// vector/hash growth is exposed through HostBaGraphUpdateResult.
 class HostBaGraphStore {
  public:
   explicit HostBaGraphStore(uint64_t owner_epoch);
