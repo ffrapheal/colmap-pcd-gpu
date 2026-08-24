@@ -52,6 +52,28 @@ DenseActiveState MakeState() {
   return state;
 }
 
+HostBaGraphColdInput MakeLargeGraph(const size_t observation_count) {
+  HostBaGraphColdInput input;
+  input.owner_epoch = 303;
+  input.topology_revision = 1;
+  input.cameras.push_back({7, 4, 1920, 1080, 8});
+  input.images.reserve(observation_count);
+  input.points.reserve(observation_count);
+  input.observations.reserve(observation_count);
+  for (size_t i = 0; i < observation_count; ++i) {
+    const uint32_t image_id = static_cast<uint32_t>(10000 + i);
+    const uint64_t point_id = static_cast<uint64_t>(20000 + i);
+    input.images.push_back({image_id, 7, true});
+    input.points.push_back({point_id});
+    input.observations.push_back(
+        {image_id,
+         0,
+         point_id,
+         {{static_cast<double>(i), static_cast<double>(i + 1)}}});
+  }
+  return input;
+}
+
 BaSolveIntent MakeIntent(const CatalogReadLease& lease) {
   BaSolveIntent intent;
   intent.owner_epoch = lease.owner_epoch();
@@ -160,7 +182,8 @@ BOOST_AUTO_TEST_CASE(TransactionNoopReassignAndFailureDoNotPartiallyPublish) {
   HostBaGraphUpdateResult update;
   std::string error;
   BOOST_REQUIRE(store.ColdBuild(MakeGraph(), &update, &error));
-  const CatalogReadLease generation1 = store.AcquireReadLease();
+  CatalogReadLease generation1 = store.AcquireReadLease();
+  CatalogReadLease generation1_copy = generation1;
 
   CoalescedBaGraphMutation noop;
   noop.owner_epoch = 101;
@@ -168,6 +191,17 @@ BOOST_AUTO_TEST_CASE(TransactionNoopReassignAndFailureDoNotPartiallyPublish) {
   noop.revision_after = 2;
   noop.observation_upserts.push_back({20, 99, 30, {{1.0, 2.0}}});
   noop.tombstone_observations.push_back({20, 99});
+  HostBaGraphColdInput busy_rebuild = MakeGraph();
+  busy_rebuild.topology_revision = 2;
+  BOOST_CHECK(!store.ColdBuild(busy_rebuild, &update, &error));
+  BOOST_CHECK(update.reader_busy);
+  BOOST_CHECK(!store.ApplyCoalescedMutation(noop, &update, &error));
+  BOOST_CHECK(update.reader_busy);
+  BOOST_CHECK_EQUAL(generation1.topology_revision(), 1);
+  generation1 = CatalogReadLease();
+  BOOST_CHECK(!store.ApplyCoalescedMutation(noop, &update, &error));
+  BOOST_CHECK(update.reader_busy);
+  generation1_copy = CatalogReadLease();
   BOOST_REQUIRE_MESSAGE(store.ApplyCoalescedMutation(noop, &update, &error),
                         error);
   BOOST_CHECK(update.semantic_noop);
@@ -184,6 +218,11 @@ BOOST_AUTO_TEST_CASE(TransactionNoopReassignAndFailureDoNotPartiallyPublish) {
   BOOST_CHECK(!update.published);
   BOOST_CHECK_EQUAL(store.topology_revision(), 2);
   BOOST_CHECK_EQUAL(store.generation(), 1);
+  {
+    const CatalogReadLease lease = store.AcquireReadLease();
+    BOOST_REQUIRE(lease.valid());
+    BOOST_CHECK(lease.FindObservation(20, 2) == nullptr);
+  }
 
   CoalescedBaGraphMutation reassign;
   reassign.owner_epoch = 101;
@@ -196,12 +235,15 @@ BOOST_AUTO_TEST_CASE(TransactionNoopReassignAndFailureDoNotPartiallyPublish) {
       {21, 1, 31, {{110.0, 210.0}}});
   BOOST_REQUIRE_MESSAGE(
       store.ApplyCoalescedMutation(reassign, &update, &error), error);
-  const CatalogReadLease generation2 = store.AcquireReadLease();
+  CatalogReadLease generation2 = store.AcquireReadLease();
   BOOST_REQUIRE_EQUAL(generation2.points().size, 2);
   BOOST_CHECK_EQUAL(generation2.points()[0].track_length, 1);
   BOOST_CHECK_EQUAL(generation2.points()[1].track_length, 1);
   BOOST_CHECK_EQUAL(generation2.FindObservation(21, 1)->point_slot, 1);
-  BOOST_CHECK_EQUAL(generation2.FindObservation(21, 1)->camera_slot, 1);
+  BOOST_CHECK_EQUAL(
+      generation2.images()[generation2.FindObservation(21, 1)->image_slot]
+          .camera_slot,
+      1);
 
   BaSolveIntent stale = MakeIntent(generation2);
   stale.catalog_generation = 1;
@@ -217,6 +259,8 @@ BOOST_AUTO_TEST_CASE(TransactionNoopReassignAndFailureDoNotPartiallyPublish) {
   NativeHostSolvePreparationRuntime runtime;
   BOOST_CHECK(!materializer.Materialize(generation2, stale, state, &view,
                                         &active, &runtime, &error));
+  const uint64_t generation2_value = generation2.generation();
+  generation2 = CatalogReadLease();
 
   CoalescedBaGraphMutation erase;
   erase.owner_epoch = 101;
@@ -244,6 +288,7 @@ BOOST_AUTO_TEST_CASE(TransactionNoopReassignAndFailureDoNotPartiallyPublish) {
   BOOST_CHECK(!store.ApplyCoalescedMutation(full_rebuild, &update, &error));
   BOOST_CHECK(update.full_rebuild_required);
   BOOST_CHECK_EQUAL(store.topology_revision(), 5);
+  BOOST_CHECK(!store.AcquireReadLease().valid());
 
   HostBaGraphColdInput invalid_rebuild = MakeGraph();
   invalid_rebuild.topology_revision = 6;
@@ -255,7 +300,16 @@ BOOST_AUTO_TEST_CASE(TransactionNoopReassignAndFailureDoNotPartiallyPublish) {
   BOOST_REQUIRE_MESSAGE(store.ColdBuild(rebuild, &update, &error), error);
   BOOST_CHECK(update.full_rebuild);
   BOOST_CHECK_EQUAL(store.topology_revision(), 6);
-  BOOST_CHECK_GT(store.generation(), generation2.generation());
+  BOOST_CHECK_GT(store.generation(), generation2_value);
+
+  CoalescedBaGraphMutation camera_delete;
+  camera_delete.owner_epoch = 101;
+  camera_delete.revision_before = 6;
+  camera_delete.revision_after = 7;
+  camera_delete.tombstone_camera_ids.push_back(7);
+  BOOST_CHECK(!store.ApplyCoalescedMutation(camera_delete, &update, &error));
+  BOOST_CHECK(update.full_rebuild_required);
+  BOOST_CHECK(!store.AcquireReadLease().valid());
 }
 
 BOOST_AUTO_TEST_CASE(OwnerIsolationAndCascadingTombstone) {
@@ -281,6 +335,126 @@ BOOST_AUTO_TEST_CASE(OwnerIsolationAndCascadingTombstone) {
   BOOST_CHECK(!lease.observations()[0].header.alive);
   BOOST_CHECK(!lease.observations()[1].header.alive);
   BOOST_CHECK_EQUAL(update.cascaded_observation_tombstones, 2);
+}
+
+BOOST_AUTO_TEST_CASE(DeltaComplexityTracksOnlyTouchedIncidence) {
+  constexpr size_t kUnrelatedObservationCount = 4096;
+  HostBaGraphStore store(303);
+  HostBaGraphUpdateResult update;
+  std::string error;
+  BOOST_REQUIRE_MESSAGE(
+      store.ColdBuild(MakeLargeGraph(kUnrelatedObservationCount), &update,
+                      &error),
+      error);
+  BOOST_CHECK_EQUAL(update.full_catalog_scans, 1);
+
+  const auto apply = [&](CoalescedBaGraphMutation mutation) {
+    mutation.owner_epoch = 303;
+    BOOST_REQUIRE_MESSAGE(
+        store.ApplyCoalescedMutation(mutation, &update, &error), error);
+    BOOST_CHECK(update.in_place_delta);
+    BOOST_CHECK_EQUAL(update.transaction_copy_bytes, 0);
+    BOOST_CHECK_EQUAL(update.full_catalog_scans, 0);
+  };
+
+  CoalescedBaGraphMutation add;
+  add.revision_before = 1;
+  add.revision_after = 2;
+  add.observation_upserts.push_back(
+      {10000, 1, 20001, {{10.0, 20.0}}});
+  apply(add);
+  BOOST_CHECK_EQUAL(update.adjacency_nodes_visited, 0);
+  BOOST_CHECK_EQUAL(update.adjacency_nodes_appended, 2);
+  BOOST_CHECK_EQUAL(update.touched_entity_records, 2);
+
+  CoalescedBaGraphMutation xy;
+  xy.revision_before = 2;
+  xy.revision_after = 3;
+  xy.observation_upserts.push_back(
+      {10000, 1, 20001, {{11.0, 21.0}}});
+  apply(xy);
+  BOOST_CHECK_EQUAL(update.adjacency_nodes_visited, 0);
+  BOOST_CHECK_EQUAL(update.adjacency_nodes_appended, 0);
+  BOOST_CHECK_EQUAL(update.touched_observation_records, 1);
+
+  CoalescedBaGraphMutation rebind;
+  rebind.revision_before = 3;
+  rebind.revision_after = 4;
+  rebind.observation_upserts.push_back(
+      {10000, 1, 20002, {{11.0, 21.0}}});
+  apply(rebind);
+  BOOST_CHECK_EQUAL(update.adjacency_nodes_visited, 0);
+  BOOST_CHECK_EQUAL(update.adjacency_nodes_appended, 2);
+
+  CoalescedBaGraphMutation tombstone;
+  tombstone.revision_before = 4;
+  tombstone.revision_after = 5;
+  tombstone.tombstone_observations.push_back({10000, 1});
+  apply(tombstone);
+  BOOST_CHECK_EQUAL(update.adjacency_nodes_visited, 0);
+  BOOST_CHECK_EQUAL(update.adjacency_nodes_appended, 0);
+
+  CoalescedBaGraphMutation revive;
+  revive.revision_before = 5;
+  revive.revision_after = 6;
+  revive.observation_upserts.push_back(
+      {10000, 1, 20001, {{11.0, 21.0}}});
+  apply(revive);
+  BOOST_CHECK_EQUAL(update.adjacency_nodes_appended, 2);
+
+  CoalescedBaGraphMutation original_to_b;
+  original_to_b.revision_before = 6;
+  original_to_b.revision_after = 7;
+  original_to_b.observation_upserts.push_back(
+      {10000, 0, 20001, {{0.0, 1.0}}});
+  apply(original_to_b);
+  CoalescedBaGraphMutation original_to_a;
+  original_to_a.revision_before = 7;
+  original_to_a.revision_after = 8;
+  original_to_a.observation_upserts.push_back(
+      {10000, 0, 20000, {{0.0, 1.0}}});
+  apply(original_to_a);
+
+  CoalescedBaGraphMutation invalid;
+  invalid.owner_epoch = 303;
+  invalid.revision_before = 8;
+  invalid.revision_after = 9;
+  invalid.observation_upserts.push_back(
+      {10000, 2, 999999, {{1.0, 2.0}}});
+  BOOST_CHECK(!store.ApplyCoalescedMutation(invalid, &update, &error));
+  BOOST_CHECK(!update.published);
+  {
+    const CatalogReadLease lease = store.AcquireReadLease();
+    BOOST_REQUIRE(lease.valid());
+    BOOST_CHECK_EQUAL(lease.topology_revision(), 8);
+    BOOST_CHECK(lease.FindObservation(10000, 0)->header.alive);
+    BOOST_CHECK_EQUAL(lease.FindObservation(10000, 0)->point_slot, 0);
+  }
+
+  CoalescedBaGraphMutation delete_point;
+  delete_point.revision_before = 8;
+  delete_point.revision_after = 9;
+  delete_point.tombstone_point_ids.push_back(20001);
+  apply(delete_point);
+  BOOST_CHECK_EQUAL(update.adjacency_nodes_visited, 4);
+  BOOST_CHECK_LT(update.adjacency_nodes_visited,
+                 kUnrelatedObservationCount);
+  {
+    const CatalogReadLease lease = store.AcquireReadLease();
+    BOOST_REQUIRE(lease.valid());
+    BOOST_CHECK(lease.FindObservation(10000, 0)->header.alive);
+    BOOST_CHECK(!lease.FindObservation(10000, 1)->header.alive);
+    BOOST_CHECK_EQUAL(lease.points()[0].track_length, 1);
+  }
+
+  CoalescedBaGraphMutation delete_image;
+  delete_image.revision_before = 9;
+  delete_image.revision_after = 10;
+  delete_image.tombstone_image_ids.push_back(10002);
+  apply(delete_image);
+  BOOST_CHECK_EQUAL(update.adjacency_nodes_visited, 1);
+  BOOST_CHECK_LT(update.adjacency_nodes_visited,
+                 kUnrelatedObservationCount);
 }
 
 BOOST_AUTO_TEST_CASE(GlobalWholeAndSelectionRevisionRemainExplicitIdentity) {

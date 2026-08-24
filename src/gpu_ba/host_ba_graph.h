@@ -28,7 +28,7 @@ enum class CudaResidualOrder : uint8_t;
 enum class CudaSchurContributionBackend : uint8_t;
 struct CudaFullLmOptions;
 
-constexpr uint32_t kHostBaGraphAbiVersion = 1;
+constexpr uint32_t kHostBaGraphAbiVersion = 2;
 constexpr uint32_t kNativeHostSolveViewAbiVersion = 1;
 constexpr uint32_t kBaGraphInvalidSlot = 0xffffffffu;
 
@@ -65,7 +65,7 @@ struct HostBaImageSlot {
   HostBaGraphSlotHeader header;
   uint32_t image_id = 0;
   uint32_t camera_slot = kBaGraphInvalidSlot;
-  uint32_t adjacency_offset = 0;
+  uint32_t adjacency_head = kBaGraphInvalidSlot;
   uint32_t adjacency_count = 0;
   // Monotonic number of incidence nodes ever appended for this slot. Current
   // solve semantics use adjacency_count, never this lifetime diagnostic.
@@ -77,7 +77,7 @@ struct HostBaImageSlot {
 struct HostBaPointSlot {
   HostBaGraphSlotHeader header;
   uint64_t point3D_id = 0;
-  uint32_t adjacency_offset = 0;
+  uint32_t adjacency_head = kBaGraphInvalidSlot;
   uint32_t adjacency_count = 0;
   uint32_t lifetime_incidence_count = 0;
   uint32_t track_length = 0;
@@ -87,10 +87,16 @@ struct HostBaObservationSlot {
   HostBaGraphSlotHeader header;
   uint32_t image_slot = kBaGraphInvalidSlot;
   uint32_t point_slot = kBaGraphInvalidSlot;
-  uint32_t camera_slot = kBaGraphInvalidSlot;
   uint32_t point2D_idx = 0;
   uint64_t source_identity = 0;
+  uint64_t association_generation = 0;
   std::array<double, 2> xy{{0.0, 0.0}};
+};
+
+struct HostBaIncidenceNode {
+  uint32_t observation_slot = kBaGraphInvalidSlot;
+  uint32_t next_node = kBaGraphInvalidSlot;
+  uint64_t association_generation = 0;
 };
 
 struct HostBaCameraRecord {
@@ -159,13 +165,22 @@ struct HostBaGraphUpdateResult {
   uint64_t tombstoned_slots = 0;
   uint64_t cascaded_observation_tombstones = 0;
   uint64_t transaction_copy_bytes = 0;
+  uint64_t touched_entity_records = 0;
+  uint64_t touched_observation_records = 0;
+  uint64_t adjacency_nodes_visited = 0;
+  uint64_t adjacency_nodes_appended = 0;
+  uint64_t full_catalog_scans = 0;
   bool published = false;
   bool semantic_noop = false;
   bool full_rebuild = false;
   bool full_rebuild_required = false;
+  bool in_place_delta = false;
+  bool reader_busy = false;
 };
 
 struct HostBaGraphPublication;
+struct HostBaGraphLeaseGateState;
+struct HostBaGraphReadGuard;
 
 class CatalogReadLease {
  public:
@@ -182,8 +197,8 @@ class CatalogReadLease {
   BaArrayView<HostBaImageSlot> images() const noexcept;
   BaArrayView<HostBaPointSlot> points() const noexcept;
   BaArrayView<HostBaObservationSlot> observations() const noexcept;
-  BaArrayView<uint32_t> image_observation_slots() const noexcept;
-  BaArrayView<uint32_t> point_observation_slots() const noexcept;
+  BaArrayView<HostBaIncidenceNode> image_incidence_nodes() const noexcept;
+  BaArrayView<HostBaIncidenceNode> point_incidence_nodes() const noexcept;
 
   const HostBaCameraSlot* FindCameraById(uint32_t id) const noexcept;
   const HostBaImageSlot* FindImageById(uint32_t id) const noexcept;
@@ -194,8 +209,10 @@ class CatalogReadLease {
  private:
   friend class HostBaGraphStore;
   explicit CatalogReadLease(
-      std::shared_ptr<const HostBaGraphPublication> publication);
+      std::shared_ptr<const HostBaGraphPublication> publication,
+      std::shared_ptr<HostBaGraphReadGuard> guard);
   std::shared_ptr<const HostBaGraphPublication> publication_;
+  std::shared_ptr<HostBaGraphReadGuard> guard_;
 };
 
 // Single-writer Mapper-lifetime structure store. Dynamic parameter values are
@@ -225,7 +242,9 @@ class HostBaGraphStore {
  private:
   uint64_t owner_epoch_ = 0;
   uint64_t next_generation_ = 0;
-  std::shared_ptr<const HostBaGraphPublication> publication_;
+  bool valid_ = false;
+  std::shared_ptr<HostBaGraphLeaseGateState> gate_;
+  std::shared_ptr<HostBaGraphPublication> publication_;
 };
 
 struct NativeCudaResolvedConfig {
