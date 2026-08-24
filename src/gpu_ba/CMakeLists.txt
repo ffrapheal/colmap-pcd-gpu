@@ -18,7 +18,8 @@ if(GPU_BA_CUDA_ENABLED)
     add_library(gpu_ba_custom_cuda STATIC
                 custom_cuda.h custom_cuda.cu custom_cuda_fp32.cu
                 custom_cuda_audit.cc host_problem_store.cc
-                host_problem_store.h host_problem_store_internal.h)
+                host_problem_store.h host_problem_store_internal.h
+                native_graph_problem_store.h native_graph_problem_store.cc)
     set_target_properties(gpu_ba_custom_cuda PROPERTIES
         FOLDER ${COLMAP_TARGETS_ROOT_FOLDER}/${FOLDER_NAME}
         CUDA_ARCHITECTURES ${CMAKE_CUDA_ARCHITECTURES}

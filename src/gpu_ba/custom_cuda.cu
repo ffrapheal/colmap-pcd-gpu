@@ -1,6 +1,7 @@
 #include "gpu_ba/custom_cuda.h"
 #include "gpu_ba/active_solve_view.h"
 #include "gpu_ba/host_problem_store_internal.h"
+#include "gpu_ba/native_graph_problem_store.h"
 
 #include <cuda_runtime.h>
 #include <cuda.h>
@@ -17261,6 +17262,138 @@ void AccumulateHostStoreRuntime(const CudaHostProblemStoreRuntimeInfo& value,
 
 }  // namespace
 
+bool ResolveNativeCudaConfiguration(
+    const CudaSolveProblem& problem,
+    const CudaFullLmOptions& requested_options,
+    const uint64_t config_generation,
+    CudaFullLmOptions* resolved_options,
+    NativeCudaResolvedConfig* config,
+    std::string* error) {
+  if (resolved_options == nullptr || config == nullptr || error == nullptr ||
+      config_generation == 0) {
+    if (error != nullptr) *error = "invalid native config resolver arguments";
+    return false;
+  }
+  error->clear();
+  CudaLayerCOptions layer_c;
+  CudaArithmeticPrecision precision = CudaArithmeticPrecision::kFp64;
+  HotKernelImplementation hot = HotKernelImplementation::kReference;
+  CudaSchurContributionBackend schur =
+      CudaSchurContributionBackend::kDirectTransformed;
+  if (!ResolvePreparedHostBuildConfiguration(
+          requested_options, &layer_c, &precision, &hot, &schur, error)) {
+    return false;
+  }
+  if (requested_options.device_context_mode !=
+          CudaDeviceContextMode::kDeviceControl ||
+      !ProfileAtLeast(requested_options.execution_profile,
+                      CudaExecutionProfile::kCompactControl)) {
+    *error = "native_graph requires device_control and compact_control";
+    return false;
+  }
+  CudaHessianAssemblyBackend hessian =
+      CudaHessianAssemblyBackend::kCompatibilityDefault;
+  std::string hessian_requested;
+  CudaLossMode loss_mode = CudaLossMode::kFromSnapshot;
+  double loss_scale = 0.0;
+  if (!ResolveHessianAssemblyBackend(
+          layer_c.layer_b.hessian_assembly_backend, hot, &hessian,
+          &hessian_requested, error) ||
+      !ResolveCudaLoss(problem, layer_c.layer_b, &loss_mode, &loss_scale,
+                       error)) {
+    return false;
+  }
+  LidarResidualMode lidar_mode;
+  const std::string lidar_name = problem.metadata.lidar_residual_mode.empty()
+      ? "legacy_exact"
+      : problem.metadata.lidar_residual_mode;
+  if (!ParseLidarResidualMode(lidar_name, &lidar_mode)) {
+    *error = "unsupported lidar residual mode: " + lidar_name;
+    return false;
+  }
+
+  *resolved_options = requested_options;
+  resolved_options->layer_c = layer_c;
+  resolved_options->arithmetic_precision = precision;
+  resolved_options->layer_c.schur_contribution_backend = schur;
+  resolved_options->layer_c.layer_b.hessian_assembly_backend = hessian;
+  resolved_options->layer_c.layer_b.loss_mode = loss_mode;
+  resolved_options->layer_c.layer_b.loss_scale = loss_scale;
+  switch (hot) {
+    case HotKernelImplementation::kReference:
+      resolved_options->hot_kernel_mode = CudaHotKernelMode::kReference;
+      break;
+    case HotKernelImplementation::kOptimized:
+      resolved_options->hot_kernel_mode = CudaHotKernelMode::kOptimized;
+      break;
+    case HotKernelImplementation::kTransformed:
+      resolved_options->hot_kernel_mode = CudaHotKernelMode::kTransformed;
+      break;
+  }
+  resolved_options->max_num_iterations = requested_options.max_num_iterations >= 0
+      ? requested_options.max_num_iterations
+      : problem.metadata.max_num_iterations;
+  resolved_options->max_num_consecutive_invalid_steps =
+      requested_options.max_num_consecutive_invalid_steps >= 0
+          ? requested_options.max_num_consecutive_invalid_steps
+          : problem.metadata.max_consecutive_invalid_steps;
+  resolved_options->function_tolerance = requested_options.function_tolerance >= 0.0
+      ? requested_options.function_tolerance
+      : problem.metadata.function_tolerance;
+  resolved_options->gradient_tolerance = requested_options.gradient_tolerance >= 0.0
+      ? requested_options.gradient_tolerance
+      : problem.metadata.gradient_tolerance;
+  resolved_options->parameter_tolerance = requested_options.parameter_tolerance >= 0.0
+      ? requested_options.parameter_tolerance
+      : problem.metadata.parameter_tolerance;
+
+  NativeCudaResolvedConfig value;
+  value.resolved = true;
+  value.performance_mode = resolved_options->performance_mode;
+  value.config_generation = config_generation;
+  value.arithmetic_precision = precision;
+  value.device_context = resolved_options->device_context_mode;
+  value.memory_mode = layer_c.layer_b.layer_a.memory_mode;
+  value.reduction_mode = layer_c.layer_b.reduction_mode;
+  value.audit_profile = resolved_options->audit_profile;
+  value.linearization_cache =
+      resolved_options->current_linearization_cache_mode;
+  value.hessian_backend = hessian;
+  value.schur_backend = schur;
+  value.hot_kernel = resolved_options->hot_kernel_mode;
+  value.execution_profile = resolved_options->execution_profile;
+  value.residual_order = layer_c.layer_b.layer_a.residual_order;
+  value.loss_mode = loss_mode;
+  value.lidar_residual_mode = lidar_mode;
+  value.lidar_near_zero_threshold = 1e-12;
+  value.loss_scale = loss_scale;
+  value.device = layer_c.layer_b.layer_a.device;
+  value.block_size = layer_c.layer_b.layer_a.block_size;
+  value.cost_reduction_threads = layer_c.layer_b.cost_reduction_threads;
+  value.pair_chunk_limit_bytes =
+      resolved_options->pair_chunk_limit_bytes_for_testing;
+  value.hessian_segment_size =
+      layer_c.layer_b.hessian_segment_size_for_testing;
+  value.schur_segment_size = layer_c.schur_segment_size_for_testing;
+  value.max_num_iterations = resolved_options->max_num_iterations;
+  value.max_consecutive_invalid_steps =
+      resolved_options->max_num_consecutive_invalid_steps;
+  value.function_tolerance = resolved_options->function_tolerance;
+  value.gradient_tolerance = resolved_options->gradient_tolerance;
+  value.parameter_tolerance = resolved_options->parameter_tolerance;
+  value.max_solver_time_in_seconds =
+      resolved_options->max_solver_time_in_seconds;
+  value.initial_trust_region_radius =
+      resolved_options->initial_trust_region_radius;
+  value.min_trust_region_radius = resolved_options->min_trust_region_radius;
+  value.max_trust_region_radius = resolved_options->max_trust_region_radius;
+  value.min_relative_decrease = resolved_options->min_relative_decrease;
+  value.min_lm_diagonal = layer_c.layer_b.min_lm_diagonal;
+  value.max_lm_diagonal = layer_c.layer_b.max_lm_diagonal;
+  *config = std::move(value);
+  return true;
+}
+
 struct GpuBaHostProblemStoreControl {
   const Reconstruction* reconstruction = nullptr;
   uint64_t owner_epoch = 0;
@@ -17601,7 +17734,9 @@ bool PreparedIndexedActiveSolve::Complete(
 
 GpuBaHostProblemStore::GpuBaHostProblemStore(
     const Reconstruction* reconstruction, const uint64_t owner_epoch)
-    : control_(std::make_shared<GpuBaHostProblemStoreControl>()) {
+    : control_(std::make_shared<GpuBaHostProblemStoreControl>()),
+      native_graph_state_(CreateNativeGraphStoreState(reconstruction,
+                                                       owner_epoch)) {
   control_->reconstruction = reconstruction;
   control_->owner_epoch = owner_epoch;
   control_->journal_cursor = reconstruction == nullptr
@@ -17624,6 +17759,11 @@ bool GpuBaHostProblemStore::Shutdown(std::string* error) noexcept {
   if (error == nullptr) return false;
   error->clear();
   if (control_ == nullptr || control_->shutdown) return true;
+  std::string native_error;
+  if (!ShutdownNativeGraphStoreState(native_graph_state_, &native_error)) {
+    *error = native_error;
+    return false;
+  }
   if (control_->active) {
     *error = "StoreBusy: cannot shutdown an active host prepared store";
     control_->shutdown_requested = true;

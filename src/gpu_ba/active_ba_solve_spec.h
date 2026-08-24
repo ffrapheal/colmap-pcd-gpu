@@ -26,6 +26,7 @@ enum class CudaProblemSource : uint8_t {
   kLegacySnapshot = 0,
   kActiveSpec = 1,
   kIndexedCatalog = 2,
+  kNativeGraph = 3,
 };
 
 bool ParseCudaProblemSource(const std::string& value,
