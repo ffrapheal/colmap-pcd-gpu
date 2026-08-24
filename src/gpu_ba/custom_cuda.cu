@@ -23061,11 +23061,27 @@ bool RunCustomCudaSolveCore(const CudaSolveProblem* problem,
     native_result->final_cost = result->final_cost;
     native_result->trial_iterations = result->trial_iterations;
     native_result->accepted_steps = result->accepted_steps;
+    native_result->accepted_decisions = result->accepted_decisions;
     native_result->accepted_commits = result->accepted_commits;
     native_result->rejected_steps = result->rejected_steps;
     native_result->invalid_steps = result->invalid_steps;
     native_result->final_internal_state_epoch =
         result->runtime.final_internal_state_epoch;
+    native_result->max_backward_error = 0.0;
+    native_result->backward_error_samples = result->trace.size();
+    for (const CudaLmIteration& iteration : result->trace) {
+      if (!std::isfinite(iteration.backward_error)) {
+        native_result->max_backward_error =
+            std::numeric_limits<double>::quiet_NaN();
+        break;
+      }
+      native_result->max_backward_error = std::max(
+          native_result->max_backward_error, iteration.backward_error);
+    }
+    native_result->resource_cleanup_failed =
+        result->error_classification ==
+            CudaSolveErrorClass::kResourceCleanup ||
+        result->runtime.resource_cleanup_failures != 0;
     native_result->runtime.legacy_kernel_input_bundle_calls =
         native_bundle->runtime.legacy_kernel_input_bundle_calls;
     native_result->runtime.build_cuda_layer_a_inputs_calls =

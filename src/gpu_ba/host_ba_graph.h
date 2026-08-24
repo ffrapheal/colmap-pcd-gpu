@@ -349,6 +349,9 @@ struct BaSolveIntent {
   NativeCudaResolvedConfig config;
   std::vector<uint32_t> active_image_slots;
   std::vector<uint32_t> active_visual_observation_slots;
+  // When true, an empty vector means that no visual observations are active;
+  // it must not fall back to scanning every active-image incidence.
+  bool active_visual_observation_slots_explicit = false;
   // Optional source-insertion sequence produced by the shared residual
   // enumerator. When present it must cover every selected visual and LiDAR
   // residual exactly once. It is distinct from catalog physical identity and
@@ -560,9 +563,13 @@ struct BaSolveResult {
   double final_cost = 0.0;
   int32_t trial_iterations = 0;
   int32_t accepted_steps = 0;
+  int32_t accepted_decisions = 0;
   int32_t accepted_commits = 0;
   int32_t rejected_steps = 0;
   int32_t invalid_steps = 0;
+  uint64_t backward_error_samples = 0;
+  double max_backward_error = 0.0;
+  bool resource_cleanup_failed = false;
   uint64_t final_internal_state_epoch = 0;
   DenseActiveState final_state;
 };

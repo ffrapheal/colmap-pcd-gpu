@@ -2660,7 +2660,7 @@ bool BundleAdjuster::Solve(Reconstruction* reconstruction) {
             cuda_result.final_cost = native_result.final_cost;
             cuda_result.trial_iterations = native_result.trial_iterations;
             cuda_result.accepted_steps = native_result.accepted_steps;
-            cuda_result.accepted_decisions = native_result.accepted_commits;
+            cuda_result.accepted_decisions = native_result.accepted_decisions;
             cuda_result.accepted_commits = native_result.accepted_commits;
             cuda_result.rejected_steps = native_result.rejected_steps;
             cuda_result.invalid_steps = native_result.invalid_steps;
@@ -2709,10 +2709,11 @@ bool BundleAdjuster::Solve(Reconstruction* reconstruction) {
     execution_result_.final_cost = cuda_result.final_cost;
     execution_result_.peak_cuda_bytes =
         cuda_result.runtime.persistent_device.peak_resident_bytes;
-    host_store_device_cleanup_failed =
-        cuda_result.error_classification ==
-            gpu_ba::CudaSolveErrorClass::kResourceCleanup ||
-        cuda_result.runtime.resource_cleanup_failures != 0;
+    host_store_device_cleanup_failed = native_graph_requested
+        ? native_result.resource_cleanup_failed
+        : (cuda_result.error_classification ==
+               gpu_ba::CudaSolveErrorClass::kResourceCleanup ||
+           cuda_result.runtime.resource_cleanup_failures != 0);
     if (cuda_host_store_binding_.mode ==
             gpu_ba::CudaHostProblemStoreMode::kDisabled ||
         cuda_result.runtime.host_problem_store.mode_requested != "disabled") {
@@ -2813,6 +2814,10 @@ bool BundleAdjuster::Solve(Reconstruction* reconstruction) {
       execution_result_.max_backward_error = std::max(
           execution_result_.max_backward_error, iteration.backward_error);
     }
+    if (native_graph_requested) {
+      execution_result_.max_backward_error =
+          native_result.max_backward_error;
+    }
 
     const double cost_tolerance =
         std::max(1e-8, 1e-10 * std::max(1.0, cuda_result.initial_cost));
@@ -2825,6 +2830,8 @@ bool BundleAdjuster::Solve(Reconstruction* reconstruction) {
         (cuda_result.accepted_commits == 0 ||
          cuda_result.final_cost < cuda_result.initial_cost) &&
         cuda_result.accepted_decisions == cuda_result.accepted_commits &&
+        (!native_graph_requested ||
+         native_result.backward_error_samples != 0) &&
         std::isfinite(execution_result_.max_backward_error);
     if (!numerical_contract && cuda_error.empty()) {
       cuda_error = "CUDA_NUMERICAL_ACCEPTANCE_CONTRACT";

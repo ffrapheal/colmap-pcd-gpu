@@ -1774,7 +1774,7 @@ bool NativeHostSolveMaterializer::Materialize(
                       error);
     }
     if (!activate_image(image_slot, false)) return false;
-    if (intent.active_visual_observation_slots.empty()) {
+    if (!intent.active_visual_observation_slots_explicit) {
       const HostBaImageSlot& image = images[image_slot];
       if (!visit_incidence(
               image.adjacency_head, image.adjacency_count, image_slot, true,
@@ -1785,7 +1785,7 @@ bool NativeHostSolveMaterializer::Materialize(
       }
     }
   }
-  if (!intent.active_visual_observation_slots.empty()) {
+  if (intent.active_visual_observation_slots_explicit) {
     for (const uint32_t observation_slot :
          intent.active_visual_observation_slots) {
       if (observation_slot >= observations.size ||

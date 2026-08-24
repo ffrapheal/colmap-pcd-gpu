@@ -368,6 +368,9 @@ bool PreparedNativeActiveSolve::Complete(std::string* error) noexcept {
       data->active = false;
       return false;
     }
+    // Release the graph read guard while active_prepares still excludes a
+    // second prepare. This closes the reader_busy window at handoff.
+    data->view.catalog = CatalogReadLease();
     --data->state->active_prepares;
     data->active = false;
   }
@@ -550,12 +553,14 @@ bool PrepareCudaNativeActiveSolve(
   intent.selection_revision = state->next_selection_generation;
   intent.kind = problem.metadata.ba_kind;
   intent.config = resolved_config;
+  intent.active_visual_observation_slots_explicit = true;
   DenseActiveState dense;
   dense.owner_epoch = inputs.owner_epoch;
   dense.state_generation = state->next_state_generation;
   std::unordered_set<uint32_t> selected_images;
   std::unordered_set<uint32_t> relevant_cameras;
   std::unordered_set<uint32_t> relevant_points;
+  std::unordered_set<uint32_t> explicit_variable_points;
   for (const ImageSnapshot& image : problem.images) {
     const HostBaImageSlot* slot = lease.FindImageById(image.image_id);
     if (slot == nullptr || !slot->header.alive ||
@@ -634,6 +639,7 @@ bool PrepareCudaNativeActiveSolve(
     intent.point_policies.push_back(policy);
     if (point.config_role == 1) {
       intent.explicit_variable_point_slots.push_back(slot->header.slot);
+      explicit_variable_points.insert(slot->header.slot);
     }
   }
   std::unordered_map<uint64_t, uint32_t> visual_source_slots;
@@ -650,6 +656,14 @@ bool PrepareCudaNativeActiveSolve(
         !visual_source_slots.emplace(observation.source_index,
                                      slot->header.slot).second) {
       *error = "native visual residual is inconsistent with the graph catalog";
+      return false;
+    }
+    if (selected_images.count(observation.image_id) != 0) {
+      intent.active_visual_observation_slots.push_back(slot->header.slot);
+    } else if (explicit_variable_points.count(slot->point_slot) == 0) {
+      *error =
+          "native boundary visual residual is not owned by an explicit "
+          "variable point";
       return false;
     }
   }
@@ -781,7 +795,15 @@ bool ValidateAndCommitNativeBaState(
   error->clear();
   const auto& data = *prepared.data_;
   const NativeHostSolveView& view = data.view;
+  if (reconstruction->StructureOwnerEpoch() != view.identity.owner_epoch ||
+      reconstruction->StructureRevision() != view.identity.catalog_revision ||
+      inputs.owner_epoch != view.identity.owner_epoch ||
+      inputs.catalog_revision != view.identity.catalog_revision) {
+    *error = "native commit Reconstruction structure identity changed";
+    return false;
+  }
   if (candidate.owner_epoch != view.identity.owner_epoch ||
+      candidate.state_generation == 0 ||
       candidate.state_generation < data.initial_state.state_generation ||
       candidate.cameras.size() != data.initial_state.cameras.size() ||
       candidate.images.size() != data.initial_state.images.size() ||
@@ -810,7 +832,8 @@ bool ValidateAndCommitNativeBaState(
   std::unordered_set<uint32_t> image_slots;
   std::unordered_set<uint32_t> point_slots;
   for (const DenseCameraState& value : candidate.cameras) {
-    if (value.camera_slot >= cameras.size ||
+    if (value.state_generation != candidate.state_generation ||
+        value.camera_slot >= cameras.size ||
         !camera_slots.insert(value.camera_slot).second ||
         !Finite(value.parameters)) {
       *error = "native final camera state is invalid";
@@ -826,7 +849,8 @@ bool ValidateAndCommitNativeBaState(
     }
   }
   for (const DenseImageState& value : candidate.images) {
-    if (value.image_slot >= images.size ||
+    if (value.state_generation != candidate.state_generation ||
+        value.image_slot >= images.size ||
         !image_slots.insert(value.image_slot).second ||
         !Finite(value.quaternion) || !Finite(value.translation)) {
       *error = "native final image state is invalid";
@@ -875,7 +899,8 @@ bool ValidateAndCommitNativeBaState(
     }
   }
   for (const DensePointState& value : candidate.points) {
-    if (value.point_slot >= points.size ||
+    if (value.state_generation != candidate.state_generation ||
+        value.point_slot >= points.size ||
         !point_slots.insert(value.point_slot).second || !Finite(value.xyz)) {
       *error = "native final point state is invalid";
       return false;

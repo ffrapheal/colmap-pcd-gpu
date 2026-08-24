@@ -70,8 +70,10 @@ bool BuildShadowFixture(ShadowFixture* fixture, std::string* error) {
   graph.images.push_back({20, 7, true});
   graph.images.push_back({21, 7, true});
   graph.points.push_back({30});
+  graph.points.push_back({31});
   graph.observations.push_back({20, 0, 30, {{10.0, 11.0}}});
   graph.observations.push_back({21, 1, 30, {{12.0, 13.0}}});
+  graph.observations.push_back({20, 2, 31, {{99.0, 101.0}}});
   HostBaGraphUpdateResult update;
   if (!fixture->store.ColdBuild(graph, &update, error)) return false;
   fixture->lease = fixture->store.AcquireReadLease();
@@ -130,6 +132,8 @@ bool BuildShadowFixture(ShadowFixture* fixture, std::string* error) {
   fixture->intent.config.max_num_iterations = 2;
   fixture->intent.config.initial_trust_region_radius = 1.0;
   fixture->intent.active_image_slots.push_back(0);
+  fixture->intent.active_visual_observation_slots_explicit = true;
+  fixture->intent.active_visual_observation_slots.push_back(0);
   fixture->intent.explicit_variable_point_slots.push_back(0);
   fixture->intent.translation_subsets.push_back({0, 2, {0, 0, 0}});
   CameraParameterPolicy camera_policy;
@@ -412,6 +416,7 @@ BOOST_AUTO_TEST_CASE(SyntheticLegacyAndNativeKernelBoundaryPreparationParity) {
   BOOST_REQUIRE_EQUAL(view.active_image_slots.size(), 1);
   BOOST_REQUIRE_EQUAL(view.boundary_image_slots.size(), 1);
   BOOST_REQUIRE_EQUAL(view.active_point_slots.size(), 1);
+  BOOST_REQUIRE_EQUAL(view.visual_observation_slots.size(), 2);
   BOOST_CHECK_EQUAL(view.catalog.cameras()[view.active_camera_slots[0]].camera_id,
                     7);
   BOOST_CHECK_EQUAL(view.catalog.images()[view.active_image_slots[0]].image_id,
@@ -654,10 +659,19 @@ BOOST_AUTO_TEST_CASE(
   BOOST_CHECK_EQUAL(native.termination_reason, legacy.termination_reason);
   BOOST_CHECK_EQUAL(native.trial_iterations, legacy.trial_iterations);
   BOOST_CHECK_EQUAL(native.accepted_commits, legacy.accepted_commits);
+  BOOST_CHECK_EQUAL(native.accepted_decisions, legacy.accepted_decisions);
   BOOST_CHECK_EQUAL(native.rejected_steps, legacy.rejected_steps);
   BOOST_CHECK_EQUAL(native.invalid_steps, legacy.invalid_steps);
   BOOST_CHECK_EQUAL(native.final_internal_state_epoch,
                     legacy.runtime.final_internal_state_epoch);
+  double legacy_max_backward_error = 0.0;
+  for (const CudaLmIteration& iteration : legacy.trace) {
+    legacy_max_backward_error =
+        std::max(legacy_max_backward_error, iteration.backward_error);
+  }
+  BOOST_CHECK_EQUAL(native.backward_error_samples, legacy.trace.size());
+  BOOST_CHECK_EQUAL(native.max_backward_error, legacy_max_backward_error);
+  BOOST_CHECK(std::isfinite(native.max_backward_error));
   BOOST_CHECK_EQUAL(native.initial_cost, legacy.initial_cost);
   BOOST_CHECK_EQUAL(native.final_cost, legacy.final_cost);
   BOOST_CHECK_EQUAL(native.final_state.state_generation,
