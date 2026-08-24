@@ -32,6 +32,8 @@
 #ifndef COLMAP_SRC_SFM_INCREMENTAL_MAPPER_H_
 #define COLMAP_SRC_SFM_INCREMENTAL_MAPPER_H_
 
+#include <cassert>
+
 #include "base/database.h"
 #include "base/database_cache.h"
 #include "base/reconstruction.h"
@@ -68,8 +70,14 @@ class NonBaStageSink;
 class IncrementalMapper {
  public:
   struct Options {
+    enum class LocalLidarRoute {
+      PROJECTION,
+      KDTREE,
+    };
+
     int first_image_fixed_frames = 1;
     int min_proj_num = 1;
+    bool local_lidar_kdtree_only = false;
     double kdtree_max_search_range;
     double kdtree_min_search_range;
     double search_range_drop_speed;
@@ -153,6 +161,16 @@ class IncrementalMapper {
     };
     ImageSelectionMethod image_selection_method =
         ImageSelectionMethod::MIN_UNCERTAINTY;
+
+    LocalLidarRoute LocalLidarRouteForTrackLength(
+        const size_t track_length) const {
+      assert(min_proj_num >= 0);
+      if (!local_lidar_kdtree_only &&
+          track_length < static_cast<size_t>(min_proj_num) + 3) {
+        return LocalLidarRoute::PROJECTION;
+      }
+      return LocalLidarRoute::KDTREE;
+    }
 
     bool Check() const;
   };

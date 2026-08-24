@@ -349,7 +349,8 @@ size_t CompleteAndMergeTracks(const IncrementalMapperOptions& options,
 IncrementalMapper::Options IncrementalMapperOptions::Mapper() const {
   IncrementalMapper::Options options = mapper;
   options.first_image_fixed_frames = first_image_fixed_frames;
-  options.min_proj_num = min_proj_num; 
+  options.min_proj_num = min_proj_num;
+  options.local_lidar_kdtree_only = local_lidar_kdtree_only;
   options.kdtree_max_search_range = kdtree_max_search_range;
   options.kdtree_min_search_range = kdtree_min_search_range;
   options.search_range_drop_speed = search_range_drop_speed;

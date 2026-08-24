@@ -551,7 +551,9 @@ void OptionManager::AddMapperOptions() {
   AddAndRegisterDefaultOption("Mapper.icp_ground_lidar_constraint_weight",
                               &mapper->icp_ground_lidar_constraint_weight); 
   AddAndRegisterDefaultOption("Mapper.min_proj_num",
-                              &mapper->min_proj_num);                          
+                              &mapper->min_proj_num);
+  AddAndRegisterDefaultOption("Mapper.local_lidar_kdtree_only",
+                              &mapper->local_lidar_kdtree_only);
   AddAndRegisterDefaultOption("Mapper.depth_image_scale",
                               &mapper->depth_image_scale);  
   AddAndRegisterDefaultOption("Mapper.if_save_depth_image",

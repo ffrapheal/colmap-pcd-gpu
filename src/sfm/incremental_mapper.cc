@@ -105,6 +105,7 @@ float RankNextImageMinUncertainty(const Image& image) {
 }  // namespace
 
 bool IncrementalMapper::Options::Check() const {
+  CHECK_OPTION_GE(min_proj_num, 0);
   CHECK_OPTION_GT(init_min_num_inliers, 0);
   CHECK_OPTION_GT(init_max_error, 0.0);
   CHECK_OPTION_GE(init_max_forward_motion, 0.0);
@@ -1079,7 +1080,9 @@ IncrementalMapper::AdjustLocalBundle(
                 point3D.Track().Length() <= kMaxTrackLength) {
               ba_config.AddVariablePoint(point3D_id);
               variable_point3D_ids.insert(point3D_id);
-              if (point3D.Track().Length() < options.min_proj_num + 3) {
+              if (options.LocalLidarRouteForTrackLength(
+                      point3D.Track().Length()) ==
+                  Options::LocalLidarRoute::PROJECTION) {
                 pcdproj_point3D_ids.insert(point3D_id);
               } else {
                 search_closest_point3D_ids.insert(point3D_id);

@@ -75,6 +75,8 @@ struct IncrementalMapperOptions {
   int first_image_fixed_frames = 8;
   // Minimize proj times for each image before Icp
   int min_proj_num = 1;
+  // Route every admitted local LiDAR candidate through the existing KD-tree.
+  bool local_lidar_kdtree_only = false;
   // If use lidar point cloud as constraint
   bool if_add_lidar_constraint = true;
   // Lidar point cloud file
