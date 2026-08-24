@@ -1556,6 +1556,48 @@ BOOST_AUTO_TEST_CASE(ActiveSpecZeroObservationSelectedCameraRunsFastPath) {
   BOOST_CHECK_EQUAL(adjuster.ExecutionResult().snapshot_materialization_calls,
                     0);
 }
+
+BOOST_AUTO_TEST_CASE(NativeGraphRunsProductionBranchWithoutLegacySnapshot) {
+  FailureModeReset reset;
+  SyntheticProblem problem = MakeSyntheticProblem();
+  constexpr uint64_t kOwnerEpoch = 12001;
+  problem.reconstruction.BeginStructureJournal(kOwnerEpoch, 32);
+  gpu_ba::GpuBaHostProblemStore store(&problem.reconstruction, kOwnerEpoch);
+  gpu_ba::CudaHostStoreBinding binding;
+  binding.store = &store;
+  binding.owner_epoch = kOwnerEpoch;
+  binding.mode = gpu_ba::CudaHostProblemStoreMode::kHostPreparedStore;
+  BundleAdjustmentOptions options = CudaOptions(false);
+  options.ba_cuda_host_problem_store = "host_prepared_store";
+  options.ba_cuda_problem_source = gpu_ba::CudaProblemSource::kNativeGraph;
+  options.ba_cuda_execution_profile =
+      BundleAdjustmentOptions::CudaExecutionProfile::COMPACT_CONTROL;
+  options.ba_cuda_audit_profile = "production";
+  options.ba_cuda_arithmetic_precision = "fp64";
+  options.ba_cuda_hessian_assembly_backend = "observation_segmented";
+  options.ba_cuda_hot_kernel_mode = "transformed";
+  options.ba_cuda_schur_contribution_backend = "segmented";
+  BundleAdjuster adjuster(options, problem.config);
+  adjuster.SetOptimazePhrase(BundleAdjuster::OptimazePhrase::Local);
+  adjuster.SetCudaHostStoreBinding(binding);
+  BOOST_REQUIRE_MESSAGE(adjuster.Solve(&problem.reconstruction),
+                        adjuster.ExecutionResult().diagnostic_message);
+  const BundleAdjustmentExecutionResult& execution =
+      adjuster.ExecutionResult();
+  BOOST_CHECK_EQUAL(execution.problem_source_requested, "native_graph");
+  BOOST_CHECK_EQUAL(execution.problem_source_effective, "native_graph");
+  BOOST_CHECK(!execution.ceres_problem_created);
+  BOOST_CHECK_EQUAL(execution.ceres_cost_function_creations, 0);
+  BOOST_CHECK_EQUAL(execution.ceres_add_residual_calls, 0);
+  BOOST_CHECK_EQUAL(execution.snapshot_materialization_calls, 0);
+  BOOST_CHECK_EQUAL(execution.active_spec_build_calls, 1);
+  BOOST_CHECK(!execution.fallback_used);
+  BOOST_CHECK(std::isfinite(execution.initial_cost));
+  BOOST_CHECK(std::isfinite(execution.final_cost));
+  std::string shutdown_error;
+  BOOST_REQUIRE(store.Shutdown(&shutdown_error));
+  problem.reconstruction.EndStructureJournal();
+}
 #endif
 
 }  // namespace

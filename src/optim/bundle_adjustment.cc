@@ -55,6 +55,7 @@
 #endif
 #ifdef GPU_BA_CUDA_ENABLED
 #include "gpu_ba/custom_cuda.h"
+#include "gpu_ba/native_graph_problem_store.h"
 #endif
 
 namespace colmap {
@@ -162,7 +163,8 @@ bool BundleAdjustmentOptions::Check() const {
         ba_cuda_host_problem_store == "host_prepared_store");
   CHECK(ba_cuda_problem_source == gpu_ba::CudaProblemSource::kLegacySnapshot ||
         ba_cuda_problem_source == gpu_ba::CudaProblemSource::kActiveSpec ||
-        ba_cuda_problem_source == gpu_ba::CudaProblemSource::kIndexedCatalog);
+        ba_cuda_problem_source == gpu_ba::CudaProblemSource::kIndexedCatalog ||
+        ba_cuda_problem_source == gpu_ba::CudaProblemSource::kNativeGraph);
   CHECK(ba_lidar_residual == "legacy_exact" ||
         ba_lidar_residual == "legacy_guarded" ||
         ba_lidar_residual == "signed");
@@ -2110,8 +2112,12 @@ bool BundleAdjuster::Solve(Reconstruction* reconstruction) {
   const bool indexed_catalog_requested =
       options_.ba_cuda_problem_source ==
       gpu_ba::CudaProblemSource::kIndexedCatalog;
+  const bool native_graph_requested =
+      options_.ba_cuda_problem_source ==
+      gpu_ba::CudaProblemSource::kNativeGraph;
   const bool typed_problem_requested =
-      active_spec_requested || indexed_catalog_requested;
+      active_spec_requested || indexed_catalog_requested ||
+      native_graph_requested;
 #ifdef GPU_BA_CUDA_ENABLED
   const bool custom_cuda_compiled = true;
 #else
@@ -2126,6 +2132,8 @@ bool BundleAdjuster::Solve(Reconstruction* reconstruction) {
 #ifdef GPU_BA_CUDA_ENABLED
   gpu_ba::PreparedHostSolveView prepared_host_view;
   gpu_ba::PreparedIndexedActiveSolve prepared_indexed_solve;
+  gpu_ba::PreparedNativeActiveSolve prepared_native_solve;
+  gpu_ba::NativeActiveSolveInputs native_inputs;
   bool host_store_device_cleanup_failed = false;
 #endif
 #ifdef GPU_BA_ENABLED
@@ -2145,6 +2153,13 @@ bool BundleAdjuster::Solve(Reconstruction* reconstruction) {
   };
   const auto finish = [&](const bool success) {
 #ifdef GPU_BA_CUDA_ENABLED
+    if (prepared_native_solve.valid()) {
+      std::string complete_error;
+      if (!prepared_native_solve.Complete(&complete_error) &&
+          execution_result_.diagnostic_message.empty()) {
+        execution_result_.diagnostic_message = complete_error;
+      }
+    }
     if (prepared_indexed_solve.valid()) {
       std::string complete_error;
       if (!prepared_indexed_solve.Complete(
@@ -2256,7 +2271,7 @@ bool BundleAdjuster::Solve(Reconstruction* reconstruction) {
        !options_.ba_compare_dir.empty())) {
     execution_result_.problem_source_effective = "invalid";
     execution_result_.problem_source_fallback_reason =
-        indexed_catalog_requested
+        (indexed_catalog_requested || native_graph_requested)
             ? "INDEXED_CATALOG_REQUIRES_CUSTOM_CUDA_NO_CAPTURE_NO_ORACLE"
             : "ACTIVE_SPEC_REQUIRES_CUSTOM_CUDA_NO_CAPTURE_NO_ORACLE";
     execution_result_.executed_backend = "none";
@@ -2269,16 +2284,20 @@ bool BundleAdjuster::Solve(Reconstruction* reconstruction) {
     execution_result_.termination = "failure";
     return finish(false);
   }
-  if (indexed_catalog_requested &&
+  if ((indexed_catalog_requested || native_graph_requested) &&
       cuda_host_store_binding_.mode !=
           gpu_ba::CudaHostProblemStoreMode::kHostPreparedStore) {
     execution_result_.problem_source_effective = "invalid";
     execution_result_.problem_source_fallback_reason =
-        "INDEXED_CATALOG_REQUIRES_MAPPER_HOST_STORE";
+        native_graph_requested
+            ? "NATIVE_GRAPH_REQUIRES_MAPPER_HOST_STORE"
+            : "INDEXED_CATALOG_REQUIRES_MAPPER_HOST_STORE";
     execution_result_.executed_backend = "none";
     SetStableError(&execution_result_, StableBaError::kUnsupportedConfiguration);
     execution_result_.diagnostic_message =
-        "indexed_catalog requires a Mapper-owned host_prepared_store binding";
+        std::string(gpu_ba::CudaProblemSourceName(
+            options_.ba_cuda_problem_source)) +
+        " requires a Mapper-owned host_prepared_store binding";
     execution_result_.termination = "failure";
     return finish(false);
   }
@@ -2307,8 +2326,10 @@ bool BundleAdjuster::Solve(Reconstruction* reconstruction) {
   if (typed_problem_requested) {
     execution_result_.problem_source_effective = "invalid";
     execution_result_.problem_source_fallback_reason =
-        indexed_catalog_requested ? "INDEXED_CATALOG_NOT_COMPILED"
-                                  : "ACTIVE_SPEC_NOT_COMPILED";
+        indexed_catalog_requested
+            ? "INDEXED_CATALOG_NOT_COMPILED"
+            : (native_graph_requested ? "NATIVE_GRAPH_NOT_COMPILED"
+                                      : "ACTIVE_SPEC_NOT_COMPILED");
     SetStableError(&execution_result_, StableBaError::kUnsupportedConfiguration);
     execution_result_.termination = "failure";
     return finish(false);
@@ -2570,6 +2591,7 @@ bool BundleAdjuster::Solve(Reconstruction* reconstruction) {
     bool preflight_ok = ValidateCustomCudaProductionSupport(
         options_, solver_options, cuda_problem, &cuda_error);
     gpu_ba::CudaFullLmResult cuda_result;
+    gpu_ba::BaSolveResult native_result;
     bool cuda_ok = false;
     double cuda_wall = 0.0;
     if (preflight_ok) {
@@ -2577,7 +2599,15 @@ bool BundleAdjuster::Solve(Reconstruction* reconstruction) {
       gpu_ba::CudaFullLmOptions cuda_options =
           CreateProductionCudaOptions(options_, solver_options);
       gpu_ba::CudaHostProblemStoreRuntimeInfo host_store_runtime;
-      if (indexed_catalog_requested) {
+      if (native_graph_requested) {
+        if (!gpu_ba::MakeNativeActiveSolveInputs(
+                active_spec, &native_inputs, &cuda_error) ||
+            !gpu_ba::PrepareCudaNativeActiveSolve(
+                native_inputs, cuda_options, cuda_host_store_binding_,
+                &prepared_native_solve, &cuda_error)) {
+          preflight_ok = false;
+        }
+      } else if (indexed_catalog_requested) {
         if (!gpu_ba::PrepareCudaIndexedActiveSolve(
                 cuda_problem, cuda_options, cuda_host_store_binding_,
                 &prepared_indexed_solve, &cuda_error)) {
@@ -2620,11 +2650,29 @@ bool BundleAdjuster::Solve(Reconstruction* reconstruction) {
           cuda_result.initial_cost = std::numeric_limits<double>::quiet_NaN();
           cuda_result.final_cost = std::numeric_limits<double>::infinity();
         } else {
-          cuda_ok = typed_problem_requested
-              ? gpu_ba::RunCustomCudaSolve(
-                    active_spec.problem, cuda_options, &cuda_result, &cuda_error)
-              : gpu_ba::RunCustomCudaSolve(
-                    captured_snapshot, cuda_options, &cuda_result, &cuda_error);
+          if (native_graph_requested) {
+            cuda_ok = gpu_ba::RunCustomCudaSolve(
+                prepared_native_solve.request(), &native_result, &cuda_error);
+            cuda_result.success = native_result.success;
+            cuda_result.error = native_result.error;
+            cuda_result.termination_reason = native_result.termination_reason;
+            cuda_result.initial_cost = native_result.initial_cost;
+            cuda_result.final_cost = native_result.final_cost;
+            cuda_result.trial_iterations = native_result.trial_iterations;
+            cuda_result.accepted_steps = native_result.accepted_steps;
+            cuda_result.accepted_decisions = native_result.accepted_commits;
+            cuda_result.accepted_commits = native_result.accepted_commits;
+            cuda_result.rejected_steps = native_result.rejected_steps;
+            cuda_result.invalid_steps = native_result.invalid_steps;
+            cuda_result.runtime.final_internal_state_epoch =
+                native_result.final_internal_state_epoch;
+          } else {
+            cuda_ok = typed_problem_requested
+                ? gpu_ba::RunCustomCudaSolve(active_spec.problem, cuda_options,
+                                             &cuda_result, &cuda_error)
+                : gpu_ba::RunCustomCudaSolve(captured_snapshot, cuda_options,
+                                             &cuda_result, &cuda_error);
+          }
         }
         cuda_wall = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - cuda_start).count();
@@ -2783,19 +2831,24 @@ bool BundleAdjuster::Solve(Reconstruction* reconstruction) {
     }
 
     if (numerical_contract) {
-      if (g_bundle_adjustment_failure_mode_for_testing.load() ==
+      if (!native_graph_requested &&
+          g_bundle_adjustment_failure_mode_for_testing.load() ==
               static_cast<int>(FailureModeForTesting::kCudaTopologyMismatch) &&
           !cuda_result.final_state.images.empty()) {
         ++cuda_result.final_state.images.front().camera_id;
       }
       std::string commit_error;
-      const bool commit_ok = typed_problem_requested
-          ? gpu_ba::ValidateAndCommitActiveBaState(
-                active_spec, cuda_result.final_state, reconstruction,
-                &commit_error)
-          : PrepareAndCommitCudaState(captured_snapshot,
-                                      cuda_result.final_state,
-                                      reconstruction, &commit_error);
+      const bool commit_ok = native_graph_requested
+          ? gpu_ba::ValidateAndCommitNativeBaState(
+                native_inputs, prepared_native_solve,
+                native_result.final_state, reconstruction, &commit_error)
+          : (typed_problem_requested
+                 ? gpu_ba::ValidateAndCommitActiveBaState(
+                       active_spec, cuda_result.final_state, reconstruction,
+                       &commit_error)
+                 : PrepareAndCommitCudaState(captured_snapshot,
+                                             cuda_result.final_state,
+                                             reconstruction, &commit_error));
       if (!commit_ok) {
         SetStableError(&execution_result_, StableBaError::kCommitIntegrityError);
         execution_result_.diagnostic_message = commit_error;
@@ -2827,6 +2880,22 @@ bool BundleAdjuster::Solve(Reconstruction* reconstruction) {
         }
         CopyHostStoreCommitStateToExecution(
             prepared_indexed_solve.runtime_info(), &execution_result_);
+      }
+      if (prepared_native_solve.valid()) {
+        std::string complete_error;
+        if (!prepared_native_solve.Complete(&complete_error)) {
+          SetStableError(&execution_result_,
+                         StableBaError::kCommitIntegrityError);
+          execution_result_.diagnostic_message = complete_error;
+          execution_result_.termination = "failure";
+          std::string restore_error;
+          if (!restore_transaction(true, &restore_error)) {
+            SetStableError(&execution_result_,
+                           StableBaError::kTransactionRestoreFailed);
+            execution_result_.diagnostic_message = restore_error;
+          }
+          return finish(false);
+        }
       }
       if (prepared_host_view.valid()) {
         std::string complete_error;

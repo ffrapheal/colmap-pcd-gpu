@@ -1,6 +1,7 @@
 #define TEST_NAME "gpu_ba/native_cuda_bridge"
 #include "util/testing.h"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <string>
@@ -219,6 +220,178 @@ bool BuildShadowFixture(ShadowFixture* fixture, std::string* error) {
       {1, ParameterKind::kTranslation, 20, 3, 2, false},
       {2, ParameterKind::kPoint3D, 30, 3, 3, false},
       {3, ParameterKind::kCamera, 7, 8, 8, true}};
+  return true;
+}
+
+bool BuildAcceptedCommitFixture(ShadowFixture* fixture, std::string* error) {
+  HostBaGraphColdInput graph;
+  graph.owner_epoch = 44;
+  graph.topology_revision = 4;
+  graph.cameras.push_back({7, 4, 0, 0, 8});
+  graph.images.push_back({11, 7, true});
+  graph.images.push_back({12, 7, true});
+  graph.points.push_back({101});
+  graph.points.push_back({102});
+  graph.observations.push_back({11, 1, 101, {{360.0, 190.0}}});
+  graph.observations.push_back({12, 1, 101, {{350.0, 200.0}}});
+  graph.observations.push_back({11, 2, 102, {{300.0, 260.0}}});
+  HostBaGraphUpdateResult update;
+  if (!fixture->store.ColdBuild(graph, &update, error)) return false;
+  fixture->lease = fixture->store.AcquireReadLease();
+
+  fixture->dense_state.owner_epoch = graph.owner_epoch;
+  fixture->dense_state.state_generation = 9;
+  DenseCameraState camera;
+  camera.camera_slot = 0;
+  camera.state_generation = fixture->dense_state.state_generation;
+  camera.parameters = {610.0, 605.0, 320.0, 240.0,
+                       -0.03, 0.004, 0.001, -0.0007};
+  fixture->dense_state.cameras.push_back(camera);
+  DenseImageState image;
+  image.image_slot = 0;
+  image.state_generation = fixture->dense_state.state_generation;
+  image.quaternion = {{1.0, 0.0, 0.0, 0.0}};
+  image.translation = {{0.1, -0.2, 0.3}};
+  fixture->dense_state.images.push_back(image);
+  image.image_slot = 1;
+  image.translation = {{-0.2, 0.1, 0.4}};
+  fixture->dense_state.images.push_back(image);
+  DensePointState point;
+  point.point_slot = 0;
+  point.state_generation = fixture->dense_state.state_generation;
+  point.xyz = {{0.2, -0.1, 3.0}};
+  fixture->dense_state.points.push_back(point);
+  point.point_slot = 1;
+  point.xyz = {{-0.4, 0.3, 4.0}};
+  fixture->dense_state.points.push_back(point);
+
+  fixture->intent.owner_epoch = graph.owner_epoch;
+  fixture->intent.catalog_revision = fixture->lease.topology_revision();
+  fixture->intent.catalog_generation = fixture->lease.generation();
+  fixture->intent.selection_revision = 3;
+  fixture->intent.kind = BaKind::kLocal;
+  fixture->intent.config.resolved = true;
+  fixture->intent.config.config_generation = 7;
+  fixture->intent.config.arithmetic_precision = CudaArithmeticPrecision::kFp64;
+  fixture->intent.config.device_context = CudaDeviceContextMode::kDeviceControl;
+  fixture->intent.config.memory_mode = CudaMemoryMode::kExplicitDeviceCopy;
+  fixture->intent.config.reduction_mode =
+      CudaReductionMode::kParallelDeterministic;
+  fixture->intent.config.audit_profile = CudaAuditProfile::kProduction;
+  fixture->intent.config.linearization_cache =
+      CudaCurrentLinearizationCacheMode::kEnabled;
+  fixture->intent.config.hessian_backend =
+      CudaHessianAssemblyBackend::kObservationSegmented;
+  fixture->intent.config.schur_backend =
+      CudaSchurContributionBackend::kSegmentedTransformed;
+  fixture->intent.config.hot_kernel = CudaHotKernelMode::kTransformed;
+  fixture->intent.config.execution_profile =
+      CudaExecutionProfile::kCompactControl;
+  fixture->intent.config.residual_order = CudaResidualOrder::kSourceInsertion;
+  fixture->intent.config.loss_mode = CudaLossMode::kTrivial;
+  fixture->intent.config.loss_scale = 1.0;
+  fixture->intent.config.max_num_iterations = 2;
+  fixture->intent.config.max_consecutive_invalid_steps = 10;
+  fixture->intent.config.function_tolerance = 0.0;
+  fixture->intent.config.gradient_tolerance = 0.0;
+  fixture->intent.config.parameter_tolerance = 0.0;
+  fixture->intent.active_image_slots.push_back(0);
+  fixture->intent.explicit_variable_point_slots.push_back(0);
+  fixture->intent.translation_subsets.push_back({0, 1u << 1, {0, 0, 0}});
+  CameraParameterPolicy camera_policy;
+  camera_policy.camera_slot = 0;
+  camera_policy.constant = true;
+  fixture->intent.camera_policies.push_back(camera_policy);
+  fixture->intent.point_policies.push_back({0, false, 0, false, 0.0});
+  fixture->intent.point_policies.push_back({1, true, 0, false, 0.0});
+  LidarConstraintRecord lidar;
+  lidar.point_slot = 0;
+  lidar.constraint_slot = 0;
+  lidar.physical_identity = 3;
+  lidar.plane = {{0.2, -0.3, 0.7, -1.8}};
+  lidar.weight = 4.0;
+  lidar.point_state_generation = fixture->dense_state.state_generation;
+  fixture->intent.lidar.lidar_map_generation = 1;
+  fixture->intent.lidar.match_config_generation = 1;
+  fixture->intent.lidar.constraints.push_back(lidar);
+  fixture->intent.source_insertion_order = {
+      {ResidualKind::kVisual, 0},
+      {ResidualKind::kVisual, 1},
+      {ResidualKind::kVisual, 2},
+      {ResidualKind::kLidar, 0}};
+
+  fixture->reference.metadata.snapshot_id = "cuda-layer-b-native-accepted";
+  fixture->reference.metadata.loss_function = "TRIVIAL";
+  fixture->reference.metadata.lidar_residual_mode = "legacy_exact";
+  fixture->reference.metadata.max_num_iterations = 2;
+  fixture->reference.metadata.max_consecutive_invalid_steps = 10;
+  fixture->reference.metadata.function_tolerance = 0.0;
+  fixture->reference.metadata.gradient_tolerance = 0.0;
+  fixture->reference.metadata.parameter_tolerance = 0.0;
+  CameraSnapshot reference_camera;
+  reference_camera.camera_id = 7;
+  reference_camera.model_id = 4;
+  reference_camera.constant = true;
+  reference_camera.params = camera.parameters;
+  fixture->reference.cameras.push_back(reference_camera);
+  ImageSnapshot reference_image;
+  reference_image.image_id = 11;
+  reference_image.camera_id = 7;
+  reference_image.selected = true;
+  reference_image.pose_constant = false;
+  reference_image.has_pose_parameter_blocks = true;
+  reference_image.constant_tvec_mask = 1u << 1;
+  reference_image.qvec = {{1.0, 0.0, 0.0, 0.0}};
+  reference_image.tvec = {{0.1, -0.2, 0.3}};
+  fixture->reference.images.push_back(reference_image);
+  reference_image.image_id = 12;
+  reference_image.selected = false;
+  reference_image.pose_constant = true;
+  reference_image.has_pose_parameter_blocks = false;
+  reference_image.constant_tvec_mask = 0;
+  reference_image.tvec = {{-0.2, 0.1, 0.4}};
+  fixture->reference.images.push_back(reference_image);
+  PointSnapshot reference_point;
+  reference_point.point3D_id = 101;
+  reference_point.xyz = {{0.2, -0.1, 3.0}};
+  fixture->reference.points.push_back(reference_point);
+  reference_point.point3D_id = 102;
+  reference_point.constant = true;
+  reference_point.xyz = {{-0.4, 0.3, 4.0}};
+  fixture->reference.points.push_back(reference_point);
+  const auto add_observation = [&](const uint64_t source,
+                                   const uint32_t image_id,
+                                   const uint32_t point2D_idx,
+                                   const uint64_t point3D_id,
+                                   const std::array<double, 2>& xy) {
+    ObservationSnapshot observation;
+    observation.source_index = source;
+    observation.image_id = image_id;
+    observation.point2D_idx = point2D_idx;
+    observation.point3D_id = point3D_id;
+    observation.pose_constant = image_id == 12;
+    observation.xy = xy;
+    fixture->reference.observations.push_back(observation);
+    fixture->reference.source_insertion_order.push_back(
+        {source, ResidualKind::kVisual, image_id, point2D_idx, point3D_id});
+  };
+  add_observation(0, 11, 1, 101, {{360.0, 190.0}});
+  add_observation(1, 12, 1, 101, {{350.0, 200.0}});
+  add_observation(2, 11, 2, 102, {{300.0, 260.0}});
+  LidarSnapshot reference_lidar;
+  reference_lidar.source_index = 3;
+  reference_lidar.point3D_id = 101;
+  reference_lidar.weight = 4.0;
+  reference_lidar.plane = lidar.plane;
+  fixture->reference.lidar.push_back(reference_lidar);
+  fixture->reference.source_insertion_order.push_back(
+      {3, ResidualKind::kLidar, 0, 0, 101});
+  fixture->reference.canonical_order =
+      fixture->reference.source_insertion_order;
+  fixture->reference.parameter_blocks_source_order = {
+      {0, ParameterKind::kQuaternion, 11, 4, 3, false},
+      {1, ParameterKind::kTranslation, 11, 3, 2, false},
+      {2, ParameterKind::kPoint3D, 101, 3, 3, false}};
   return true;
 }
 
@@ -451,6 +624,84 @@ BOOST_AUTO_TEST_CASE(NativeRequestRunsSharedLmControllerAndDownloadsDeviceState)
         result.final_state.points[i].xyz.end(),
         legacy_result.final_state.points[i].xyz.begin(),
         legacy_result.final_state.points[i].xyz.end());
+  }
+}
+
+BOOST_AUTO_TEST_CASE(
+    NativeAcceptedCommitSwapsCurrentSlotAndDownloadsCommittedState) {
+  ShadowFixture fixture;
+  std::string error;
+  BOOST_REQUIRE_MESSAGE(BuildAcceptedCommitFixture(&fixture, &error), error);
+  NativeHostSolveMaterializer materializer;
+  NativeHostSolveView view;
+  ActiveStateBuffer state;
+  NativeHostSolvePreparationRuntime preparation;
+  BOOST_REQUIRE_MESSAGE(materializer.Materialize(
+                            fixture.lease, fixture.intent,
+                            fixture.dense_state, &view, &state, &preparation,
+                            &error),
+                        error);
+  CudaFullLmOptions options = NativeFullLmOptions(view.config);
+  CudaFullLmResult legacy;
+  BOOST_REQUIRE_MESSAGE(
+      RunCustomCudaSolve(fixture.reference, options, &legacy, &error), error);
+  NativeCudaSolveRequest request{&view, &state, &options};
+  BaSolveResult native;
+  BOOST_REQUIRE_MESSAGE(RunCustomCudaSolve(request, &native, &error), error);
+  BOOST_REQUIRE_GE(legacy.accepted_commits, 1);
+  BOOST_REQUIRE_GE(legacy.runtime.final_internal_state_epoch, 1);
+  BOOST_CHECK_EQUAL(native.success, legacy.success);
+  BOOST_CHECK_EQUAL(native.termination_reason, legacy.termination_reason);
+  BOOST_CHECK_EQUAL(native.trial_iterations, legacy.trial_iterations);
+  BOOST_CHECK_EQUAL(native.accepted_commits, legacy.accepted_commits);
+  BOOST_CHECK_EQUAL(native.rejected_steps, legacy.rejected_steps);
+  BOOST_CHECK_EQUAL(native.invalid_steps, legacy.invalid_steps);
+  BOOST_CHECK_EQUAL(native.final_internal_state_epoch,
+                    legacy.runtime.final_internal_state_epoch);
+  BOOST_CHECK_EQUAL(native.initial_cost, legacy.initial_cost);
+  BOOST_CHECK_EQUAL(native.final_cost, legacy.final_cost);
+  BOOST_CHECK_EQUAL(native.final_state.state_generation,
+                    state.state_generation + native.final_internal_state_epoch);
+  BOOST_CHECK_EQUAL(native.runtime.dense_active_state_device_download_calls, 1);
+  BOOST_REQUIRE_EQUAL(native.final_state.cameras.size(),
+                      legacy.final_state.cameras.size());
+  BOOST_REQUIRE_EQUAL(native.final_state.images.size(),
+                      legacy.final_state.images.size());
+  BOOST_REQUIRE_EQUAL(native.final_state.points.size(),
+                      legacy.final_state.points.size());
+  for (size_t i = 0; i < native.final_state.cameras.size(); ++i) {
+    BOOST_CHECK_EQUAL_COLLECTIONS(
+        native.final_state.cameras[i].parameters.begin(),
+        native.final_state.cameras[i].parameters.end(),
+        legacy.final_state.cameras[i].params.begin(),
+        legacy.final_state.cameras[i].params.end());
+  }
+  for (size_t i = 0; i < native.final_state.images.size(); ++i) {
+    BOOST_CHECK_EQUAL_COLLECTIONS(
+        native.final_state.images[i].quaternion.begin(),
+        native.final_state.images[i].quaternion.end(),
+        legacy.final_state.images[i].qvec.begin(),
+        legacy.final_state.images[i].qvec.end());
+    BOOST_CHECK_EQUAL_COLLECTIONS(
+        native.final_state.images[i].translation.begin(),
+        native.final_state.images[i].translation.end(),
+        legacy.final_state.images[i].tvec.begin(),
+        legacy.final_state.images[i].tvec.end());
+  }
+  for (size_t i = 0; i < native.final_state.points.size(); ++i) {
+    const uint64_t point3D_id =
+        fixture.lease.points()[native.final_state.points[i].point_slot]
+            .point3D_id;
+    const auto legacy_point = std::find_if(
+        legacy.final_state.points.begin(), legacy.final_state.points.end(),
+        [point3D_id](const PointSnapshot& point) {
+          return point.point3D_id == point3D_id;
+        });
+    BOOST_REQUIRE(legacy_point != legacy.final_state.points.end());
+    BOOST_CHECK_EQUAL_COLLECTIONS(
+        native.final_state.points[i].xyz.begin(),
+        native.final_state.points[i].xyz.end(),
+        legacy_point->xyz.begin(), legacy_point->xyz.end());
   }
 }
 

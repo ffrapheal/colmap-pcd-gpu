@@ -1665,6 +1665,14 @@ bool RunCustomCudaSolve(const NativeCudaSolveRequest& request,
                         BaSolveResult* result,
                         std::string* error);
 
+bool ResolveNativeCudaConfiguration(
+    const CudaSolveProblem& problem,
+    const CudaFullLmOptions& requested_options,
+    uint64_t config_generation,
+    CudaFullLmOptions* resolved_options,
+    NativeCudaResolvedConfig* config,
+    std::string* error);
+
 // Internal dispatch target for explicit Phase 10.1a precision experiments.
 // Callers should use RunCustomCudaSolve so selector validation and telemetry
 // remain centralized. It is declared here only because it lives in an

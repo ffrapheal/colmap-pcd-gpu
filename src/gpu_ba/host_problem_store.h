@@ -19,6 +19,7 @@ struct MapperStaticCatalogStableTables;
 struct PreparedHostSolveViewData;
 struct StaticProblemDataCatalog;
 struct GpuBaHostProblemStoreControl;
+struct NativeGraphStoreState;
 struct PreparedHostStorePublication;
 struct PreparedIndexedCatalogPublication;
 
@@ -29,6 +30,8 @@ enum class CudaHostProblemStoreMode : uint8_t {
 
 class GpuBaHostProblemStore;
 class PreparedIndexedActiveSolve;
+class PreparedNativeActiveSolve;
+struct NativeActiveSolveInputs;
 
 struct CudaHostProblemStoreLeaseTestResult {
   bool shutdown_reported_store_busy = false;
@@ -241,8 +244,15 @@ class GpuBaHostProblemStore {
       const CudaHostStoreBinding&,
       PreparedIndexedActiveSolve*,
       std::string*);
+  friend bool PrepareCudaNativeActiveSolve(
+      const NativeActiveSolveInputs&,
+      const CudaFullLmOptions&,
+      const CudaHostStoreBinding&,
+      PreparedNativeActiveSolve*,
+      std::string*);
 
   std::shared_ptr<GpuBaHostProblemStoreControl> control_;
+  std::shared_ptr<NativeGraphStoreState> native_graph_state_;
 };
 
 bool ParseCudaHostProblemStoreMode(const std::string& value,

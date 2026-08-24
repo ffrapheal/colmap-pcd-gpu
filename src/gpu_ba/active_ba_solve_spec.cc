@@ -189,6 +189,10 @@ bool ParseCudaProblemSource(const std::string& value,
     *source = CudaProblemSource::kIndexedCatalog;
     return true;
   }
+  if (value == "native_graph") {
+    *source = CudaProblemSource::kNativeGraph;
+    return true;
+  }
   return false;
 }
 
@@ -197,6 +201,7 @@ const char* CudaProblemSourceName(const CudaProblemSource source) {
     case CudaProblemSource::kLegacySnapshot: return "legacy_snapshot";
     case CudaProblemSource::kActiveSpec: return "active_spec";
     case CudaProblemSource::kIndexedCatalog: return "indexed_catalog";
+    case CudaProblemSource::kNativeGraph: return "native_graph";
   }
   return "invalid";
 }
