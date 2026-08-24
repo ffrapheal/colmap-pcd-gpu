@@ -1311,6 +1311,8 @@ void WriteExecutionTelemetry(const std::string& path,
   WriteJsonNumber(file, value.native_indexed_packing_milliseconds);
   file << ",\"native_variable_state_download_milliseconds\":";
   WriteJsonNumber(file, value.native_variable_state_download_milliseconds);
+  file << ",\"native_intent_build_milliseconds\":";
+  WriteJsonNumber(file, value.native_intent_build_milliseconds);
   file << ",\"trigger_image_id\":" << value.trigger_image_id
        << ",\"refinement_index\":" << value.refinement_index;
   file << "}\n";
@@ -2333,7 +2335,8 @@ void BundleAdjuster::SetCudaHostStoreBinding(
 
 bool BundleAdjuster::SolveNative(
     Reconstruction* reconstruction,
-    const gpu_ba::NativeBaSolveIntent& intent) {
+    const gpu_ba::NativeBaSolveIntent& intent,
+    const double intent_build_milliseconds) {
   CHECK_NOTNULL(reconstruction);
   CHECK(!solve_called_) << "Cannot use the same BundleAdjuster multiple times";
   solve_called_ = true;
@@ -2344,6 +2347,11 @@ bool BundleAdjuster::SolveNative(
 #endif
   summary_ = ceres::Solver::Summary();
   execution_result_ = BundleAdjustmentExecutionResult();
+  execution_result_.native_intent_build_milliseconds =
+      std::isfinite(intent_build_milliseconds) &&
+              intent_build_milliseconds >= 0.0
+          ? intent_build_milliseconds
+          : 0.0;
   const auto solve_start = std::chrono::steady_clock::now();
   execution_result_.requested_backend = options_.ba_backend;
   execution_result_.executed_backend = "custom_cuda";

@@ -281,6 +281,12 @@ class IncrementalMapper {
 #endif
 
  private:
+  bool SolveBundleAdjustment(
+      const BundleAdjustmentOptions& ba_options,
+      const BundleAdjustmentConfig& ba_config,
+      BundleAdjuster::OptimazePhrase phrase,
+      BundleAdjuster* bundle_adjuster);
+
   // Find seed images for incremental reconstruction. Suitable seed images have
   // a large number of correspondences and have camera calibration priors. The
   // returned list is ordered such that most suitable images are in the front.
@@ -362,6 +368,7 @@ class IncrementalMapper {
   gpu_ba::CudaHostProblemStoreMode gpu_ba_host_store_mode_ =
       gpu_ba::CudaHostProblemStoreMode::kDisabled;
   uint64_t gpu_ba_host_store_owner_epoch_ = 0;
+  uint64_t gpu_ba_native_selection_revision_ = 0;
   std::unique_ptr<gpu_ba::GpuBaHostProblemStore> gpu_ba_host_problem_store_;
 #endif
 };

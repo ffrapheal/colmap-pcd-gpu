@@ -329,6 +329,7 @@ struct BundleAdjustmentExecutionResult {
   uint64_t native_repeated_residual_state_packing_bytes = 0;
   double native_indexed_packing_milliseconds = 0.0;
   double native_variable_state_download_milliseconds = 0.0;
+  double native_intent_build_milliseconds = 0.0;
   uint64_t host_store_host_resident_bytes = 0;
   uint64_t host_store_host_peak_bytes = 0;
   uint64_t host_store_owner_identity_violations = 0;
@@ -509,7 +510,8 @@ class BundleAdjuster {
   // CUDA identity are supplied directly, so the successful path creates no
   // Ceres Problem, ActiveBaSolveSpec, CudaSolveProblem, or Snapshot.
   bool SolveNative(Reconstruction* reconstruction,
-                   const gpu_ba::NativeBaSolveIntent& intent);
+                   const gpu_ba::NativeBaSolveIntent& intent,
+                   double intent_build_milliseconds = 0.0);
 
   bool Solve(Reconstruction* reconstruction);
 #ifdef GPU_BA_ENABLED

@@ -34,9 +34,13 @@
 #include <array>
 #include <atomic>
 #include <fstream>
+#include <iostream>
 
 #include "base/projection.h"
 #include "base/triangulation.h"
+#ifdef GPU_BA_CUDA_ENABLED
+#include "gpu_ba/host_ba_graph.h"
+#endif
 #include "estimators/pose.h"
 #include "util/bitmap.h"
 #include "util/misc.h"
@@ -146,6 +150,7 @@ void IncrementalMapper::BeginReconstruction(
   reconstruction_->SetUp(&database_cache_->CorrespondenceGraph());
 #ifdef GPU_BA_CUDA_ENABLED
   gpu_ba_host_store_mode_ = host_store_mode;
+  gpu_ba_native_selection_revision_ = 0;
   if (gpu_ba_host_store_mode_ ==
       gpu_ba::CudaHostProblemStoreMode::kHostPreparedStore) {
     gpu_ba_host_store_owner_epoch_ = NextGpuBaHostStoreOwnerEpoch();
@@ -194,11 +199,71 @@ void IncrementalMapper::EndReconstruction(const bool discard) {
     reconstruction_->EndStructureJournal();
   }
   gpu_ba_host_store_owner_epoch_ = 0;
+  gpu_ba_native_selection_revision_ = 0;
   gpu_ba_host_store_mode_ = gpu_ba::CudaHostProblemStoreMode::kDisabled;
 #endif
   reconstruction_->TearDown();
   reconstruction_ = nullptr;
   triangulator_.reset();
+}
+
+bool IncrementalMapper::SolveBundleAdjustment(
+    const BundleAdjustmentOptions& ba_options,
+    const BundleAdjustmentConfig& ba_config,
+    const BundleAdjuster::OptimazePhrase phrase,
+    BundleAdjuster* bundle_adjuster) {
+  CHECK_NOTNULL(reconstruction_);
+  CHECK_NOTNULL(bundle_adjuster);
+#ifdef GPU_BA_CUDA_ENABLED
+  BindGpuBaHostProblemStore(gpu_ba_host_store_mode_,
+                            gpu_ba_host_problem_store_.get(),
+                            gpu_ba_host_store_owner_epoch_, bundle_adjuster);
+#endif
+  bundle_adjuster->SetOptimazePhrase(phrase);
+
+#ifdef GPU_BA_CUDA_ENABLED
+  if (ba_options.ba_backend == "custom_cuda" &&
+      ba_options.ba_cuda_problem_source ==
+          gpu_ba::CudaProblemSource::kNativeGraph) {
+    if (gpu_ba_host_store_mode_ !=
+            gpu_ba::CudaHostProblemStoreMode::kHostPreparedStore ||
+        gpu_ba_host_problem_store_ == nullptr ||
+        gpu_ba_host_store_owner_epoch_ == 0) {
+      std::cerr << "Native CUDA BA requires the mapping-session host graph "
+                   "store."
+                << std::endl;
+      return false;
+    }
+    if (++gpu_ba_native_selection_revision_ == 0) {
+      ++gpu_ba_native_selection_revision_;
+    }
+    const gpu_ba::BaKind kind =
+        phrase == BundleAdjuster::OptimazePhrase::Local
+            ? gpu_ba::BaKind::kLocal
+            : (phrase == BundleAdjuster::OptimazePhrase::WholeMap
+                   ? gpu_ba::BaKind::kWhole
+                   : gpu_ba::BaKind::kGlobal);
+    gpu_ba::NativeBaSolveIntent intent;
+    std::string error;
+    const auto intent_start = std::chrono::steady_clock::now();
+    if (!BuildNativeBaSolveIntent(
+            ba_options, ba_config, *reconstruction_,
+            gpu_ba_host_store_owner_epoch_,
+            reconstruction_->StructureRevision(),
+            gpu_ba_native_selection_revision_, kind, &intent, &error)) {
+      std::cerr << "Native CUDA BA intent construction failed: " << error
+                << std::endl;
+      return false;
+    }
+    const double intent_build_milliseconds =
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - intent_start)
+            .count();
+    return bundle_adjuster->SolveNative(reconstruction_, intent,
+                                        intent_build_milliseconds);
+  }
+#endif
+  return bundle_adjuster->Solve(reconstruction_);
 }
 
 #ifdef GPU_BA_CUDA_ENABLED
@@ -969,15 +1034,9 @@ IncrementalMapper::AdjustLocalBundle(
     
     // Adjust the local bundle.
     BundleAdjuster bundle_adjuster(ba_options, ba_config);
-#ifdef GPU_BA_CUDA_ENABLED
-    BindGpuBaHostProblemStore(gpu_ba_host_store_mode_,
-                              gpu_ba_host_problem_store_.get(),
-                              gpu_ba_host_store_owner_epoch_,
-                              &bundle_adjuster);
-#endif
     const BundleAdjuster::OptimazePhrase phrase = BundleAdjuster::OptimazePhrase::Local;
-    bundle_adjuster.SetOptimazePhrase(phrase);
-    if (!bundle_adjuster.Solve(reconstruction_)) {
+    if (!SolveBundleAdjustment(ba_options, ba_config, phrase,
+                               &bundle_adjuster)) {
       report.success = false;
       return report;
     }
@@ -1056,16 +1115,9 @@ bool IncrementalMapper::AdjustGlobalBundle(
 
   // Run bundle adjustment.
   BundleAdjuster bundle_adjuster(ba_options, ba_config);
-#ifdef GPU_BA_CUDA_ENABLED
-  BindGpuBaHostProblemStore(gpu_ba_host_store_mode_,
-                            gpu_ba_host_problem_store_.get(),
-                            gpu_ba_host_store_owner_epoch_,
-                            &bundle_adjuster);
-#endif
   const BundleAdjuster::OptimazePhrase phrase = BundleAdjuster::OptimazePhrase::Global;
-  bundle_adjuster.SetOptimazePhrase(phrase);
-
-  if (!bundle_adjuster.Solve(reconstruction_)) {
+  if (!SolveBundleAdjustment(ba_options, ba_config, phrase,
+                             &bundle_adjuster)) {
     return false;
   }
 
@@ -1209,16 +1261,9 @@ bool IncrementalMapper::AdjustGlobalBundleByLidar(
   
   // Run bundle adjustment.
   BundleAdjuster bundle_adjuster(ba_options, ba_config);
-#ifdef GPU_BA_CUDA_ENABLED
-  BindGpuBaHostProblemStore(gpu_ba_host_store_mode_,
-                            gpu_ba_host_problem_store_.get(),
-                            gpu_ba_host_store_owner_epoch_,
-                            &bundle_adjuster);
-#endif
   const BundleAdjuster::OptimazePhrase phrase = BundleAdjuster::OptimazePhrase::Global;
-  bundle_adjuster.SetOptimazePhrase(phrase);
-
-  if (!bundle_adjuster.Solve(reconstruction_)) {
+  if (!SolveBundleAdjustment(ba_options, ba_config, phrase,
+                             &bundle_adjuster)) {
     return false;
   }
 
