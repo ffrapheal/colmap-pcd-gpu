@@ -9898,18 +9898,22 @@ bool BuildCudaLayerAInputs(const NativeHostSolveView& view,
       if (!observation.header.alive ||
           ordinal.physical_identity != observation.source_identity ||
           observation.image_slot >= graph_images.size ||
-          observation.point_slot >= graph_points.size ||
-          observation.camera_slot >= graph_cameras.size) {
+          observation.point_slot >= graph_points.size) {
         *error = "native visual references a dead graph slot";
+        return false;
+      }
+      const uint32_t camera_slot =
+          graph_images[observation.image_slot].camera_slot;
+      if (camera_slot >= graph_cameras.size) {
+        *error = "native visual image camera slot is out of bounds";
         return false;
       }
       const auto image = images.find(observation.image_slot);
       const auto point = points.find(observation.point_slot);
-      const auto camera = cameras.find(observation.camera_slot);
+      const auto camera = cameras.find(camera_slot);
       if (image == images.end() || point == points.end() ||
           camera == cameras.end() ||
-          graph_cameras[observation.camera_slot].model_id !=
-              kOpenCvcCameraModelId ||
+          graph_cameras[camera_slot].model_id != kOpenCvcCameraModelId ||
           camera->second->parameters.size() != 8 ||
           !NativeFinite(camera->second->parameters)) {
         *error = "native visual state or OPENCV camera layout is invalid";
