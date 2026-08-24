@@ -12,6 +12,9 @@
 #include "base/correspondence_graph.h"
 #include "base/database_cache.h"
 #include "base/projection.h"
+#ifdef GPU_BA_CUDA_ENABLED
+#include "gpu_ba/native_graph_problem_store.h"
+#endif
 #include "optim/bundle_adjustment.h"
 #include "sfm/incremental_mapper.h"
 
@@ -1557,7 +1560,7 @@ BOOST_AUTO_TEST_CASE(ActiveSpecZeroObservationSelectedCameraRunsFastPath) {
                     0);
 }
 
-BOOST_AUTO_TEST_CASE(NativeGraphRunsProductionBranchWithoutLegacySnapshot) {
+BOOST_AUTO_TEST_CASE(NativeGraphActiveSpecAdapterRunsWithoutLegacySnapshot) {
   FailureModeReset reset;
   SyntheticProblem problem = MakeSyntheticProblem();
   constexpr uint64_t kOwnerEpoch = 12001;
@@ -1591,12 +1594,436 @@ BOOST_AUTO_TEST_CASE(NativeGraphRunsProductionBranchWithoutLegacySnapshot) {
   BOOST_CHECK_EQUAL(execution.ceres_add_residual_calls, 0);
   BOOST_CHECK_EQUAL(execution.snapshot_materialization_calls, 0);
   BOOST_CHECK_EQUAL(execution.active_spec_build_calls, 1);
+  BOOST_CHECK_EQUAL(execution.native_legacy_kernel_input_bundle_calls, 0);
+  BOOST_CHECK_EQUAL(execution.native_repeated_residual_state_packing_bytes, 0);
+  BOOST_CHECK_GT(execution.native_device_store_lookup_calls, 0);
+  BOOST_CHECK_GT(execution.native_variable_state_d2h_calls, 0);
   BOOST_CHECK(!execution.fallback_used);
   BOOST_CHECK(std::isfinite(execution.initial_cost));
   BOOST_CHECK(std::isfinite(execution.final_cost));
   std::string shutdown_error;
   BOOST_REQUIRE(store.Shutdown(&shutdown_error));
   problem.reconstruction.EndStructureJournal();
+}
+
+BOOST_AUTO_TEST_CASE(DirectNativeIntentMatchesSelectionAndRunsWithoutLegacy) {
+  FailureModeReset reset;
+  const auto configure = [](SyntheticProblem* problem) {
+    AddThirdTrackObservationImage(problem);
+    BundleAdjustmentConfig config;
+    config.AddImage(0);
+    config.AddImage(0);
+    config.SetConstantCamera(0);
+    config.SetConstantPose(0);
+    config.AddVariablePoint(2);
+    config.AddConstantPoint(1);
+    Eigen::Vector3d lidar_xyz(0.1, 0.2, 0.3);
+    Eigen::Vector4d lidar_plane(0.0, 1.0, 0.0, -0.2);
+    LidarPoint lidar(LidarPointType::Icp, lidar_xyz, lidar_plane);
+    config.AddLidarPoint(2, lidar);
+    config.SetLidarSearchRange(2, 0.25);
+    problem->config = std::move(config);
+  };
+  SyntheticProblem reference = MakeSyntheticProblem();
+  SyntheticProblem direct = MakeSyntheticProblem();
+  configure(&reference);
+  configure(&direct);
+  for (const image_t image_id : {image_t{0}, image_t{1}, image_t{2}}) {
+    reference.reconstruction.Image(image_id).NormalizeQvec();
+    direct.reconstruction.Image(image_id).NormalizeQvec();
+  }
+  BOOST_REQUIRE_EQUAL(direct.config.OrderedImages().size(), 1);
+  BOOST_CHECK_EQUAL(direct.config.OrderedImages().front(), 0);
+
+  BundleAdjustmentOptions options = CudaOptions(false);
+  options.if_add_lidar_constraint = true;
+  options.loss_function_type = BundleAdjustmentOptions::LossFunctionType::TRIVIAL;
+  options.loss_function_scale = 0.0;
+  options.ba_cuda_host_problem_store = "host_prepared_store";
+  options.ba_cuda_problem_source = gpu_ba::CudaProblemSource::kNativeGraph;
+  options.ba_cuda_execution_profile =
+      BundleAdjustmentOptions::CudaExecutionProfile::COMPACT_CONTROL;
+  options.ba_cuda_audit_profile = "production";
+  options.ba_cuda_arithmetic_precision = "fp64";
+  options.ba_cuda_hessian_assembly_backend = "observation_segmented";
+  options.ba_cuda_hot_kernel_mode = "transformed";
+  options.ba_cuda_schur_contribution_backend = "segmented";
+
+  constexpr uint64_t kReferenceOwner = 12002;
+  constexpr uint64_t kDirectOwner = 12003;
+  reference.reconstruction.BeginStructureJournal(kReferenceOwner, 64);
+  direct.reconstruction.BeginStructureJournal(kDirectOwner, 64);
+  const auto comparison = CompareProblemSources(
+      &reference, options, BundleAdjuster::OptimazePhrase::Local);
+
+  gpu_ba::NativeBaSolveIntent intent;
+  std::string error;
+  BOOST_REQUIRE_MESSAGE(
+      BuildNativeBaSolveIntent(
+          options, direct.config, direct.reconstruction, kDirectOwner,
+          direct.reconstruction.StructureRevision(), 7,
+          gpu_ba::BaKind::kLocal, &intent, &error),
+      error);
+  BOOST_REQUIRE_EQUAL(intent.explicit_variable_point_ids.size(), 1);
+  BOOST_REQUIRE_EQUAL(intent.explicit_constant_point_ids.size(), 1);
+  BOOST_CHECK_EQUAL(intent.explicit_variable_point_ids.front(), 2);
+  BOOST_CHECK_EQUAL(intent.explicit_constant_point_ids.front(), 1);
+  BOOST_CHECK(intent.config.loss_mode == gpu_ba::CudaLossMode::kTrivial);
+  BOOST_CHECK_EQUAL(intent.config.loss_scale, 1.0);
+
+  const ceres::Solver::Options effective =
+      CreateEffectiveBundleAdjustmentSolverOptions(
+          options, direct.config.NumImages(),
+          static_cast<int>(direct.config.NumResiduals(direct.reconstruction)));
+  BOOST_CHECK_EQUAL(intent.config.max_num_iterations,
+                    effective.max_num_iterations);
+  BOOST_CHECK_EQUAL(intent.config.max_consecutive_invalid_steps,
+                    effective.max_num_consecutive_invalid_steps);
+  BOOST_CHECK_EQUAL(intent.config.function_tolerance,
+                    effective.function_tolerance);
+  BOOST_CHECK_EQUAL(intent.config.gradient_tolerance,
+                    effective.gradient_tolerance);
+  BOOST_CHECK_EQUAL(intent.config.parameter_tolerance,
+                    effective.parameter_tolerance);
+  BOOST_CHECK_EQUAL(intent.config.max_solver_time_in_seconds,
+                    effective.max_solver_time_in_seconds);
+  BOOST_CHECK_EQUAL(intent.config.initial_trust_region_radius,
+                    effective.initial_trust_region_radius);
+  BOOST_CHECK_EQUAL(intent.config.min_trust_region_radius,
+                    effective.min_trust_region_radius);
+  BOOST_CHECK_EQUAL(intent.config.max_trust_region_radius,
+                    effective.max_trust_region_radius);
+  BOOST_CHECK_EQUAL(intent.config.min_relative_decrease,
+                    effective.min_relative_decrease);
+  BOOST_CHECK_EQUAL(intent.config.min_lm_diagonal,
+                    effective.min_lm_diagonal);
+  BOOST_CHECK_EQUAL(intent.config.max_lm_diagonal,
+                    effective.max_lm_diagonal);
+
+  BundleAdjustmentOptions invalid_soft_l1 = options;
+  invalid_soft_l1.loss_function_type =
+      BundleAdjustmentOptions::LossFunctionType::SOFT_L1;
+  invalid_soft_l1.loss_function_scale = 0.0;
+  gpu_ba::CudaFullLmOptions invalid_resolved_options;
+  gpu_ba::NativeCudaResolvedConfig invalid_resolved_config;
+  BOOST_CHECK(!ResolveNativeBundleAdjustmentCudaConfiguration(
+      invalid_soft_l1, effective, 8, &invalid_resolved_options,
+      &invalid_resolved_config, &error));
+
+  gpu_ba::CudaFullLmOptions resolved_options;
+  gpu_ba::NativeCudaResolvedConfig resolved_config;
+  BOOST_REQUIRE_MESSAGE(ResolveNativeBundleAdjustmentCudaConfiguration(
+                            options, effective, 7, &resolved_options,
+                            &resolved_config, &error),
+                        error);
+  gpu_ba::GpuBaHostProblemStore direct_store(&direct.reconstruction,
+                                              kDirectOwner);
+  gpu_ba::CudaHostStoreBinding direct_binding;
+  direct_binding.store = &direct_store;
+  direct_binding.owner_epoch = kDirectOwner;
+  direct_binding.mode = gpu_ba::CudaHostProblemStoreMode::kHostPreparedStore;
+  gpu_ba::PreparedNativeActiveSolve prepared;
+  BOOST_REQUIRE_MESSAGE(gpu_ba::PrepareCudaNativeBaSolve(
+                            intent, &direct.reconstruction, resolved_options,
+                            direct_binding, &prepared, &error),
+                        error);
+  const gpu_ba::NativeHostSolveView* view = prepared.view();
+  BOOST_REQUIRE(view != nullptr);
+
+  using PhysicalResidual = std::pair<uint8_t, uint64_t>;
+  std::vector<PhysicalResidual> direct_physical;
+  for (const gpu_ba::ResidualOrdinal& ordinal : view->residual_ordinals) {
+    direct_physical.emplace_back(static_cast<uint8_t>(ordinal.kind),
+                                 ordinal.physical_identity);
+  }
+  std::vector<PhysicalResidual> reference_physical;
+  for (const gpu_ba::ObservationSnapshot& observation :
+       comparison.active.problem.observations) {
+    reference_physical.emplace_back(
+        static_cast<uint8_t>(gpu_ba::ResidualKind::kVisual),
+        (static_cast<uint64_t>(observation.image_id) << 32) |
+            observation.point2D_idx);
+  }
+  for (const gpu_ba::LidarSnapshot& lidar : comparison.active.problem.lidar) {
+    reference_physical.emplace_back(
+        static_cast<uint8_t>(gpu_ba::ResidualKind::kLidar),
+        (static_cast<uint64_t>(lidar.point3D_id) << 2) ^ lidar.lidar_type);
+  }
+  std::sort(direct_physical.begin(), direct_physical.end());
+  std::sort(reference_physical.begin(), reference_physical.end());
+  BOOST_CHECK(direct_physical == reference_physical);
+  BOOST_CHECK_EQUAL(view->scalar_residual_count,
+                    comparison.active.scalar_residual_count);
+  BOOST_CHECK_EQUAL(view->ambient_parameter_count,
+                    comparison.active.ambient_parameter_count);
+  BOOST_CHECK_EQUAL(view->effective_parameter_count,
+                    comparison.active.effective_parameter_count);
+
+  std::vector<const gpu_ba::ResidualOrdinal*> source_order(
+      view->residual_ordinals.size(), nullptr);
+  for (const gpu_ba::ResidualOrdinal& ordinal : view->residual_ordinals) {
+    BOOST_REQUIRE_LT(ordinal.source_insertion_index, source_order.size());
+    source_order[ordinal.source_insertion_index] = &ordinal;
+  }
+  BOOST_REQUIRE_EQUAL(source_order.size(), 17);
+  const auto catalog_observations = view->catalog.observations();
+  const auto catalog_images = view->catalog.images();
+  const auto catalog_points = view->catalog.points();
+  const auto visual_ids = [&](const gpu_ba::ResidualOrdinal* ordinal) {
+    const gpu_ba::HostBaObservationSlot& observation =
+        catalog_observations[ordinal->source_slot];
+    return std::make_pair(catalog_images[observation.image_slot].image_id,
+                          catalog_points[observation.point_slot].point3D_id);
+  };
+  for (size_t index = 0; index < 12; ++index) {
+    BOOST_REQUIRE(source_order[index] != nullptr);
+    BOOST_REQUIRE(source_order[index]->kind ==
+                  gpu_ba::ResidualKind::kVisual);
+    BOOST_CHECK_EQUAL(visual_ids(source_order[index]).first, 0);
+  }
+  for (size_t index = 12; index < 14; ++index) {
+    BOOST_REQUIRE(source_order[index] != nullptr);
+    BOOST_REQUIRE(source_order[index]->kind ==
+                  gpu_ba::ResidualKind::kVisual);
+    const auto ids = visual_ids(source_order[index]);
+    BOOST_CHECK_EQUAL(ids.second, 2);
+    BOOST_CHECK(ids.first == 1 || ids.first == 2);
+  }
+  BOOST_REQUIRE(source_order[14] != nullptr);
+  BOOST_CHECK(source_order[14]->kind == gpu_ba::ResidualKind::kLidar);
+  for (size_t index = 15; index < 17; ++index) {
+    BOOST_REQUIRE(source_order[index] != nullptr);
+    BOOST_REQUIRE(source_order[index]->kind ==
+                  gpu_ba::ResidualKind::kVisual);
+    const auto ids = visual_ids(source_order[index]);
+    BOOST_CHECK_EQUAL(ids.second, 1);
+    BOOST_CHECK(ids.first == 1 || ids.first == 2);
+  }
+  const gpu_ba::HostBaPointSlot* constant_slot =
+      view->catalog.FindPointById(1);
+  BOOST_REQUIRE(constant_slot != nullptr);
+  const auto constant_policy = std::find_if(
+      view->fixed.points.begin(), view->fixed.points.end(),
+      [&](const gpu_ba::PointFixedPolicyResult& value) {
+        return value.point_slot == constant_slot->header.slot;
+      });
+  BOOST_REQUIRE(constant_policy != view->fixed.points.end());
+  BOOST_CHECK_EQUAL(constant_policy->constant, 1);
+  const gpu_ba::HostBaPointSlot* variable_slot =
+      view->catalog.FindPointById(2);
+  BOOST_REQUIRE(variable_slot != nullptr);
+  const auto variable_policy = std::find_if(
+      view->fixed.points.begin(), view->fixed.points.end(),
+      [&](const gpu_ba::PointFixedPolicyResult& value) {
+        return value.point_slot == variable_slot->header.slot;
+      });
+  BOOST_REQUIRE(variable_policy != view->fixed.points.end());
+  BOOST_CHECK_EQUAL(variable_policy->constant, 0);
+  BOOST_REQUIRE_EQUAL(view->boundary_image_slots.size(), 2);
+  BOOST_CHECK(std::all_of(
+      view->fixed.images.begin(), view->fixed.images.end(),
+      [](const gpu_ba::ImageFixedPolicyResult& value) {
+        return value.pose_constant != 0;
+      }));
+  BOOST_REQUIRE_EQUAL(view->fixed.cameras.size(), 1);
+  BOOST_CHECK_EQUAL(view->fixed.cameras.front().constant, 1);
+
+  const std::vector<gpu_ba::ResidualOrdinal> first_ordinals =
+      view->residual_ordinals;
+  prepared.Release();
+  gpu_ba::PreparedNativeActiveSolve repeated;
+  BOOST_REQUIRE_MESSAGE(gpu_ba::PrepareCudaNativeBaSolve(
+                            intent, &direct.reconstruction, resolved_options,
+                            direct_binding, &repeated, &error),
+                        error);
+  BOOST_REQUIRE_EQUAL(repeated.view()->residual_ordinals.size(),
+                      first_ordinals.size());
+  for (size_t index = 0; index < first_ordinals.size(); ++index) {
+    const auto& lhs = first_ordinals[index];
+    const auto& rhs = repeated.view()->residual_ordinals[index];
+    BOOST_CHECK(lhs.kind == rhs.kind);
+    BOOST_CHECK_EQUAL(lhs.source_insertion_index,
+                      rhs.source_insertion_index);
+    BOOST_CHECK_EQUAL(lhs.physical_identity, rhs.physical_identity);
+  }
+  repeated.Release();
+
+  gpu_ba::GpuBaHostProblemStore reference_store(&reference.reconstruction,
+                                                 kReferenceOwner);
+  gpu_ba::CudaHostStoreBinding reference_binding;
+  reference_binding.store = &reference_store;
+  reference_binding.owner_epoch = kReferenceOwner;
+  reference_binding.mode =
+      gpu_ba::CudaHostProblemStoreMode::kHostPreparedStore;
+  BundleAdjuster reference_adjuster(options, reference.config);
+  reference_adjuster.SetOptimazePhrase(BundleAdjuster::OptimazePhrase::Local);
+  reference_adjuster.SetCudaHostStoreBinding(reference_binding);
+  BOOST_REQUIRE_MESSAGE(reference_adjuster.Solve(&reference.reconstruction),
+                        reference_adjuster.ExecutionResult().diagnostic_message);
+  BundleAdjuster direct_adjuster(options, direct.config);
+  direct_adjuster.SetOptimazePhrase(BundleAdjuster::OptimazePhrase::Local);
+  direct_adjuster.SetCudaHostStoreBinding(direct_binding);
+  BOOST_REQUIRE_MESSAGE(direct_adjuster.SolveNative(&direct.reconstruction,
+                                                    intent),
+                        direct_adjuster.ExecutionResult().diagnostic_message);
+  const auto& reference_execution = reference_adjuster.ExecutionResult();
+  const auto& direct_execution = direct_adjuster.ExecutionResult();
+  BOOST_CHECK_EQUAL(direct_execution.active_spec_build_calls, 0);
+  BOOST_CHECK_EQUAL(direct_execution.ceres_problem_created, false);
+  BOOST_CHECK_EQUAL(direct_execution.ceres_cost_function_creations, 0);
+  BOOST_CHECK_EQUAL(direct_execution.ceres_add_residual_calls, 0);
+  BOOST_CHECK_EQUAL(direct_execution.snapshot_materialization_calls, 0);
+  BOOST_CHECK_EQUAL(direct_execution.bundle_adjuster_setup_milliseconds, 0.0);
+  BOOST_CHECK_EQUAL(direct_execution.native_legacy_kernel_input_bundle_calls, 0);
+  BOOST_CHECK_GT(direct_execution.native_variable_state_d2h_calls, 0);
+  BOOST_CHECK_EQUAL(direct_execution.fallback_used, false);
+  BOOST_CHECK_EQUAL(direct_execution.trial_steps,
+                    reference_execution.trial_steps);
+  BOOST_CHECK_EQUAL(direct_execution.accepted_commits,
+                    reference_execution.accepted_commits);
+  BOOST_CHECK_EQUAL(direct_execution.rejected_steps,
+                    reference_execution.rejected_steps);
+  BOOST_CHECK_EQUAL(direct_execution.invalid_steps,
+                    reference_execution.invalid_steps);
+  BOOST_CHECK_SMALL(direct_execution.initial_cost -
+                        reference_execution.initial_cost,
+                    1e-12);
+  BOOST_CHECK_SMALL(direct_execution.final_cost - reference_execution.final_cost,
+                    1e-12);
+  CheckStateEqual(reference.reconstruction, direct.reconstruction);
+
+  std::string shutdown_error;
+  BOOST_REQUIRE(reference_store.Shutdown(&shutdown_error));
+  BOOST_REQUIRE(direct_store.Shutdown(&shutdown_error));
+  reference.reconstruction.EndStructureJournal();
+  direct.reconstruction.EndStructureJournal();
+}
+
+BOOST_AUTO_TEST_CASE(DirectNativeAcceptedCommitWritesReconstructionState) {
+  FailureModeReset reset;
+  SyntheticProblem reference = MakeSyntheticProblem();
+  SyntheticProblem direct = MakeSyntheticProblem();
+  reference.reconstruction.Image(1).Tvec(1) += 0.15;
+  direct.reconstruction.Image(1).Tvec(1) += 0.15;
+  constexpr uint64_t kReferenceOwner = 12004;
+  constexpr uint64_t kDirectOwner = 12005;
+  reference.reconstruction.BeginStructureJournal(kReferenceOwner, 64);
+  direct.reconstruction.BeginStructureJournal(kDirectOwner, 64);
+
+  BundleAdjustmentOptions options = CudaOptions(false);
+  options.loss_function_type =
+      BundleAdjustmentOptions::LossFunctionType::SOFT_L1;
+  options.solver_options.max_num_iterations = 5;
+  options.ba_cuda_host_problem_store = "host_prepared_store";
+  options.ba_cuda_problem_source = gpu_ba::CudaProblemSource::kNativeGraph;
+  options.ba_cuda_execution_profile =
+      BundleAdjustmentOptions::CudaExecutionProfile::COMPACT_CONTROL;
+  options.ba_cuda_audit_profile = "production";
+  options.ba_cuda_arithmetic_precision = "fp64";
+  options.ba_cuda_hessian_assembly_backend = "observation_segmented";
+  options.ba_cuda_hot_kernel_mode = "transformed";
+  options.ba_cuda_schur_contribution_backend = "segmented";
+
+  gpu_ba::GpuBaHostProblemStore reference_store(&reference.reconstruction,
+                                                 kReferenceOwner);
+  gpu_ba::GpuBaHostProblemStore direct_store(&direct.reconstruction,
+                                              kDirectOwner);
+  gpu_ba::CudaHostStoreBinding reference_binding;
+  reference_binding.store = &reference_store;
+  reference_binding.owner_epoch = kReferenceOwner;
+  reference_binding.mode =
+      gpu_ba::CudaHostProblemStoreMode::kHostPreparedStore;
+  gpu_ba::CudaHostStoreBinding direct_binding;
+  direct_binding.store = &direct_store;
+  direct_binding.owner_epoch = kDirectOwner;
+  direct_binding.mode = gpu_ba::CudaHostProblemStoreMode::kHostPreparedStore;
+
+  gpu_ba::NativeBaSolveIntent intent;
+  std::string error;
+  BOOST_REQUIRE_MESSAGE(
+      BuildNativeBaSolveIntent(
+          options, direct.config, direct.reconstruction, kDirectOwner,
+          direct.reconstruction.StructureRevision(), 9,
+          gpu_ba::BaKind::kLocal, &intent, &error),
+      error);
+  const Eigen::Vector4d fixed_qvec = direct.reconstruction.Image(0).Qvec();
+  const double fixed_translation_x = direct.reconstruction.Image(1).Tvec(0);
+  const std::vector<double> fixed_camera =
+      direct.reconstruction.Camera(0).Params();
+
+  BundleAdjuster reference_adjuster(options, reference.config);
+  reference_adjuster.SetOptimazePhrase(BundleAdjuster::OptimazePhrase::Local);
+  reference_adjuster.SetCudaHostStoreBinding(reference_binding);
+  BOOST_REQUIRE_MESSAGE(reference_adjuster.Solve(&reference.reconstruction),
+                        reference_adjuster.ExecutionResult().diagnostic_message);
+  BundleAdjuster direct_adjuster(options, direct.config);
+  direct_adjuster.SetOptimazePhrase(BundleAdjuster::OptimazePhrase::Local);
+  direct_adjuster.SetCudaHostStoreBinding(direct_binding);
+  BOOST_REQUIRE_MESSAGE(direct_adjuster.SolveNative(&direct.reconstruction,
+                                                    intent),
+                        direct_adjuster.ExecutionResult().diagnostic_message);
+
+  const auto& reference_execution = reference_adjuster.ExecutionResult();
+  const auto& direct_execution = direct_adjuster.ExecutionResult();
+  BOOST_TEST_MESSAGE(
+      "direct accepted trace: trials=" << direct_execution.trial_steps
+      << " commits=" << direct_execution.accepted_commits
+      << " rejects=" << direct_execution.rejected_steps
+      << " invalid=" << direct_execution.invalid_steps
+      << " initial_cost=" << direct_execution.initial_cost
+      << " final_cost=" << direct_execution.final_cost);
+  BOOST_REQUIRE_GE(reference_execution.accepted_commits, 1);
+  BOOST_REQUIRE_GE(direct_execution.accepted_commits, 1);
+  BOOST_CHECK_EQUAL(direct_execution.accepted_commits,
+                    reference_execution.accepted_commits);
+  BOOST_CHECK_EQUAL(direct_execution.trial_steps,
+                    reference_execution.trial_steps);
+  BOOST_CHECK_EQUAL(direct_execution.rejected_steps,
+                    reference_execution.rejected_steps);
+  BOOST_CHECK_EQUAL(direct_execution.invalid_steps,
+                    reference_execution.invalid_steps);
+  BOOST_CHECK_SMALL(direct_execution.initial_cost -
+                        reference_execution.initial_cost,
+                    1e-12);
+  BOOST_CHECK_SMALL(direct_execution.final_cost - reference_execution.final_cost,
+                    1e-10);
+  BOOST_CHECK_EQUAL(direct_execution.active_spec_build_calls, 0);
+  BOOST_CHECK(!direct_execution.ceres_problem_created);
+  BOOST_CHECK_EQUAL(direct_execution.ceres_cost_function_creations, 0);
+  BOOST_CHECK_EQUAL(direct_execution.ceres_add_residual_calls, 0);
+  BOOST_CHECK_EQUAL(direct_execution.snapshot_materialization_calls, 0);
+  BOOST_CHECK_EQUAL(direct_execution.native_legacy_kernel_input_bundle_calls, 0);
+  BOOST_CHECK(!direct_execution.fallback_used);
+  BOOST_CHECK_GT(direct_execution.native_variable_state_d2h_calls, 0);
+  BOOST_CHECK_EQUAL(fixed_qvec, direct.reconstruction.Image(0).Qvec());
+  BOOST_CHECK_EQUAL(fixed_translation_x,
+                    direct.reconstruction.Image(1).Tvec(0));
+  BOOST_CHECK_EQUAL_COLLECTIONS(
+      fixed_camera.begin(), fixed_camera.end(),
+      direct.reconstruction.Camera(0).Params().begin(),
+      direct.reconstruction.Camera(0).Params().end());
+  for (const auto& image : reference.reconstruction.Images()) {
+    BOOST_REQUIRE(direct.reconstruction.ExistsImage(image.first));
+    BOOST_CHECK_SMALL((image.second.Qvec() -
+                       direct.reconstruction.Image(image.first).Qvec()).norm(),
+                      1e-10);
+    BOOST_CHECK_SMALL((image.second.Tvec() -
+                       direct.reconstruction.Image(image.first).Tvec()).norm(),
+                      1e-9);
+  }
+  for (const auto& point : reference.reconstruction.Points3D()) {
+    BOOST_REQUIRE(direct.reconstruction.ExistsPoint3D(point.first));
+    BOOST_CHECK_SMALL(
+        (point.second.XYZ() -
+         direct.reconstruction.Point3D(point.first).XYZ()).norm(),
+        1e-8);
+  }
+
+  std::string shutdown_error;
+  BOOST_REQUIRE(reference_store.Shutdown(&shutdown_error));
+  BOOST_REQUIRE(direct_store.Shutdown(&shutdown_error));
+  reference.reconstruction.EndStructureJournal();
+  direct.reconstruction.EndStructureJournal();
 }
 #endif
 

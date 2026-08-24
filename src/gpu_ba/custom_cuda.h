@@ -23,6 +23,34 @@ struct NativePreparationComparisonResult;
 enum class CudaHotKernelMode : uint8_t;
 enum class CudaSchurContributionBackend : uint8_t;
 
+class DeviceBaProblemStoreHandle final {
+ public:
+  DeviceBaProblemStoreHandle(const DeviceBaProblemStoreHandle&) = delete;
+  DeviceBaProblemStoreHandle& operator=(const DeviceBaProblemStoreHandle&) =
+      delete;
+  ~DeviceBaProblemStoreHandle();
+
+  uint64_t owner_epoch() const noexcept { return owner_epoch_; }
+
+ private:
+  friend std::shared_ptr<DeviceBaProblemStoreHandle>
+  CreateDeviceBaProblemStore(uint64_t);
+  friend bool FailNextDeviceBaProblemStorePublishForTesting(
+      const std::shared_ptr<DeviceBaProblemStoreHandle>&, std::string*);
+  friend bool RunCustomCudaSolve(const NativeCudaSolveRequest&,
+                                 BaSolveResult*,
+                                 std::string*);
+  explicit DeviceBaProblemStoreHandle(uint64_t owner_epoch);
+  uint64_t owner_epoch_ = 0;
+  std::shared_ptr<void> state_;
+};
+
+std::shared_ptr<DeviceBaProblemStoreHandle> CreateDeviceBaProblemStore(
+    uint64_t owner_epoch);
+bool FailNextDeviceBaProblemStorePublishForTesting(
+    const std::shared_ptr<DeviceBaProblemStoreHandle>& store,
+    std::string* error);
+
 // These flat records are the host/device ABI for the first custom_cuda layer.
 // They intentionally contain only fixed-size IEEE-754 binary64 arrays so the
 // kernel does not depend on Eigen, Ceres, or STL layout.
@@ -1354,6 +1382,18 @@ struct CudaPersistentDeviceRuntimeInfo {
   uint64_t indexed_device_catalog_invalidations = 0;
   uint64_t indexed_device_catalog_prefix_bytes = 0;
   uint64_t indexed_device_catalog_arena_generation = 0;
+  // Native HostBaGraphStore resident catalog. Unlike the legacy indexed
+  // prototype this allocation is independent from the grow-only solve arena.
+  uint64_t native_device_store_lookup_calls = 0;
+  uint64_t native_device_store_reuse_calls = 0;
+  uint64_t native_device_store_full_upload_calls = 0;
+  uint64_t native_device_store_full_upload_bytes = 0;
+  uint64_t native_device_store_patch_upload_calls = 0;
+  uint64_t native_device_store_patch_upload_bytes = 0;
+  uint64_t native_device_store_growth_d2d_calls = 0;
+  uint64_t native_device_store_growth_d2d_bytes = 0;
+  uint64_t native_device_store_invalidations = 0;
+  uint64_t native_device_store_generation = 0;
 };
 
 struct CudaFullLmRuntimeInfo {
@@ -1664,10 +1704,23 @@ bool RunCustomCudaSolve(const CudaSolveProblem& problem,
 bool RunCustomCudaSolve(const NativeCudaSolveRequest& request,
                         BaSolveResult* result,
                         std::string* error);
+bool MakeCudaFullLmOptionsFromNativeConfig(
+    const NativeCudaResolvedConfig& config,
+    CudaFullLmOptions* options,
+    std::string* error);
 
 bool ResolveNativeCudaConfiguration(
     const CudaSolveProblem& problem,
     const CudaFullLmOptions& requested_options,
+    uint64_t config_generation,
+    CudaFullLmOptions* resolved_options,
+    NativeCudaResolvedConfig* config,
+    std::string* error);
+bool ResolveNativeCudaConfiguration(
+    const CudaFullLmOptions& requested_options,
+    CudaLossMode loss_mode,
+    double loss_scale,
+    LidarResidualMode lidar_mode,
     uint64_t config_generation,
     CudaFullLmOptions* resolved_options,
     NativeCudaResolvedConfig* config,

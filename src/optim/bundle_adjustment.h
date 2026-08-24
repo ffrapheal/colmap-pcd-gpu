@@ -56,6 +56,7 @@ namespace gpu_ba {
 class SnapshotRecorder;
 struct Snapshot;
 struct SnapshotWriteResult;
+struct NativeCudaResolvedConfig;
 }
 
 //参数的结构，包括损失函数类型，
@@ -313,6 +314,21 @@ struct BundleAdjustmentExecutionResult {
   uint64_t indexed_device_catalog_invalidations = 0;
   uint64_t indexed_device_catalog_prefix_bytes = 0;
   uint64_t indexed_device_catalog_arena_generation = 0;
+  uint64_t native_device_store_lookup_calls = 0;
+  uint64_t native_device_store_reuse_calls = 0;
+  uint64_t native_device_store_full_upload_calls = 0;
+  uint64_t native_device_store_full_upload_bytes = 0;
+  uint64_t native_device_store_patch_upload_calls = 0;
+  uint64_t native_device_store_patch_upload_bytes = 0;
+  uint64_t native_device_store_growth_d2d_calls = 0;
+  uint64_t native_device_store_growth_d2d_bytes = 0;
+  uint64_t native_device_store_invalidations = 0;
+  uint64_t native_variable_state_d2h_calls = 0;
+  uint64_t native_variable_state_d2h_bytes = 0;
+  uint64_t native_legacy_kernel_input_bundle_calls = 0;
+  uint64_t native_repeated_residual_state_packing_bytes = 0;
+  double native_indexed_packing_milliseconds = 0.0;
+  double native_variable_state_download_milliseconds = 0.0;
   uint64_t host_store_host_resident_bytes = 0;
   uint64_t host_store_host_peak_bytes = 0;
   uint64_t host_store_owner_identity_violations = 0;
@@ -421,6 +437,7 @@ class BundleAdjustmentConfig {
 
   // Access configuration data.
   const std::unordered_set<image_t>& Images() const;
+  const std::vector<image_t>& OrderedImages() const;
   const std::unordered_set<point3D_t>& VariablePoints() const;
   const std::unordered_set<point3D_t>& ConstantPoints() const;
   const std::vector<int>& ConstantTvec(const image_t image_id) const;
@@ -436,6 +453,7 @@ class BundleAdjustmentConfig {
  private:
   std::unordered_set<camera_t> constant_camera_ids_;
   std::unordered_set<image_t> image_ids_;
+  std::vector<image_t> ordered_image_ids_;
   std::unordered_set<point3D_t> variable_point3D_ids_;
   std::unordered_set<point3D_t> constant_point3D_ids_;
   std::unordered_set<image_t> constant_poses_;
@@ -443,6 +461,27 @@ class BundleAdjustmentConfig {
   std::unordered_map<point3D_t, double> lidar_search_ranges_;
 
 };
+
+#ifdef GPU_BA_CUDA_ENABLED
+bool ResolveNativeBundleAdjustmentCudaConfiguration(
+    const BundleAdjustmentOptions& options,
+    const ceres::Solver::Options& effective_solver_options,
+    uint64_t config_generation,
+    gpu_ba::CudaFullLmOptions* resolved_options,
+    gpu_ba::NativeCudaResolvedConfig* config,
+    std::string* error);
+
+bool BuildNativeBaSolveIntent(
+    const BundleAdjustmentOptions& options,
+    const BundleAdjustmentConfig& config,
+    const Reconstruction& reconstruction,
+    uint64_t owner_epoch,
+    uint64_t topology_revision,
+    uint64_t selection_revision,
+    gpu_ba::BaKind kind,
+    gpu_ba::NativeBaSolveIntent* intent,
+    std::string* error);
+#endif
 
 // Bundle adjustment based on Ceres-Solver. Enables most flexible configurations
 // and provides best solution quality.
@@ -465,6 +504,12 @@ class BundleAdjuster {
   void SetOptimazePhrase(const OptimazePhrase& phrase);
   void SetCudaHostStoreBinding(
       const gpu_ba::CudaHostStoreBinding& binding) noexcept;
+
+  // Final native handoff used by Mapper integration: selection and resolved
+  // CUDA identity are supplied directly, so the successful path creates no
+  // Ceres Problem, ActiveBaSolveSpec, CudaSolveProblem, or Snapshot.
+  bool SolveNative(Reconstruction* reconstruction,
+                   const gpu_ba::NativeBaSolveIntent& intent);
 
   bool Solve(Reconstruction* reconstruction);
 #ifdef GPU_BA_ENABLED

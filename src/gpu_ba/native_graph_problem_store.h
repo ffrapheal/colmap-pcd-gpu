@@ -56,6 +56,7 @@ class PreparedNativeActiveSolve {
   const NativeHostSolveView* view() const noexcept;
   const ActiveStateBuffer* initial_state() const noexcept;
   const NativeGraphPrepareRuntime& runtime() const noexcept;
+  void Release() noexcept;
   bool Complete(std::string* error) noexcept;
 
  private:
@@ -65,10 +66,23 @@ class PreparedNativeActiveSolve {
       const CudaHostStoreBinding&,
       PreparedNativeActiveSolve*,
       std::string*);
+  friend bool PrepareCudaNativeBaSolve(
+      const NativeBaSolveIntent&,
+      Reconstruction*,
+      const CudaFullLmOptions&,
+      const CudaHostStoreBinding&,
+      PreparedNativeActiveSolve*,
+      std::string*);
   friend bool ValidateAndCommitNativeBaState(
       const NativeActiveSolveInputs&,
       const PreparedNativeActiveSolve&,
-      const DenseActiveState&,
+      const VariableStateDelta&,
+      Reconstruction*,
+      std::string*);
+  friend bool ValidateAndCommitNativeBaDelta(
+      const NativeBaSolveIntent&,
+      const PreparedNativeActiveSolve&,
+      const VariableStateDelta&,
       Reconstruction*,
       std::string*);
   struct Data;
@@ -78,6 +92,15 @@ class PreparedNativeActiveSolve {
 bool MakeNativeActiveSolveInputs(const ActiveBaSolveSpec& spec,
                                  NativeActiveSolveInputs* inputs,
                                  std::string* error);
+
+// Reference adapter used by the same-binary ActiveSpec oracle. The final
+// Mapper native path supplies NativeBaSolveIntent directly.
+bool MakeNativeBaSolveIntentFromActiveSpec(
+    const ActiveBaSolveSpec& spec,
+    uintptr_t reconstruction_identity,
+    const NativeCudaResolvedConfig& resolved_config,
+    NativeBaSolveIntent* intent,
+    std::string* error);
 
 std::shared_ptr<NativeGraphStoreState> CreateNativeGraphStoreState(
     const Reconstruction* reconstruction, uint64_t owner_epoch);
@@ -92,10 +115,25 @@ bool PrepareCudaNativeActiveSolve(
     PreparedNativeActiveSolve* prepared,
     std::string* error);
 
+bool PrepareCudaNativeBaSolve(
+    const NativeBaSolveIntent& intent,
+    Reconstruction* reconstruction,
+    const CudaFullLmOptions& options,
+    const CudaHostStoreBinding& binding,
+    PreparedNativeActiveSolve* prepared,
+    std::string* error);
+
 bool ValidateAndCommitNativeBaState(
     const NativeActiveSolveInputs& inputs,
     const PreparedNativeActiveSolve& prepared,
-    const DenseActiveState& candidate,
+    const VariableStateDelta& candidate,
+    Reconstruction* reconstruction,
+    std::string* error);
+
+bool ValidateAndCommitNativeBaDelta(
+    const NativeBaSolveIntent& intent,
+    const PreparedNativeActiveSolve& prepared,
+    const VariableStateDelta& candidate,
     Reconstruction* reconstruction,
     std::string* error);
 

@@ -27,6 +27,7 @@ enum class CudaReductionMode : uint8_t;
 enum class CudaResidualOrder : uint8_t;
 enum class CudaSchurContributionBackend : uint8_t;
 struct CudaFullLmOptions;
+class DeviceBaProblemStoreHandle;
 
 constexpr uint32_t kHostBaGraphAbiVersion = 2;
 constexpr uint32_t kNativeHostSolveViewAbiVersion = 1;
@@ -339,6 +340,65 @@ struct LidarConstraintSelection {
   std::vector<LidarConstraintRecord> constraints;
 };
 
+// Mapper-facing native contract. It contains only stable Reconstruction IDs,
+// selection/fixed policy, LiDAR constraints, and an already-resolved CUDA
+// configuration. Stable graph slots and residual ordinals are derived under a
+// CatalogReadLease; callers never manufacture GPU/catalog indices.
+struct NativeBaTranslationPolicy {
+  uint32_t image_id = 0;
+  uint8_t constant_mask = 0;
+  uint8_t padding[3]{};
+};
+
+struct NativeBaCameraPolicy {
+  uint32_t camera_id = 0;
+  bool constant = true;
+  std::vector<uint32_t> fixed_parameter_indices;
+};
+
+struct NativeBaPointPolicy {
+  uint64_t point3D_id = 0;
+  bool constant = false;
+  uint8_t config_role = 0;
+  bool has_search_range = false;
+  double search_range = 0.0;
+};
+
+struct NativeBaLidarConstraint {
+  uint64_t point3D_id = 0;
+  uint32_t constraint_slot = kBaGraphInvalidSlot;
+  uint64_t physical_identity = 0;
+  uint8_t lidar_type = 0;
+  uint8_t padding[3]{};
+  std::array<double, 4> plane{{0.0, 0.0, 0.0, 0.0}};
+  std::array<double, 3> lidar_xyz{{0.0, 0.0, 0.0}};
+  double weight = 0.0;
+  double search_range = 0.0;
+};
+
+struct NativeBaSolveIntent {
+  uint32_t abi_version = kNativeHostSolveViewAbiVersion;
+  uint64_t owner_epoch = 0;
+  uintptr_t reconstruction_identity = 0;
+  uint64_t expected_topology_revision = 0;
+  uint64_t selection_revision = 0;
+  BaKind kind = BaKind::kLocal;
+  NativeCudaResolvedConfig config;
+  // Order is semantically significant and is the source-insertion image order.
+  std::vector<uint32_t> active_image_ids;
+  // Direct preparation emits external visual residuals in this category order:
+  // variable points, LiDAR constraints, then constant points.
+  std::vector<uint64_t> explicit_variable_point_ids;
+  std::vector<uint64_t> explicit_constant_point_ids;
+  std::vector<uint32_t> fixed_pose_ids;
+  std::vector<NativeBaTranslationPolicy> translation_policies;
+  std::vector<NativeBaCameraPolicy> camera_policies;
+  std::vector<NativeBaPointPolicy> point_policies;
+  uint64_t lidar_map_generation = 0;
+  uint64_t lidar_match_config_generation = 0;
+  std::vector<NativeBaLidarConstraint> lidar_constraints;
+};
+
 struct BaSolveIntent {
   uint32_t abi_version = kNativeHostSolveViewAbiVersion;
   uint64_t owner_epoch = 0;
@@ -362,6 +422,7 @@ struct BaSolveIntent {
   };
   std::vector<ResidualSelection> source_insertion_order;
   std::vector<uint32_t> explicit_variable_point_slots;
+  std::vector<uint32_t> explicit_constant_point_slots;
   std::vector<uint32_t> fixed_pose_slots;
   std::vector<TranslationSubsetPolicy> translation_subsets;
   std::vector<CameraParameterPolicy> camera_policies;
@@ -396,6 +457,44 @@ struct DenseActiveState {
   std::vector<DenseCameraState> cameras;
   std::vector<DenseImageState> images;
   std::vector<DensePointState> points;
+};
+
+struct VariableImageStateDelta {
+  uint32_t image_slot = kBaGraphInvalidSlot;
+  uint8_t translation_subset_mask = 0;
+  uint8_t padding[3]{};
+  std::array<double, 4> quaternion{{1.0, 0.0, 0.0, 0.0}};
+  std::array<double, 3> translation{{0.0, 0.0, 0.0}};
+};
+
+struct VariablePointStateDelta {
+  uint32_t point_slot = kBaGraphInvalidSlot;
+  uint32_t reserved = 0;
+  std::array<double, 3> xyz{{0.0, 0.0, 0.0}};
+};
+
+struct VariableCameraStateDelta {
+  uint32_t camera_slot = kBaGraphInvalidSlot;
+  uint32_t reserved = 0;
+  std::vector<double> parameters;
+};
+
+// The only production state returned by a native solve. Fixed entities are
+// deliberately absent. The expected slot vectors make coverage validation
+// explicit before Reconstruction mutation begins.
+struct VariableStateDelta {
+  uint64_t owner_epoch = 0;
+  uint64_t catalog_revision = 0;
+  uint64_t catalog_generation = 0;
+  uint64_t view_generation = 0;
+  uint64_t solve_generation = 0;
+  uint64_t state_generation = 0;
+  std::vector<uint32_t> expected_image_slots;
+  std::vector<uint32_t> expected_point_slots;
+  std::vector<uint32_t> expected_camera_slots;
+  std::vector<VariableImageStateDelta> images;
+  std::vector<VariablePointStateDelta> points;
+  std::vector<VariableCameraStateDelta> cameras;
 };
 
 struct ActiveStateBuffer {
@@ -548,7 +647,25 @@ struct BaSolveResult {
     uint64_t temporary_visual_input_bytes = 0;
     uint64_t temporary_lidar_input_bytes = 0;
     uint64_t dense_active_state_device_download_calls = 0;
-    bool temporary_legacy_kernel_abi = true;
+    uint64_t variable_state_delta_device_download_calls = 0;
+    uint64_t variable_state_delta_device_download_bytes = 0;
+    uint64_t indexed_visual_binding_bytes = 0;
+    uint64_t repeated_residual_state_packing_bytes = 0;
+    uint64_t device_store_lookup_calls = 0;
+    uint64_t device_store_reuse_calls = 0;
+    uint64_t device_store_full_upload_calls = 0;
+    uint64_t device_store_full_upload_bytes = 0;
+    uint64_t device_store_patch_upload_calls = 0;
+    uint64_t device_store_patch_upload_bytes = 0;
+    uint64_t device_store_growth_d2d_calls = 0;
+    uint64_t device_store_growth_d2d_bytes = 0;
+    uint64_t device_store_invalidations = 0;
+    uint64_t device_store_generation = 0;
+    uint64_t indexed_plan_build_calls = 0;
+    uint64_t indexed_plan_upload_bytes = 0;
+    double indexed_packing_milliseconds = 0.0;
+    double variable_state_download_milliseconds = 0.0;
+    bool temporary_legacy_kernel_abi = false;
     bool native_lm_controller_handoff_complete = false;
     uint64_t real_cost_layout_entries = 0;
     uint64_t real_pose_adjacency_entries = 0;
@@ -571,13 +688,16 @@ struct BaSolveResult {
   double max_backward_error = 0.0;
   bool resource_cleanup_failed = false;
   uint64_t final_internal_state_epoch = 0;
-  DenseActiveState final_state;
+  VariableStateDelta variable_delta;
 };
 
 struct NativeCudaSolveRequest {
   const NativeHostSolveView* view = nullptr;
   const ActiveStateBuffer* initial_state = nullptr;
   const CudaFullLmOptions* options = nullptr;
+  // Mapping-session owner for static device catalog generations. The solve
+  // context pins the published allocation while it is executing.
+  std::shared_ptr<DeviceBaProblemStoreHandle> device_store;
 };
 
 }  // namespace gpu_ba

@@ -20,6 +20,7 @@ struct PreparedHostSolveViewData;
 struct StaticProblemDataCatalog;
 struct GpuBaHostProblemStoreControl;
 struct NativeGraphStoreState;
+struct NativeBaSolveIntent;
 struct PreparedHostStorePublication;
 struct PreparedIndexedCatalogPublication;
 
@@ -246,6 +247,13 @@ class GpuBaHostProblemStore {
       std::string*);
   friend bool PrepareCudaNativeActiveSolve(
       const NativeActiveSolveInputs&,
+      const CudaFullLmOptions&,
+      const CudaHostStoreBinding&,
+      PreparedNativeActiveSolve*,
+      std::string*);
+  friend bool PrepareCudaNativeBaSolve(
+      const NativeBaSolveIntent&,
+      Reconstruction*,
       const CudaFullLmOptions&,
       const CudaHostStoreBinding&,
       PreparedNativeActiveSolve*,

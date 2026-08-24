@@ -36,6 +36,9 @@
 
 namespace colmap {
 namespace gpu_ba {
+
+struct NativeIndexedKernelInput;
+
 namespace {
 
 thread_local CudaTimingLedger* g_cuda_timing_sink = nullptr;
@@ -1100,6 +1103,8 @@ bool AcquireRuntimePoolLease(const int device,
 
 bool EnsureRuntimePoolArena(CudaRuntimePoolLease* lease,
                             const uint64_t required,
+                            const uint64_t external_resident_bytes,
+                            const uint64_t memory_budget_bytes,
                             CudaPersistentDeviceRuntimeInfo* runtime,
                             std::string* error) {
   if (lease == nullptr || lease->entry == nullptr || runtime == nullptr ||
@@ -1109,19 +1114,37 @@ bool EnsureRuntimePoolArena(CudaRuntimePoolLease* lease,
   }
   CudaRuntimePoolEntry& entry = *lease->entry;
   runtime->arena_required_bytes = required;
-  if (entry.arena_capacity >= required) {
+  const bool growth = entry.arena_capacity < required;
+  uint64_t capacity = entry.arena_capacity;
+  if (growth) {
+    constexpr uint64_t kArenaQuantum = 4ull * 1024ull * 1024ull;
+    if (required > std::numeric_limits<uint64_t>::max() -
+                       (kArenaQuantum - 1)) {
+      *error = "RuntimePool arena capacity overflow";
+      return false;
+    }
+    capacity =
+        ((required + kArenaQuantum - 1) / kArenaQuantum) * kArenaQuantum;
+  }
+  uint64_t budget_peak = 0;
+  const auto budget_add = [&](const uint64_t value) {
+    if (value > std::numeric_limits<uint64_t>::max() - budget_peak)
+      return false;
+    budget_peak += value;
+    return true;
+  };
+  if (!budget_add(external_resident_bytes) || !budget_add(capacity) ||
+      (growth && entry.arena != nullptr &&
+       !budget_add(entry.arena_capacity)) ||
+      (memory_budget_bytes != 0 && budget_peak > memory_budget_bytes)) {
+    *error = "INSUFFICIENT_GPU_MEMORY for RuntimePool arena peak budget";
+    return false;
+  }
+  if (!growth) {
     runtime->arena_capacity_bytes = entry.arena_capacity;
     runtime->arena_retained_bytes = entry.arena_capacity;
     return true;
   }
-  constexpr uint64_t kArenaQuantum = 4ull * 1024ull * 1024ull;
-  if (required > std::numeric_limits<uint64_t>::max() -
-                     (kArenaQuantum - 1)) {
-    *error = "RuntimePool arena capacity overflow";
-    return false;
-  }
-  const uint64_t capacity =
-      ((required + kArenaQuantum - 1) / kArenaQuantum) * kArenaQuantum;
   if (entry.arena_generation == std::numeric_limits<uint64_t>::max()) {
     *error = "RuntimePool arena generation exhausted";
     return false;
@@ -2500,6 +2523,728 @@ struct DeviceVisualStaticInput {
   double observation[2];
 };
 
+// Native indexed ABI: the catalog owns the measurement and stable entity
+// relation. A solve uploads only compact-entity indices and source ordinal.
+struct DeviceIndexedVisualBinding {
+  uint64_t source_index;
+  uint64_t physical_identity;
+  uint32_t observation_slot;
+  uint32_t image_entity_index;
+  uint32_t point_entity_index;
+  uint32_t camera_entity_index;
+};
+
+struct DeviceBaCatalogCamera {
+  uint32_t camera_id;
+  int32_t model_id;
+  uint32_t parameter_count;
+  uint32_t alive;
+  uint64_t generation;
+};
+
+struct DeviceBaCatalogImage {
+  uint32_t image_id;
+  uint32_t camera_slot;
+  uint32_t alive;
+  uint32_t registered;
+  uint64_t generation;
+};
+
+struct DeviceBaCatalogPoint {
+  uint64_t point3D_id;
+  uint32_t alive;
+  uint32_t track_length;
+  uint64_t generation;
+};
+
+struct DeviceBaCatalogObservation {
+  uint64_t physical_identity;
+  uint64_t generation;
+  uint32_t image_slot;
+  uint32_t point_slot;
+  uint32_t point2D_idx;
+  uint32_t alive;
+  double observation[2];
+};
+
+struct DeviceBaCatalogIncidence {
+  uint32_t observation_slot;
+  uint32_t next_node;
+  uint64_t association_generation;
+};
+
+struct DeviceBaProblemStoreView {
+  const DeviceBaCatalogCamera* cameras = nullptr;
+  const DeviceBaCatalogImage* images = nullptr;
+  const DeviceBaCatalogPoint* points = nullptr;
+  const DeviceBaCatalogObservation* observations = nullptr;
+  const DeviceBaCatalogIncidence* image_incidence = nullptr;
+  const DeviceBaCatalogIncidence* point_incidence = nullptr;
+  uint32_t camera_count = 0;
+  uint32_t image_count = 0;
+  uint32_t point_count = 0;
+  uint32_t observation_count = 0;
+};
+
+constexpr uint32_t kDeviceBaProblemStoreAbiVersion = 1;
+
+struct DeviceBaProblemStoreAllocation {
+  int device = -1;
+  uintptr_t cuda_context = 0;
+  uint64_t context_incarnation = 0;
+  uint64_t owner_epoch = 0;
+  uint64_t topology_revision = 0;
+  uint64_t catalog_generation = 0;
+  uint32_t abi_version = kDeviceBaProblemStoreAbiVersion;
+  CudaArithmeticPrecision static_storage_precision =
+      CudaArithmeticPrecision::kFp64;
+  DeviceBaCatalogCamera* cameras = nullptr;
+  DeviceBaCatalogImage* images = nullptr;
+  DeviceBaCatalogPoint* points = nullptr;
+  DeviceBaCatalogObservation* observations = nullptr;
+  DeviceBaCatalogIncidence* image_incidence = nullptr;
+  DeviceBaCatalogIncidence* point_incidence = nullptr;
+  size_t camera_capacity = 0;
+  size_t image_capacity = 0;
+  size_t point_capacity = 0;
+  size_t observation_capacity = 0;
+  size_t image_incidence_capacity = 0;
+  size_t point_incidence_capacity = 0;
+  size_t camera_count = 0;
+  size_t image_count = 0;
+  size_t point_count = 0;
+  size_t observation_count = 0;
+  size_t image_incidence_count = 0;
+  size_t point_incidence_count = 0;
+
+  ~DeviceBaProblemStoreAllocation() noexcept {
+    if (device >= 0) CleanupCudaSetDevice(device);
+    const auto release = [this](void* pointer) {
+      if (pointer != nullptr) CleanupCudaFree(pointer, device);
+    };
+    release(point_incidence);
+    release(image_incidence);
+    release(observations);
+    release(points);
+    release(images);
+    release(cameras);
+  }
+
+  DeviceBaProblemStoreView view() const noexcept {
+    DeviceBaProblemStoreView result;
+    result.cameras = cameras;
+    result.images = images;
+    result.points = points;
+    result.observations = observations;
+    result.image_incidence = image_incidence;
+    result.point_incidence = point_incidence;
+    result.camera_count = static_cast<uint32_t>(camera_count);
+    result.image_count = static_cast<uint32_t>(image_count);
+    result.point_count = static_cast<uint32_t>(point_count);
+    result.observation_count = static_cast<uint32_t>(observation_count);
+    return result;
+  }
+};
+
+struct DeviceBaProblemStoreState {
+  std::mutex mutex;
+  std::shared_ptr<DeviceBaProblemStoreAllocation> published;
+  bool valid = false;
+  bool recoverable = true;
+  uint64_t publish_generation = 0;
+  uint64_t fail_next_publish_for_testing = 0;
+};
+
+size_t DeviceBaGeometricCapacity(const size_t required,
+                                 const size_t current) {
+  if (required <= current) return current;
+  size_t capacity = std::max<size_t>(64, current);
+  while (capacity < required) {
+    const size_t growth = std::max<size_t>(1, capacity / 2);
+    if (capacity > std::numeric_limits<size_t>::max() - growth)
+      return required;
+    capacity += growth;
+  }
+  return capacity;
+}
+
+bool DeviceBaProblemStoreResidentBytes(
+    const DeviceBaProblemStoreAllocation& allocation,
+    uint64_t* bytes) noexcept {
+  uint64_t result = 0;
+  const auto add = [&](const size_t count, const size_t element_size) {
+    if (element_size != 0 &&
+        count > std::numeric_limits<uint64_t>::max() / element_size) {
+      return false;
+    }
+    const uint64_t value = static_cast<uint64_t>(count) * element_size;
+    if (value > std::numeric_limits<uint64_t>::max() - result) return false;
+    result += value;
+    return true;
+  };
+  if (!add(allocation.camera_capacity, sizeof(DeviceBaCatalogCamera)) ||
+      !add(allocation.image_capacity, sizeof(DeviceBaCatalogImage)) ||
+      !add(allocation.point_capacity, sizeof(DeviceBaCatalogPoint)) ||
+      !add(allocation.observation_capacity,
+           sizeof(DeviceBaCatalogObservation)) ||
+      !add(allocation.image_incidence_capacity,
+           sizeof(DeviceBaCatalogIncidence)) ||
+      !add(allocation.point_incidence_capacity,
+           sizeof(DeviceBaCatalogIncidence))) {
+    return false;
+  }
+  *bytes = result;
+  return true;
+}
+
+bool CheckedDeviceBaBudgetAdd(const uint64_t value,
+                              uint64_t* total) noexcept {
+  if (value > std::numeric_limits<uint64_t>::max() - *total) return false;
+  *total += value;
+  return true;
+}
+
+template <typename T>
+bool AllocateDeviceBaStoreArray(T** pointer,
+                                const size_t capacity,
+                                const int device,
+                                std::string* error) {
+  if (capacity == 0) {
+    *pointer = nullptr;
+    return true;
+  }
+  if (capacity > std::numeric_limits<size_t>::max() / sizeof(T)) {
+    *error = "DeviceBaProblemStore allocation size overflow";
+    return false;
+  }
+  void* allocation = nullptr;
+  const cudaError_t status = cudaMalloc(&allocation, capacity * sizeof(T));
+  if (status != cudaSuccess ||
+      !RegisterPoolResource(reinterpret_cast<uintptr_t>(allocation),
+                            CudaTeardownType::kAllocation, device)) {
+    if (status == cudaSuccess) CleanupCudaFree(allocation, device);
+    *error = std::string("DeviceBaProblemStore allocation failed: ") +
+             CudaErrorText(status);
+    return false;
+  }
+  *pointer = static_cast<T*>(allocation);
+  return true;
+}
+
+DeviceBaCatalogCamera DeviceBaCameraRecord(const HostBaCameraSlot& source) {
+  return {source.camera_id, source.model_id, source.parameter_count,
+          source.header.alive, source.header.generation};
+}
+
+DeviceBaCatalogImage DeviceBaImageRecord(const HostBaImageSlot& source) {
+  return {source.image_id, source.camera_slot, source.header.alive,
+          source.registered, source.header.generation};
+}
+
+DeviceBaCatalogPoint DeviceBaPointRecord(const HostBaPointSlot& source) {
+  return {source.point3D_id, source.header.alive, source.track_length,
+          source.header.generation};
+}
+
+DeviceBaCatalogObservation DeviceBaObservationRecord(
+    const HostBaObservationSlot& source) {
+  DeviceBaCatalogObservation result{};
+  result.physical_identity = source.source_identity;
+  result.generation = source.header.generation;
+  result.image_slot = source.image_slot;
+  result.point_slot = source.point_slot;
+  result.point2D_idx = source.point2D_idx;
+  result.alive = source.header.alive;
+  result.observation[0] = source.xy[0];
+  result.observation[1] = source.xy[1];
+  return result;
+}
+
+DeviceBaCatalogIncidence DeviceBaIncidenceRecord(
+    const HostBaIncidenceNode& source) {
+  return {source.observation_slot, source.next_node,
+          source.association_generation};
+}
+
+struct DeviceBaHostCopySpan {
+  size_t source_begin = 0;
+  size_t destination_begin = 0;
+  size_t count = 0;
+};
+
+template <typename Device>
+struct DeviceBaHostStaging {
+  std::vector<Device> values;
+  std::vector<DeviceBaHostCopySpan> spans;
+};
+
+template <typename Device, typename Host, typename Convert>
+bool BuildDeviceBaFullStaging(const BaArrayView<Host> source,
+                              const Convert& convert,
+                              DeviceBaHostStaging<Device>* staging,
+                              std::string* error) {
+  try {
+    staging->values.reserve(source.size);
+    for (const Host& value : source) staging->values.push_back(convert(value));
+    if (!staging->values.empty())
+      staging->spans.push_back({0, 0, staging->values.size()});
+  } catch (const std::exception& exception) {
+    *error = std::string("DeviceBaProblemStore staging failed: ") +
+             exception.what();
+    return false;
+  }
+  return true;
+}
+
+template <typename Device, typename Host, typename Convert>
+bool BuildDeviceBaPatchStaging(const BaArrayView<Host> source,
+                               const size_t old_count,
+                               const uint64_t old_generation,
+                               const Convert& convert,
+                               DeviceBaHostStaging<Device>* staging,
+                               std::string* error) {
+  size_t changed = 0;
+  for (size_t index = 0; index < source.size; ++index) {
+    if (index >= old_count ||
+        source[index].header.generation > old_generation) {
+      ++changed;
+    }
+  }
+  try {
+    staging->values.reserve(changed);
+    staging->spans.reserve(changed);
+    for (size_t index = 0; index < source.size; ++index) {
+      if (index < old_count &&
+          source[index].header.generation <= old_generation) {
+        continue;
+      }
+      if (staging->spans.empty() ||
+          staging->spans.back().destination_begin +
+                  staging->spans.back().count !=
+              index) {
+        staging->spans.push_back(
+            {staging->values.size(), index, static_cast<size_t>(0)});
+      }
+      staging->values.push_back(convert(source[index]));
+      ++staging->spans.back().count;
+    }
+  } catch (const std::exception& exception) {
+    *error = std::string("DeviceBaProblemStore patch staging failed: ") +
+             exception.what();
+    return false;
+  }
+  return true;
+}
+
+template <typename Device, typename Host, typename Convert>
+bool BuildDeviceBaAppendStaging(const BaArrayView<Host> source,
+                                const size_t old_count,
+                                const Convert& convert,
+                                DeviceBaHostStaging<Device>* staging,
+                                std::string* error) {
+  if (old_count > source.size) {
+    *error = "DeviceBaProblemStore append range is invalid";
+    return false;
+  }
+  try {
+    staging->values.reserve(source.size - old_count);
+    for (size_t index = old_count; index < source.size; ++index)
+      staging->values.push_back(convert(source[index]));
+    if (!staging->values.empty())
+      staging->spans.push_back({0, old_count, staging->values.size()});
+  } catch (const std::exception& exception) {
+    *error = std::string("DeviceBaProblemStore append staging failed: ") +
+             exception.what();
+    return false;
+  }
+  return true;
+}
+
+template <typename Device>
+bool UploadDeviceBaStaging(Device* destination,
+                           const DeviceBaHostStaging<Device>& staging,
+                           cudaStream_t stream,
+                           uint64_t* bytes,
+                           bool* queued,
+                           std::string* error) {
+  for (const DeviceBaHostCopySpan& span : staging.spans) {
+    if (span.source_begin > staging.values.size() ||
+        span.count > staging.values.size() - span.source_begin ||
+        span.count > std::numeric_limits<size_t>::max() / sizeof(Device)) {
+      *error = "DeviceBaProblemStore upload span is invalid";
+      return false;
+    }
+    const size_t copy_bytes = span.count * sizeof(Device);
+    const cudaError_t status = cudaMemcpyAsync(
+        destination + span.destination_begin,
+        staging.values.data() + span.source_begin, copy_bytes,
+        cudaMemcpyHostToDevice, stream);
+    if (status != cudaSuccess) {
+      *error = std::string("DeviceBaProblemStore upload failed: ") +
+               CudaErrorText(status);
+      return false;
+    }
+    *queued = true;
+    *bytes = SaturatingAdd(*bytes, copy_bytes);
+  }
+  return true;
+}
+
+template <typename T>
+bool CopyDeviceBaPrefix(T* destination,
+                        const T* source,
+                        const size_t count,
+                        cudaStream_t stream,
+                        uint64_t* bytes,
+                        bool* queued,
+                        std::string* error) {
+  if (count == 0) return true;
+  const size_t copy_bytes = count * sizeof(T);
+  const cudaError_t status = cudaMemcpyAsync(destination, source, copy_bytes,
+                                              cudaMemcpyDeviceToDevice, stream);
+  if (status != cudaSuccess) {
+    *error = std::string("DeviceBaProblemStore D2D growth failed: ") +
+             CudaErrorText(status);
+    return false;
+  }
+  *queued = true;
+  *bytes = SaturatingAdd(*bytes, copy_bytes);
+  return true;
+}
+
+bool EnsureDeviceBaProblemStore(
+    CudaRuntimePoolEntry* pooled,
+    const std::shared_ptr<DeviceBaProblemStoreState>& store,
+    const CatalogReadLease& catalog,
+    const CudaArithmeticPrecision precision,
+    const uint64_t memory_budget_bytes,
+    CudaPersistentDeviceRuntimeInfo* runtime,
+    std::shared_ptr<DeviceBaProblemStoreAllocation>* pinned,
+    DeviceBaProblemStoreView* view,
+    uint64_t* resident_bytes,
+    std::string* error) {
+  if (pooled == nullptr || store == nullptr || !catalog.valid() ||
+      runtime == nullptr || pinned == nullptr || view == nullptr ||
+      resident_bytes == nullptr || error == nullptr ||
+      catalog.owner_epoch() == 0 || catalog.generation() == 0 ||
+      catalog.abi_version() != kHostBaGraphAbiVersion) {
+    if (error != nullptr) *error = "DeviceBaProblemStore bind is invalid";
+    return false;
+  }
+  const auto cameras = catalog.cameras();
+  const auto images = catalog.images();
+  const auto points = catalog.points();
+  const auto observations = catalog.observations();
+  const auto image_nodes = catalog.image_incidence_nodes();
+  const auto point_nodes = catalog.point_incidence_nodes();
+  const auto bounded = [](const size_t count) {
+    return count <= std::numeric_limits<uint32_t>::max();
+  };
+  if (!bounded(cameras.size) || !bounded(images.size) ||
+      !bounded(points.size) || !bounded(observations.size) ||
+      !bounded(image_nodes.size) || !bounded(point_nodes.size)) {
+    *error = "DeviceBaProblemStore catalog exceeds uint32 ABI";
+    return false;
+  }
+  ++runtime->native_device_store_lookup_calls;
+  std::lock_guard<std::mutex> lock(store->mutex);
+  std::shared_ptr<DeviceBaProblemStoreAllocation> current = store->published;
+  const bool physical_match =
+      current != nullptr && current->device == pooled->device &&
+      current->cuda_context == pooled->key.context &&
+      current->context_incarnation == pooled->context_incarnation &&
+      current->owner_epoch == catalog.owner_epoch() &&
+      current->abi_version == kDeviceBaProblemStoreAbiVersion &&
+      current->static_storage_precision == precision;
+  if (store->valid && physical_match &&
+      current->topology_revision == catalog.topology_revision() &&
+      current->catalog_generation == catalog.generation()) {
+    if (!DeviceBaProblemStoreResidentBytes(*current, resident_bytes)) {
+      *error = "DeviceBaProblemStore resident size overflow";
+      return false;
+    }
+    uint64_t budget_resident = *resident_bytes;
+    if (!CheckedDeviceBaBudgetAdd(pooled->arena_capacity, &budget_resident) ||
+        (memory_budget_bytes != 0 &&
+         budget_resident > memory_budget_bytes)) {
+      *error = "INSUFFICIENT_GPU_MEMORY for DeviceBaProblemStore reuse budget";
+      return false;
+    }
+    ++runtime->native_device_store_reuse_calls;
+    runtime->native_device_store_generation = store->publish_generation;
+    *pinned = current;
+    *view = current->view();
+    return true;
+  }
+  if (physical_match && store->valid &&
+      (catalog.generation() < current->catalog_generation ||
+       catalog.topology_revision() < current->topology_revision)) {
+    *error = "DeviceBaProblemStore refused a stale catalog generation";
+    return false;
+  }
+
+  const size_t camera_capacity = DeviceBaGeometricCapacity(
+      cameras.size, physical_match ? current->camera_capacity : 0);
+  const size_t image_capacity = DeviceBaGeometricCapacity(
+      images.size, physical_match ? current->image_capacity : 0);
+  const size_t point_capacity = DeviceBaGeometricCapacity(
+      points.size, physical_match ? current->point_capacity : 0);
+  const size_t observation_capacity = DeviceBaGeometricCapacity(
+      observations.size, physical_match ? current->observation_capacity : 0);
+  const size_t image_incidence_capacity = DeviceBaGeometricCapacity(
+      image_nodes.size,
+      physical_match ? current->image_incidence_capacity : 0);
+  const size_t point_incidence_capacity = DeviceBaGeometricCapacity(
+      point_nodes.size,
+      physical_match ? current->point_incidence_capacity : 0);
+  uint64_t required_bytes = 0;
+  const auto add_bytes = [&](const size_t count, const size_t size) {
+    if (size != 0 && count > std::numeric_limits<uint64_t>::max() / size)
+      return false;
+    const uint64_t bytes = static_cast<uint64_t>(count) * size;
+    if (bytes > std::numeric_limits<uint64_t>::max() - required_bytes)
+      return false;
+    required_bytes += bytes;
+    return true;
+  };
+  if (!add_bytes(camera_capacity, sizeof(DeviceBaCatalogCamera)) ||
+      !add_bytes(image_capacity, sizeof(DeviceBaCatalogImage)) ||
+      !add_bytes(point_capacity, sizeof(DeviceBaCatalogPoint)) ||
+      !add_bytes(observation_capacity, sizeof(DeviceBaCatalogObservation)) ||
+      !add_bytes(image_incidence_capacity,
+                 sizeof(DeviceBaCatalogIncidence)) ||
+      !add_bytes(point_incidence_capacity,
+                 sizeof(DeviceBaCatalogIncidence))) {
+    *error = "INSUFFICIENT_GPU_MEMORY for DeviceBaProblemStore";
+    return false;
+  }
+  const bool growth = !physical_match || current == nullptr ||
+      camera_capacity != current->camera_capacity ||
+      image_capacity != current->image_capacity ||
+      point_capacity != current->point_capacity ||
+      observation_capacity != current->observation_capacity ||
+      image_incidence_capacity != current->image_incidence_capacity ||
+      point_incidence_capacity != current->point_incidence_capacity;
+  uint64_t current_bytes = 0;
+  if (current != nullptr &&
+      !DeviceBaProblemStoreResidentBytes(*current, &current_bytes)) {
+    *error = "INSUFFICIENT_GPU_MEMORY for DeviceBaProblemStore current size";
+    return false;
+  }
+  uint64_t budget_peak = 0;
+  if (!CheckedDeviceBaBudgetAdd(required_bytes, &budget_peak) ||
+      !CheckedDeviceBaBudgetAdd(pooled->arena_capacity, &budget_peak) ||
+      (growth && current != nullptr &&
+       !CheckedDeviceBaBudgetAdd(current_bytes, &budget_peak)) ||
+      (memory_budget_bytes != 0 && budget_peak > memory_budget_bytes)) {
+    *error = "INSUFFICIENT_GPU_MEMORY for DeviceBaProblemStore peak budget";
+    return false;
+  }
+  std::shared_ptr<DeviceBaProblemStoreAllocation> pending = current;
+  if (growth) {
+    size_t free_bytes = 0;
+    size_t total_bytes = 0;
+    if (cudaMemGetInfo(&free_bytes, &total_bytes) != cudaSuccess ||
+        !HasCudaMemoryHeadroom(free_bytes, required_bytes,
+                               512ull * 1024ull * 1024ull)) {
+      *error = "INSUFFICIENT_GPU_MEMORY for DeviceBaProblemStore growth";
+      return false;
+    }
+    try {
+      pending = std::make_shared<DeviceBaProblemStoreAllocation>();
+    } catch (const std::bad_alloc&) {
+      *error = "DeviceBaProblemStore allocation metadata failed";
+      return false;
+    }
+    pending->device = pooled->device;
+    pending->cuda_context = pooled->key.context;
+    pending->context_incarnation = pooled->context_incarnation;
+    pending->owner_epoch = catalog.owner_epoch();
+    pending->static_storage_precision = precision;
+    pending->camera_capacity = camera_capacity;
+    pending->image_capacity = image_capacity;
+    pending->point_capacity = point_capacity;
+    pending->observation_capacity = observation_capacity;
+    pending->image_incidence_capacity = image_incidence_capacity;
+    pending->point_incidence_capacity = point_incidence_capacity;
+    if (!AllocateDeviceBaStoreArray(&pending->cameras, camera_capacity,
+                                    pooled->device, error) ||
+        !AllocateDeviceBaStoreArray(&pending->images, image_capacity,
+                                    pooled->device, error) ||
+        !AllocateDeviceBaStoreArray(&pending->points, point_capacity,
+                                    pooled->device, error) ||
+        !AllocateDeviceBaStoreArray(&pending->observations,
+                                    observation_capacity, pooled->device,
+                                    error) ||
+        !AllocateDeviceBaStoreArray(&pending->image_incidence,
+                                    image_incidence_capacity, pooled->device,
+                                    error) ||
+        !AllocateDeviceBaStoreArray(&pending->point_incidence,
+                                    point_incidence_capacity, pooled->device,
+                                    error)) {
+      store->valid = false;
+      ++runtime->native_device_store_invalidations;
+      return false;
+    }
+  }
+
+  uint64_t transfer_bytes = 0;
+  uint64_t d2d_bytes = 0;
+  const bool incremental = physical_match && store->valid && current != nullptr &&
+      current->catalog_generation < catalog.generation() &&
+      current->camera_count <= cameras.size &&
+      current->image_count <= images.size &&
+      current->point_count <= points.size &&
+      current->observation_count <= observations.size &&
+      current->image_incidence_count <= image_nodes.size &&
+      current->point_incidence_count <= point_nodes.size;
+  DeviceBaHostStaging<DeviceBaCatalogCamera> camera_staging;
+  DeviceBaHostStaging<DeviceBaCatalogImage> image_staging;
+  DeviceBaHostStaging<DeviceBaCatalogPoint> point_staging;
+  DeviceBaHostStaging<DeviceBaCatalogObservation> observation_staging;
+  DeviceBaHostStaging<DeviceBaCatalogIncidence> image_incidence_staging;
+  DeviceBaHostStaging<DeviceBaCatalogIncidence> point_incidence_staging;
+  bool staged = false;
+  if (incremental) {
+    staged =
+        BuildDeviceBaPatchStaging(cameras, current->camera_count,
+                                  current->catalog_generation,
+                                  DeviceBaCameraRecord, &camera_staging,
+                                  error) &&
+        BuildDeviceBaPatchStaging(images, current->image_count,
+                                  current->catalog_generation,
+                                  DeviceBaImageRecord, &image_staging, error) &&
+        BuildDeviceBaPatchStaging(points, current->point_count,
+                                  current->catalog_generation,
+                                  DeviceBaPointRecord, &point_staging, error) &&
+        BuildDeviceBaPatchStaging(
+            observations, current->observation_count,
+            current->catalog_generation, DeviceBaObservationRecord,
+            &observation_staging, error) &&
+        BuildDeviceBaAppendStaging(
+            image_nodes, current->image_incidence_count,
+            DeviceBaIncidenceRecord, &image_incidence_staging, error) &&
+        BuildDeviceBaAppendStaging(
+            point_nodes, current->point_incidence_count,
+            DeviceBaIncidenceRecord, &point_incidence_staging, error);
+  } else {
+    staged =
+        BuildDeviceBaFullStaging(cameras, DeviceBaCameraRecord,
+                                 &camera_staging, error) &&
+        BuildDeviceBaFullStaging(images, DeviceBaImageRecord, &image_staging,
+                                 error) &&
+        BuildDeviceBaFullStaging(points, DeviceBaPointRecord, &point_staging,
+                                 error) &&
+        BuildDeviceBaFullStaging(observations, DeviceBaObservationRecord,
+                                 &observation_staging, error) &&
+        BuildDeviceBaFullStaging(image_nodes, DeviceBaIncidenceRecord,
+                                 &image_incidence_staging, error) &&
+        BuildDeviceBaFullStaging(point_nodes, DeviceBaIncidenceRecord,
+                                 &point_incidence_staging, error);
+  }
+  if (!staged) return false;
+
+  bool queued = false;
+  bool transferred = true;
+  if (incremental && growth) {
+    transferred =
+        CopyDeviceBaPrefix(pending->cameras, current->cameras,
+                           current->camera_count, pooled->stream, &d2d_bytes,
+                           &queued, error) &&
+        CopyDeviceBaPrefix(pending->images, current->images,
+                           current->image_count, pooled->stream, &d2d_bytes,
+                           &queued, error) &&
+        CopyDeviceBaPrefix(pending->points, current->points,
+                           current->point_count, pooled->stream, &d2d_bytes,
+                           &queued, error) &&
+        CopyDeviceBaPrefix(pending->observations, current->observations,
+                           current->observation_count, pooled->stream,
+                           &d2d_bytes, &queued, error) &&
+        CopyDeviceBaPrefix(pending->image_incidence,
+                           current->image_incidence,
+                           current->image_incidence_count, pooled->stream,
+                           &d2d_bytes, &queued, error) &&
+        CopyDeviceBaPrefix(pending->point_incidence,
+                           current->point_incidence,
+                           current->point_incidence_count, pooled->stream,
+                           &d2d_bytes, &queued, error);
+  }
+  if (transferred) {
+    transferred = UploadDeviceBaStaging(
+                      pending->cameras, camera_staging, pooled->stream,
+                      &transfer_bytes, &queued, error) &&
+                  UploadDeviceBaStaging(
+                      pending->images, image_staging, pooled->stream,
+                      &transfer_bytes, &queued, error) &&
+                  UploadDeviceBaStaging(
+                      pending->points, point_staging, pooled->stream,
+                      &transfer_bytes, &queued, error) &&
+                  UploadDeviceBaStaging(
+                      pending->observations, observation_staging,
+                      pooled->stream, &transfer_bytes, &queued, error) &&
+                  UploadDeviceBaStaging(
+                      pending->image_incidence, image_incidence_staging,
+                      pooled->stream, &transfer_bytes, &queued, error) &&
+                  UploadDeviceBaStaging(
+                      pending->point_incidence, point_incidence_staging,
+                      pooled->stream, &transfer_bytes, &queued, error);
+  }
+  const cudaError_t launch_status = transferred ? cudaGetLastError()
+                                                 : cudaErrorUnknown;
+  const cudaError_t sync_status = queued
+      ? cudaStreamSynchronize(pooled->stream)
+      : (transferred ? cudaSuccess : cudaErrorUnknown);
+  if (!transferred || launch_status != cudaSuccess ||
+      sync_status != cudaSuccess) {
+    store->valid = false;
+    ++runtime->native_device_store_invalidations;
+    if (error->empty()) {
+      *error = std::string("DeviceBaProblemStore publish failed: ") +
+               CudaErrorText(launch_status != cudaSuccess ? launch_status
+                                                          : sync_status);
+    }
+    return false;
+  }
+  if (store->fail_next_publish_for_testing != 0) {
+    --store->fail_next_publish_for_testing;
+    store->valid = false;
+    ++runtime->native_device_store_invalidations;
+    *error = "DeviceBaProblemStore publish failure injected for testing";
+    return false;
+  }
+  pending->topology_revision = catalog.topology_revision();
+  pending->catalog_generation = catalog.generation();
+  pending->camera_count = cameras.size;
+  pending->image_count = images.size;
+  pending->point_count = points.size;
+  pending->observation_count = observations.size;
+  pending->image_incidence_count = image_nodes.size;
+  pending->point_incidence_count = point_nodes.size;
+  store->published = pending;
+  store->valid = true;
+  store->recoverable = true;
+  if (++store->publish_generation == 0) ++store->publish_generation;
+  runtime->native_device_store_generation = store->publish_generation;
+  if (incremental) {
+    ++runtime->native_device_store_patch_upload_calls;
+    runtime->native_device_store_patch_upload_bytes = SaturatingAdd(
+        runtime->native_device_store_patch_upload_bytes, transfer_bytes);
+  } else {
+    ++runtime->native_device_store_full_upload_calls;
+    runtime->native_device_store_full_upload_bytes = SaturatingAdd(
+        runtime->native_device_store_full_upload_bytes, transfer_bytes);
+  }
+  if (growth && incremental) {
+    ++runtime->native_device_store_growth_d2d_calls;
+    runtime->native_device_store_growth_d2d_bytes = SaturatingAdd(
+        runtime->native_device_store_growth_d2d_bytes, d2d_bytes);
+  }
+  *resident_bytes = required_bytes;
+  *pinned = pending;
+  *view = pending->view();
+  return true;
+}
+
 struct DeviceVisualDynamicInput {
   double quaternion[4];
   double translation[3];
@@ -2777,6 +3522,87 @@ __global__ void LayerAVisualDeviceStateCompactKernel(
   StoreCompactVisual(full, &output[index]);
 }
 
+__device__ inline DeviceVisualStaticInput LoadIndexedVisualStatic(
+    const DeviceBaProblemStoreView catalog,
+    const DeviceIndexedVisualBinding binding) {
+  const DeviceBaCatalogObservation measurement =
+      catalog.observations[binding.observation_slot];
+  DeviceVisualStaticInput fixed{};
+  fixed.source_index = binding.source_index;
+  fixed.image_id = catalog.images[measurement.image_slot].image_id;
+  fixed.point3D_id = catalog.points[measurement.point_slot].point3D_id;
+  fixed.image_entity_index = binding.image_entity_index;
+  fixed.point_entity_index = binding.point_entity_index;
+  fixed.camera_entity_index = binding.camera_entity_index;
+  fixed.observation[0] = measurement.observation[0];
+  fixed.observation[1] = measurement.observation[1];
+  return fixed;
+}
+
+__global__ void LayerAVisualIndexedDeviceStateKernel(
+    const DeviceBaProblemStoreView catalog,
+    const DeviceIndexedVisualBinding* bindings,
+    const DeviceImageEntityState* images,
+    const DevicePointEntityState* points,
+    const DeviceCameraEntityState* cameras,
+    CudaVisualOutput* output,
+    const size_t count) {
+  const size_t index = blockIdx.x * blockDim.x + threadIdx.x;
+  if (index >= count) return;
+  const DeviceIndexedVisualBinding binding = bindings[index];
+  const DeviceVisualStaticInput fixed =
+      LoadIndexedVisualStatic(catalog, binding);
+  CudaVisualInput input{};
+  input.source_index = fixed.source_index;
+  input.image_id = fixed.image_id;
+  input.point3D_id = fixed.point3D_id;
+  const DeviceImageEntityState image = images[fixed.image_entity_index];
+  const DevicePointEntityState point = points[fixed.point_entity_index];
+  const DeviceCameraEntityState camera = cameras[fixed.camera_entity_index];
+  for (size_t i = 0; i < 4; ++i) input.quaternion[i] = image.quaternion[i];
+  for (size_t i = 0; i < 3; ++i) {
+    input.translation[i] = image.translation[i];
+    input.point[i] = point.xyz[i];
+  }
+  for (size_t i = 0; i < 8; ++i) input.camera[i] = camera.params[i];
+  input.observation[0] = fixed.observation[0];
+  input.observation[1] = fixed.observation[1];
+  EvaluateVisualDevice(input, &output[index]);
+}
+
+__global__ void LayerAVisualIndexedDeviceStateCompactKernel(
+    const DeviceBaProblemStoreView catalog,
+    const DeviceIndexedVisualBinding* bindings,
+    const DeviceImageEntityState* images,
+    const DevicePointEntityState* points,
+    const DeviceCameraEntityState* cameras,
+    CudaCompactVisualOutput* output,
+    const size_t count) {
+  const size_t index = blockIdx.x * blockDim.x + threadIdx.x;
+  if (index >= count) return;
+  const DeviceIndexedVisualBinding binding = bindings[index];
+  const DeviceVisualStaticInput fixed =
+      LoadIndexedVisualStatic(catalog, binding);
+  CudaVisualInput input{};
+  input.source_index = fixed.source_index;
+  input.image_id = fixed.image_id;
+  input.point3D_id = fixed.point3D_id;
+  const DeviceImageEntityState image = images[fixed.image_entity_index];
+  const DevicePointEntityState point = points[fixed.point_entity_index];
+  const DeviceCameraEntityState camera = cameras[fixed.camera_entity_index];
+  for (size_t i = 0; i < 4; ++i) input.quaternion[i] = image.quaternion[i];
+  for (size_t i = 0; i < 3; ++i) {
+    input.translation[i] = image.translation[i];
+    input.point[i] = point.xyz[i];
+  }
+  for (size_t i = 0; i < 8; ++i) input.camera[i] = camera.params[i];
+  input.observation[0] = fixed.observation[0];
+  input.observation[1] = fixed.observation[1];
+  CudaVisualOutput full{};
+  EvaluateVisualDevice(input, &full);
+  StoreCompactVisual(full, &output[index]);
+}
+
 __global__ void LayerAVisualCompactOracleKernel(
     const CudaVisualInput* input,
     CudaCompactVisualOutput* output,
@@ -2976,6 +3802,24 @@ __global__ void LayerAVisualMixedDeviceStateKernel(
   if (output[index].finite == 0) {
     output[index].residual[0] = nanf("");
   }
+}
+
+__global__ void LayerAVisualIndexedMixedDeviceStateKernel(
+    const DeviceBaProblemStoreView catalog,
+    const DeviceIndexedVisualBinding* bindings,
+    const DeviceImageEntityState* images,
+    const DevicePointEntityState* points,
+    const DeviceCameraEntityState* cameras,
+    MixedVisualOutput* output,
+    const size_t count) {
+  const size_t index = blockIdx.x * blockDim.x + threadIdx.x;
+  if (index >= count) return;
+  const DeviceVisualStaticInput fixed =
+      LoadIndexedVisualStatic(catalog, bindings[index]);
+  EvaluateVisualMixed(fixed, images[fixed.image_entity_index],
+                      points[fixed.point_entity_index],
+                      cameras[fixed.camera_entity_index], &output[index]);
+  if (output[index].finite == 0) output[index].residual[0] = nanf("");
 }
 
 __global__ void LayerALidarMixedDeviceStateKernel(
@@ -4601,6 +5445,24 @@ __global__ void GatherVariablePoseStateKernel(
   if (index >= count) return;
   const DeviceImageEntityState image = images[image_entity_indices[index]];
   for (size_t i = 0; i < 4; ++i) output[index].quaternion[i] = image.quaternion[i];
+}
+
+__global__ void GatherVariableImageEntityStateKernel(
+    const DeviceImageEntityState* images,
+    const uint32_t* image_entity_indices,
+    DeviceImageEntityState* output,
+    const size_t count) {
+  const size_t index = blockIdx.x * blockDim.x + threadIdx.x;
+  if (index < count) output[index] = images[image_entity_indices[index]];
+}
+
+__global__ void GatherVariablePointEntityStateKernel(
+    const DevicePointEntityState* points,
+    const uint32_t* point_entity_indices,
+    DevicePointEntityState* output,
+    const size_t count) {
+  const size_t index = blockIdx.x * blockDim.x + threadIdx.x;
+  if (index < count) output[index] = points[point_entity_indices[index]];
 }
 
 __global__ void QuaternionPlusTestKernel(const double* quaternion,
@@ -9173,7 +10035,7 @@ class GpuBaDeviceContext {
                   std::string* error);
   bool InitializeNative(const NativeHostSolveView& view,
                         const ActiveStateBuffer& initial_state,
-                        const LegacyKernelInputBundle::Impl& native,
+                        const NativeIndexedKernelInput& native,
                         const CudaLayerBOptions& options,
                         uint64_t solve_generation,
                         uint64_t topology_generation,
@@ -9261,11 +10123,12 @@ class GpuBaDeviceContext {
                                Snapshot* output,
                                bool final_materialization,
                                std::string* error);
-  bool DownloadCurrentNativeState(const NativeHostSolveView& view,
-                                  const ActiveStateBuffer& initial_state,
-                                  const CudaLinearizationIdentity& expected,
-                                  DenseActiveState* output,
-                                  std::string* error);
+  bool DownloadCurrentNativeVariableDelta(
+      const NativeHostSolveView& view,
+      const ActiveStateBuffer& initial_state,
+      const CudaLinearizationIdentity& expected,
+      VariableStateDelta* output,
+      std::string* error);
   bool StaleHandleSelfTest(const PackedLayerAState& packed,
                            const CudaLayerAOptions& options,
                            std::string* error);
@@ -9310,7 +10173,7 @@ class GpuBaDeviceContext {
   bool InitializeImpl(const Snapshot* legacy_initial_snapshot,
                       const NativeHostSolveView* native_view,
                       const ActiveStateBuffer* native_initial_state,
-                      const LegacyKernelInputBundle::Impl* native,
+                      const NativeIndexedKernelInput* native,
                       const PackedLayerAState& initial,
                       const CostLayout& cost_layout,
                       const LayerBTopology& layer_b,
@@ -9459,6 +10322,7 @@ class GpuBaDeviceContext {
   bool device_scaling_enabled_ = false;
   bool compact_layer_a_enabled_ = false;
   bool compact_control_enabled_ = false;
+  bool native_indexed_enabled_ = false;
   HotKernelImplementation hot_kernel_implementation_ =
       HotKernelImplementation::kReference;
   CudaSchurContributionBackend schur_contribution_backend_ =
@@ -9479,6 +10343,9 @@ class GpuBaDeviceContext {
   CudaFullLmRuntimeInfo* runtime_ = nullptr;
   std::vector<AllocationRecord> allocations_;
   CudaRuntimePoolLease runtime_pool_lease_;
+  std::shared_ptr<DeviceBaProblemStoreAllocation>
+      native_device_catalog_generation_;
+  uint64_t native_device_catalog_resident_bytes_ = 0;
   uint64_t arena_offset_ = 0;
   bool arena_planning_ = false;
   bool indexed_catalog_bound_ = false;
@@ -9490,6 +10357,8 @@ class GpuBaDeviceContext {
   cublasHandle_t blas_ = nullptr;
 
   DeviceVisualStaticInput* d_visual_static_ = nullptr;
+  DeviceIndexedVisualBinding* d_indexed_visual_bindings_ = nullptr;
+  DeviceBaProblemStoreView native_device_catalog_view_;
   DeviceVisualDynamicInput* d_visual_dynamic_ = nullptr;
   DeviceLidarStaticInput* d_lidar_static_ = nullptr;
   DeviceLidarDynamicInput* d_lidar_dynamic_ = nullptr;
@@ -9499,6 +10368,8 @@ class GpuBaDeviceContext {
   DevicePointUpdateMeta* d_point_update_meta_ = nullptr;
   uint32_t* d_pose_image_entity_indices_ = nullptr;
   uint32_t* d_point_entity_indices_ = nullptr;
+  DeviceImageEntityState* d_variable_image_download_ = nullptr;
+  DevicePointEntityState* d_variable_point_download_ = nullptr;
   uint32_t* d_state_update_status_ = nullptr;
   DeviceCostEntry* d_cost_order_ = nullptr;
   DevicePoseMeta* d_pose_meta_ = nullptr;
@@ -9613,6 +10484,9 @@ class GpuBaDeviceContext {
   std::vector<uint32_t> native_camera_slots_;
   std::vector<uint32_t> native_image_slots_;
   std::vector<uint32_t> native_point_slots_;
+  std::vector<uint32_t> variable_image_slots_;
+  std::vector<uint8_t> variable_image_translation_masks_;
+  std::vector<uint32_t> variable_point_slots_;
 };
 
 static_assert(!std::is_copy_constructible<GpuBaDeviceContext>::value,
@@ -9664,9 +10538,38 @@ struct PointStaticLayoutEntry {
 
 }  // namespace
 
-namespace {
+DeviceBaProblemStoreHandle::DeviceBaProblemStoreHandle(
+    const uint64_t owner_epoch)
+    : owner_epoch_(owner_epoch),
+      state_(std::make_shared<DeviceBaProblemStoreState>()) {}
 
-}  // namespace
+DeviceBaProblemStoreHandle::~DeviceBaProblemStoreHandle() = default;
+
+std::shared_ptr<DeviceBaProblemStoreHandle> CreateDeviceBaProblemStore(
+    const uint64_t owner_epoch) {
+  if (owner_epoch == 0) return nullptr;
+  try {
+    return std::shared_ptr<DeviceBaProblemStoreHandle>(
+        new DeviceBaProblemStoreHandle(owner_epoch));
+  } catch (const std::bad_alloc&) {
+    return nullptr;
+  }
+}
+
+bool FailNextDeviceBaProblemStorePublishForTesting(
+    const std::shared_ptr<DeviceBaProblemStoreHandle>& store,
+    std::string* error) {
+  if (error == nullptr || store == nullptr || store->state_ == nullptr) {
+    if (error != nullptr) *error = "invalid DeviceBaProblemStore test handle";
+    return false;
+  }
+  const auto state = std::static_pointer_cast<DeviceBaProblemStoreState>(
+      store->state_);
+  std::lock_guard<std::mutex> lock(state->mutex);
+  ++state->fail_next_publish_for_testing;
+  error->clear();
+  return true;
+}
 
 // Host-only immutable solver preparation. It deliberately contains no CUDA
 // pointer, state slot, linearization, scaling, Hessian, Schur, factor, or delta.
@@ -9742,6 +10645,26 @@ struct LegacyKernelInputBundle::Impl {
   bool cost_layout_ready = false;
   bool layer_b_ready = false;
   bool layer_c_ready = false;
+};
+
+struct NativeIndexedKernelInput {
+  std::vector<DeviceIndexedVisualBinding> visual_bindings;
+  std::vector<DeviceLidarStaticInput> lidar_static;
+  std::vector<DeviceCameraEntityState> cameras;
+  std::vector<DeviceImageEntityState> images;
+  std::vector<DevicePointEntityState> points;
+  std::vector<uint32_t> camera_slots;
+  std::vector<uint32_t> image_slots;
+  std::vector<uint32_t> point_slots;
+  std::vector<uint32_t> visual_image_slots;
+  std::vector<uint32_t> visual_point_slots;
+  std::vector<uint32_t> lidar_point_slots;
+  CostLayout cost_layout;
+  LayerBTopology layer_b_topology;
+  LayerCTopology layer_c_topology;
+  NativeHostSolveViewIdentity identity;
+  std::shared_ptr<DeviceBaProblemStoreState> device_store_state;
+  BaSolveResult::Runtime runtime;
 };
 
 LegacyKernelInputBundle::LegacyKernelInputBundle() : impl_(new Impl()) {}
@@ -10244,6 +11167,407 @@ bool BuildLegacyKernelInputBundle(const NativeHostSolveView& view,
          BuildLayerCTopology(view, output, error);
 }
 
+bool BuildIndexedLayerBExecutionPlan(
+    const NativeIndexedKernelInput& indexed,
+    const CudaHessianAssemblyBackend backend,
+    const uint32_t requested_segment_size,
+    LayerBTopology* topology,
+    std::string* error) {
+  (void)indexed;
+  if (backend != CudaHessianAssemblyBackend::kObservationAtomic &&
+      backend != CudaHessianAssemblyBackend::kObservationSegmented) {
+    return true;
+  }
+  if (backend == CudaHessianAssemblyBackend::kObservationAtomic) {
+    // Indexed production does not select the atomic backend. Fail closed
+    // instead of silently manufacturing a second execution-plan contract.
+    *error = "native indexed observation_atomic is not supported";
+    return false;
+  }
+  const uint32_t segment_size =
+      ResolveHessianSegmentSize(requested_segment_size);
+  if (segment_size != 16 && segment_size != 32 && segment_size != 64) {
+    *error = "native indexed Hessian segment size is invalid";
+    return false;
+  }
+  topology->hessian_segment_size = segment_size;
+  const auto build_segments = [&](const auto& metadata,
+                                  std::vector<DeviceAssemblySegment>* segments,
+                                  std::vector<DeviceAssemblyTargetRange>* ranges) {
+    ranges->resize(metadata.size());
+    for (size_t target = 0; target < metadata.size(); ++target) {
+      DeviceAssemblyTargetRange range;
+      range.segment_begin = static_cast<uint32_t>(segments->size());
+      for (uint32_t cursor = metadata[target].adjacency_begin;
+           cursor < metadata[target].adjacency_end;) {
+        const uint32_t count =
+            std::min(segment_size, metadata[target].adjacency_end - cursor);
+        segments->push_back({static_cast<uint32_t>(target), cursor,
+                             cursor + count});
+        cursor += count;
+      }
+      range.segment_end = static_cast<uint32_t>(segments->size());
+      (*ranges)[target] = range;
+    }
+    return true;
+  };
+  if (!build_segments(topology->poses, &topology->pose_segments,
+                      &topology->pose_segment_ranges)) {
+    return false;
+  }
+  topology->point_segment_ranges.resize(topology->points.size());
+  for (size_t target = 0; target < topology->points.size(); ++target) {
+    const DevicePointMeta& point = topology->points[target];
+    DeviceAssemblyTargetRange range;
+    range.segment_begin = static_cast<uint32_t>(topology->point_segments.size());
+    const uint32_t count = point.adjacency_end - point.adjacency_begin;
+    if (count <= segment_size) {
+      topology->point_direct_indices.push_back(static_cast<uint32_t>(target));
+    } else {
+      for (uint32_t cursor = point.adjacency_begin;
+           cursor < point.adjacency_end;) {
+        const uint32_t item_count =
+            std::min(segment_size, point.adjacency_end - cursor);
+        topology->point_segments.push_back(
+            {static_cast<uint32_t>(target), cursor, cursor + item_count});
+        cursor += item_count;
+      }
+    }
+    range.segment_end = static_cast<uint32_t>(topology->point_segments.size());
+    topology->point_segment_ranges[target] = range;
+  }
+  return true;
+}
+
+bool BuildNativeIndexedKernelInput(const NativeHostSolveView& view,
+                                   const ActiveStateBuffer& state,
+                                   NativeIndexedKernelInput* output,
+                                   std::string* error) {
+  if (output == nullptr || error == nullptr ||
+      !ValidateNativeHostSolveView(view, state, error)) {
+    return false;
+  }
+  const auto start = std::chrono::steady_clock::now();
+  NativeIndexedKernelInput result;
+  result.identity = view.identity;
+  const auto graph_cameras = view.catalog.cameras();
+  const auto graph_images = view.catalog.images();
+  const auto graph_points = view.catalog.points();
+  const auto graph_observations = view.catalog.observations();
+  std::vector<int32_t> camera_entity(graph_cameras.size, -1);
+  std::vector<int32_t> image_entity(graph_images.size, -1);
+  std::vector<int32_t> point_entity(graph_points.size, -1);
+  std::vector<int32_t> camera_state(graph_cameras.size, -1);
+  std::vector<int32_t> image_state(graph_images.size, -1);
+  std::vector<int32_t> point_state(graph_points.size, -1);
+  for (size_t i = 0; i < state.cameras.size(); ++i) {
+    if (state.cameras[i].camera_slot >= camera_state.size() ||
+        camera_state[state.cameras[i].camera_slot] != -1 ||
+        state.cameras[i].state_generation != state.state_generation) {
+      *error = "native indexed camera state identity is invalid";
+      return false;
+    }
+    camera_state[state.cameras[i].camera_slot] = static_cast<int32_t>(i);
+  }
+  for (size_t i = 0; i < state.images.size(); ++i) {
+    if (state.images[i].image_slot >= image_state.size() ||
+        image_state[state.images[i].image_slot] != -1 ||
+        state.images[i].state_generation != state.state_generation) {
+      *error = "native indexed image state identity is invalid";
+      return false;
+    }
+    image_state[state.images[i].image_slot] = static_cast<int32_t>(i);
+  }
+  for (size_t i = 0; i < state.points.size(); ++i) {
+    if (state.points[i].point_slot >= point_state.size() ||
+        point_state[state.points[i].point_slot] != -1 ||
+        state.points[i].state_generation != state.state_generation) {
+      *error = "native indexed point state identity is invalid";
+      return false;
+    }
+    point_state[state.points[i].point_slot] = static_cast<int32_t>(i);
+  }
+  result.camera_slots = view.active_camera_slots;
+  result.image_slots = view.active_image_slots;
+  result.image_slots.insert(result.image_slots.end(),
+                            view.boundary_image_slots.begin(),
+                            view.boundary_image_slots.end());
+  result.point_slots = view.active_point_slots;
+  result.cameras.resize(result.camera_slots.size());
+  result.images.resize(result.image_slots.size());
+  result.points.resize(result.point_slots.size());
+  for (size_t i = 0; i < result.camera_slots.size(); ++i) {
+    const uint32_t slot = result.camera_slots[i];
+    if (slot >= camera_state.size() || camera_state[slot] < 0 ||
+        state.cameras[camera_state[slot]].parameters.size() != 8) {
+      *error = "native indexed camera entity is incomplete";
+      return false;
+    }
+    camera_entity[slot] = static_cast<int32_t>(i);
+    std::copy(state.cameras[camera_state[slot]].parameters.begin(),
+              state.cameras[camera_state[slot]].parameters.end(),
+              result.cameras[i].params);
+  }
+  for (size_t i = 0; i < result.image_slots.size(); ++i) {
+    const uint32_t slot = result.image_slots[i];
+    if (slot >= image_state.size() || image_state[slot] < 0) {
+      *error = "native indexed image entity is incomplete";
+      return false;
+    }
+    image_entity[slot] = static_cast<int32_t>(i);
+    const DenseImageState& value = state.images[image_state[slot]];
+    std::copy(value.quaternion.begin(), value.quaternion.end(),
+              result.images[i].quaternion);
+    std::copy(value.translation.begin(), value.translation.end(),
+              result.images[i].translation);
+  }
+  for (size_t i = 0; i < result.point_slots.size(); ++i) {
+    const uint32_t slot = result.point_slots[i];
+    if (slot >= point_state.size() || point_state[slot] < 0) {
+      *error = "native indexed point entity is incomplete";
+      return false;
+    }
+    point_entity[slot] = static_cast<int32_t>(i);
+    const DensePointState& value = state.points[point_state[slot]];
+    std::copy(value.xyz.begin(), value.xyz.end(), result.points[i].xyz);
+  }
+  std::vector<uint32_t> visual_output(view.residual_ordinals.size(),
+                                      kBaGraphInvalidSlot);
+  std::vector<uint32_t> lidar_output(view.residual_ordinals.size(),
+                                     kBaGraphInvalidSlot);
+  std::unordered_map<uint32_t, const LidarConstraintRecord*> lidar_by_slot;
+  for (const LidarConstraintRecord& value : view.lidar.constraints)
+    lidar_by_slot.emplace(value.constraint_slot, &value);
+  for (const ResidualOrdinal& ordinal : view.residual_ordinals) {
+    if (ordinal.execution_ordinal >= view.residual_ordinals.size()) {
+      *error = "native indexed residual ordinal is invalid";
+      return false;
+    }
+    if (ordinal.kind == ResidualKind::kVisual) {
+      if (ordinal.source_slot >= graph_observations.size) {
+        *error = "native indexed visual slot is invalid";
+        return false;
+      }
+      const HostBaObservationSlot& observation =
+          graph_observations[ordinal.source_slot];
+      if (!observation.header.alive ||
+          ordinal.physical_identity != observation.source_identity ||
+          observation.image_slot >= image_entity.size() ||
+          observation.point_slot >= point_entity.size() ||
+          image_entity[observation.image_slot] < 0 ||
+          point_entity[observation.point_slot] < 0 ||
+          observation.image_slot >= graph_images.size ||
+          graph_images[observation.image_slot].camera_slot >=
+              camera_entity.size() ||
+          camera_entity[graph_images[observation.image_slot].camera_slot] < 0) {
+        *error = "native indexed visual binding is incomplete";
+        return false;
+      }
+      DeviceIndexedVisualBinding binding{};
+      binding.source_index = ordinal.source_insertion_index;
+      binding.physical_identity = ordinal.physical_identity;
+      binding.observation_slot = ordinal.source_slot;
+      binding.image_entity_index = image_entity[observation.image_slot];
+      binding.point_entity_index = point_entity[observation.point_slot];
+      binding.camera_entity_index =
+          camera_entity[graph_images[observation.image_slot].camera_slot];
+      visual_output[ordinal.execution_ordinal] =
+          static_cast<uint32_t>(result.visual_bindings.size());
+      result.visual_bindings.push_back(binding);
+      result.visual_image_slots.push_back(observation.image_slot);
+      result.visual_point_slots.push_back(observation.point_slot);
+    } else {
+      const auto found = lidar_by_slot.find(ordinal.source_slot);
+      if (found == lidar_by_slot.end() ||
+          ordinal.physical_identity != found->second->physical_identity ||
+          found->second->point_slot >= point_entity.size() ||
+          point_entity[found->second->point_slot] < 0) {
+        *error = "native indexed LiDAR binding is incomplete";
+        return false;
+      }
+      DeviceLidarStaticInput value{};
+      value.source_index = ordinal.source_insertion_index;
+      value.point3D_id = graph_points[found->second->point_slot].point3D_id;
+      value.point_entity_index = point_entity[found->second->point_slot];
+      std::copy(found->second->plane.begin(), found->second->plane.end(),
+                value.plane);
+      value.weight = found->second->weight;
+      value.mode = static_cast<uint8_t>(view.config.lidar_residual_mode);
+      value.near_zero_threshold = view.config.lidar_near_zero_threshold;
+      lidar_output[ordinal.execution_ordinal] =
+          static_cast<uint32_t>(result.lidar_static.size());
+      result.lidar_static.push_back(value);
+      result.lidar_point_slots.push_back(found->second->point_slot);
+    }
+  }
+  result.cost_layout.residual_order = view.config.residual_order;
+  result.cost_layout.visual_count = result.visual_bindings.size();
+  result.cost_layout.lidar_count = result.lidar_static.size();
+  uint64_t layout_id = 1469598103934665603ull;
+  for (const ResidualOrdinal& ordinal : view.residual_ordinals) {
+    DeviceCostEntry entry{};
+    entry.residual_kind = ordinal.kind == ResidualKind::kVisual ? 0 : 1;
+    entry.output_index = entry.residual_kind == 0
+        ? visual_output[ordinal.execution_ordinal]
+        : lidar_output[ordinal.execution_ordinal];
+    result.cost_layout.entries.push_back(entry);
+    HashWord(&layout_id, ordinal.source_insertion_index);
+    HashWord(&layout_id, ordinal.physical_identity);
+    HashWord(&layout_id, entry.residual_kind);
+    HashWord(&layout_id, entry.output_index);
+  }
+  result.cost_layout.layout_id = layout_id == 0 ? 1 : layout_id;
+
+  std::vector<const ImageFixedPolicyResult*> variable_images;
+  std::vector<const PointFixedPolicyResult*> variable_points;
+  for (const ImageFixedPolicyResult& value : view.fixed.images)
+    if (!value.pose_constant) variable_images.push_back(&value);
+  for (const PointFixedPolicyResult& value : view.fixed.points)
+    if (!value.constant) variable_points.push_back(&value);
+  if (view.config.residual_order == CudaResidualOrder::kCanonical) {
+    std::sort(variable_images.begin(), variable_images.end(),
+              [&](const auto* a, const auto* b) {
+                return graph_images[a->image_slot].image_id <
+                       graph_images[b->image_slot].image_id;
+              });
+    std::sort(variable_points.begin(), variable_points.end(),
+              [&](const auto* a, const auto* b) {
+                return graph_points[a->point_slot].point3D_id <
+                       graph_points[b->point_slot].point3D_id;
+              });
+  } else {
+    std::unordered_map<uint32_t, const ImageFixedPolicyResult*> image_policy;
+    std::unordered_map<uint32_t, const PointFixedPolicyResult*> point_policy;
+    for (const auto& value : view.fixed.images)
+      image_policy.emplace(value.image_slot, &value);
+    for (const auto& value : view.fixed.points)
+      point_policy.emplace(value.point_slot, &value);
+    variable_images.clear();
+    variable_points.clear();
+    for (const ParameterOrdinal& parameter : view.parameter_ordinals) {
+      if (parameter.constant) continue;
+      if (parameter.kind == ParameterKind::kQuaternion) {
+        const auto found = image_policy.find(parameter.entity_slot);
+        if (found != image_policy.end() &&
+            std::find(variable_images.begin(), variable_images.end(),
+                      found->second) == variable_images.end())
+          variable_images.push_back(found->second);
+      } else if (parameter.kind == ParameterKind::kPoint3D) {
+        const auto found = point_policy.find(parameter.entity_slot);
+        if (found != point_policy.end() &&
+            std::find(variable_points.begin(), variable_points.end(),
+                      found->second) == variable_points.end())
+          variable_points.push_back(found->second);
+      }
+    }
+  }
+  std::vector<int32_t> pose_by_image(graph_images.size, -1);
+  std::vector<int32_t> variable_point_by_slot(graph_points.size, -1);
+  std::vector<std::vector<uint32_t>> pose_entries(variable_images.size());
+  std::vector<std::vector<DevicePointAdjacency>> point_entries(
+      variable_points.size());
+  result.layer_b_topology.poses.resize(variable_images.size());
+  for (size_t i = 0; i < variable_images.size(); ++i) {
+    const auto& policy = *variable_images[i];
+    DevicePoseMeta& meta = result.layer_b_topology.poses[i];
+    meta.image_id = graph_images[policy.image_slot].image_id;
+    meta.dimension = 3;
+    for (int32_t& index : meta.free_translation_indices) index = -1;
+    for (int32_t component = 0; component < 3; ++component) {
+      if ((policy.translation_subset_mask & (1u << component)) == 0)
+        meta.free_translation_indices[meta.dimension++ - 3] = component;
+    }
+    pose_by_image[policy.image_slot] = static_cast<int32_t>(i);
+  }
+  result.layer_b_topology.points.resize(variable_points.size());
+  for (size_t i = 0; i < variable_points.size(); ++i) {
+    result.layer_b_topology.points[i].point3D_id =
+        graph_points[variable_points[i]->point_slot].point3D_id;
+    variable_point_by_slot[variable_points[i]->point_slot] =
+        static_cast<int32_t>(i);
+  }
+  std::map<std::pair<uint32_t, uint32_t>, std::vector<uint32_t>> edge_entries;
+  for (size_t visual_index = 0; visual_index < result.visual_bindings.size();
+       ++visual_index) {
+    const uint32_t image_slot = result.visual_image_slots[visual_index];
+    const uint32_t point_slot = result.visual_point_slots[visual_index];
+    const int32_t pose = pose_by_image[image_slot];
+    const int32_t point = variable_point_by_slot[point_slot];
+    if (pose >= 0) pose_entries[pose].push_back(visual_index);
+    if (pose >= 0 && point >= 0)
+      edge_entries[{static_cast<uint32_t>(pose),
+                    static_cast<uint32_t>(point)}]
+          .push_back(visual_index);
+  }
+  for (const DeviceCostEntry& entry : result.cost_layout.entries) {
+    const uint32_t point_slot = entry.residual_kind == 0
+        ? result.visual_point_slots[entry.output_index]
+        : result.lidar_point_slots[entry.output_index];
+    const int32_t point = variable_point_by_slot[point_slot];
+    if (point >= 0)
+      point_entries[point].push_back({entry.output_index, entry.residual_kind});
+  }
+  for (size_t i = 0; i < result.layer_b_topology.poses.size(); ++i) {
+    auto& meta = result.layer_b_topology.poses[i];
+    meta.adjacency_begin = result.layer_b_topology.pose_adjacency.size();
+    result.layer_b_topology.pose_adjacency.insert(
+        result.layer_b_topology.pose_adjacency.end(), pose_entries[i].begin(),
+        pose_entries[i].end());
+    meta.adjacency_end = result.layer_b_topology.pose_adjacency.size();
+  }
+  for (size_t i = 0; i < result.layer_b_topology.points.size(); ++i) {
+    auto& meta = result.layer_b_topology.points[i];
+    meta.adjacency_begin = result.layer_b_topology.point_adjacency.size();
+    result.layer_b_topology.point_adjacency.insert(
+        result.layer_b_topology.point_adjacency.end(),
+        point_entries[i].begin(), point_entries[i].end());
+    meta.adjacency_end = result.layer_b_topology.point_adjacency.size();
+  }
+  for (const auto& value : edge_entries) {
+    DeviceEdgeMeta edge{};
+    edge.pose_index = value.first.first;
+    edge.point_index = value.first.second;
+    edge.pose_dimension =
+        result.layer_b_topology.poses[edge.pose_index].dimension;
+    edge.adjacency_begin = result.layer_b_topology.edge_adjacency.size();
+    result.layer_b_topology.edge_adjacency.insert(
+        result.layer_b_topology.edge_adjacency.end(), value.second.begin(),
+        value.second.end());
+    edge.adjacency_end = result.layer_b_topology.edge_adjacency.size();
+    result.layer_b_topology.edges.push_back(edge);
+  }
+  if (!BuildIndexedLayerBExecutionPlan(
+          result, view.config.hessian_backend,
+          view.config.hessian_segment_size, &result.layer_b_topology, error) ||
+      !BuildLayerCTopology(result.layer_b_topology,
+                           view.config.pair_chunk_limit_bytes,
+                           &result.layer_c_topology, error) ||
+      (view.config.schur_backend ==
+           CudaSchurContributionBackend::kSegmentedTransformed &&
+       !BuildLayerCSegmentPlan(view.config.schur_segment_size,
+                               &result.layer_c_topology, error))) {
+    return false;
+  }
+  result.runtime.indexed_plan_build_calls = 1;
+  result.runtime.indexed_visual_binding_bytes =
+      result.visual_bindings.size() * sizeof(DeviceIndexedVisualBinding);
+  result.runtime.real_cost_layout_entries = result.cost_layout.entries.size();
+  result.runtime.real_pose_adjacency_entries =
+      result.layer_b_topology.pose_adjacency.size();
+  result.runtime.real_point_adjacency_entries =
+      result.layer_b_topology.point_adjacency.size();
+  result.runtime.real_edge_adjacency_entries =
+      result.layer_b_topology.edge_adjacency.size();
+  result.runtime.real_schur_pair_contributions =
+      result.layer_c_topology.pair_contributions.size();
+  result.runtime.indexed_packing_milliseconds =
+      std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - start)
+          .count();
+  *output = std::move(result);
+  return true;
+}
+
 bool CopyActiveStateForTesting(const NativeHostSolveView& view,
                                const ActiveStateBuffer& state,
                                DenseActiveState* output,
@@ -10278,16 +11602,13 @@ class GpuBaSolveContext {
   bool InitializeNative(
       const NativeHostSolveView& view,
       const ActiveStateBuffer& state,
-      const LegacyKernelInputBundle::Impl& native,
+      const NativeIndexedKernelInput& native,
       const CudaLayerBOptions& options,
       const uint64_t solve_generation,
       const HotKernelImplementation hot_kernel_implementation,
       CudaFullLmRuntimeInfo* runtime,
       std::string* error) {
     if (initialized_ || error == nullptr || runtime == nullptr ||
-        !native.layer_a_ready || !native.static_layout_ready ||
-        !native.cost_layout_ready || !native.layer_b_ready ||
-        !native.layer_c_ready || !native.identity_valid ||
         !SameNativeIdentity(native.identity, view.identity) ||
         !ValidateNativeHostSolveView(view, state, error)) {
       if (error != nullptr && error->empty())
@@ -11287,7 +12608,7 @@ class GpuBaSolveContext {
   // Non-owning immutable borrow. PreparedHostSolveView owns the shared data
   // for the complete synchronous RunCustomCudaSolve call.
   const PreparedHostSolveViewData* borrowed_prepared_host_ = nullptr;
-  const LegacyKernelInputBundle::Impl* borrowed_native_ = nullptr;
+  const NativeIndexedKernelInput* borrowed_native_ = nullptr;
   CudaHessianAssemblyBackend native_hessian_backend_ =
       CudaHessianAssemblyBackend::kCompatibilityDefault;
   std::vector<CameraStaticLayoutEntry> camera_layout_;
@@ -11759,7 +13080,7 @@ bool GpuBaDeviceContext::Initialize(
 bool GpuBaDeviceContext::InitializeNative(
     const NativeHostSolveView& view,
     const ActiveStateBuffer& initial_state,
-    const LegacyKernelInputBundle::Impl& native,
+    const NativeIndexedKernelInput& native,
     const CudaLayerBOptions& options,
     const uint64_t solve_generation,
     const uint64_t topology_generation,
@@ -11771,7 +13092,7 @@ bool GpuBaDeviceContext::InitializeNative(
     CudaFullLmRuntimeInfo* runtime,
     std::string* error) {
   return InitializeImpl(
-      nullptr, &view, &initial_state, &native, native.packed,
+      nullptr, &view, &initial_state, &native, PackedLayerAState(),
       native.cost_layout, native.layer_b_topology, native.layer_c_topology,
       options, solve_generation, topology_generation, true, true,
       hot_kernel_implementation, hessian_assembly_backend,
@@ -11783,7 +13104,7 @@ bool GpuBaDeviceContext::InitializeImpl(
     const Snapshot* legacy_initial_snapshot,
     const NativeHostSolveView* native_view,
     const ActiveStateBuffer* native_initial_state,
-    const LegacyKernelInputBundle::Impl* native,
+    const NativeIndexedKernelInput* native,
     const PackedLayerAState& initial,
     const CostLayout& cost_layout,
     const LayerBTopology& layer_b,
@@ -11830,6 +13151,7 @@ bool GpuBaDeviceContext::InitializeImpl(
       execution_profile_, CudaExecutionProfile::kCompactLayerA);
   compact_control_enabled_ = device_control_enabled_ && ProfileAtLeast(
       execution_profile_, CudaExecutionProfile::kCompactControl);
+  native_indexed_enabled_ = native_initialization;
   const auto fits_uint32 = [](const size_t count) {
     return count <= std::numeric_limits<uint32_t>::max();
   };
@@ -11867,6 +13189,13 @@ bool GpuBaDeviceContext::InitializeImpl(
   if (arithmetic_precision_ != CudaArithmeticPrecision::kFp64 &&
       !mixed_precision) {
     *error = "persistent device context precision is unsupported";
+    initializing_ = false;
+    return false;
+  }
+  if (native_initialization &&
+      (!runtime_pool_enabled_ || native->device_store_state == nullptr)) {
+    *error = "native indexed CUDA requires a mapping-owned device store and "
+             "RuntimePool CUDA resources";
     initializing_ = false;
     return false;
   }
@@ -11914,8 +13243,10 @@ bool GpuBaDeviceContext::InitializeImpl(
   solve_generation_ = solve_generation;
   topology_generation_ = topology_generation;
   layout_id_ = cost_layout.layout_id;
-  visual_count_ = initial.visual.size();
-  lidar_count_ = initial.lidar.size();
+  visual_count_ = native_initialization ? native->visual_bindings.size()
+                                        : initial.visual.size();
+  lidar_count_ = native_initialization ? native->lidar_static.size()
+                                       : initial.lidar.size();
   pose_count_ = layer_b.poses.size();
   point_count_ = layer_b.points.size();
   edge_count_ = layer_b.edges.size();
@@ -12099,6 +13430,18 @@ bool GpuBaDeviceContext::InitializeImpl(
     HashWord(&pooled_identity, pooled.key.context);
     context_identity_ = pooled_identity == 0 ? 1 : pooled_identity;
     runtime_->persistent_device.context_identity = context_identity_;
+    if (native_initialization &&
+        !EnsureDeviceBaProblemStore(
+            &pooled, native->device_store_state, native_view->catalog,
+            arithmetic_precision_, options.memory_budget_override_bytes,
+            &runtime_->persistent_device,
+            &native_device_catalog_generation_,
+            &native_device_catalog_view_,
+            &native_device_catalog_resident_bytes_, error)) {
+      initializing_ = false;
+      Close(nullptr);
+      return false;
+    }
     if (!runtime_pool_lease_.hot) {
       runtime_->persistent_device.init_stream_create_count = 1;
       runtime_->persistent_device.init_event_create_count = events_.size();
@@ -12206,7 +13549,10 @@ bool GpuBaDeviceContext::InitializeImpl(
 
   const auto allocate_main = [&]() {
     return
-      AllocatePersistent(&d_visual_static_, visual_count_, error) &&
+      AllocatePersistent(&d_visual_static_,
+                         native_initialization ? 0 : visual_count_, error) &&
+      AllocatePersistent(&d_indexed_visual_bindings_,
+                         native_initialization ? visual_count_ : 0, error) &&
       AllocatePersistent(&d_visual_dynamic_,
                          device_state_enabled_ ? 0 : visual_count_, error) &&
       AllocatePersistent(&d_lidar_static_, lidar_count_, error) &&
@@ -12218,6 +13564,10 @@ bool GpuBaDeviceContext::InitializeImpl(
       AllocatePersistent(&d_point_update_meta_, point_entity_count_, error) &&
       AllocatePersistent(&d_pose_image_entity_indices_, pose_count_, error) &&
       AllocatePersistent(&d_point_entity_indices_, point_count_, error) &&
+      AllocatePersistent(&d_variable_image_download_,
+                         native_initialization ? pose_count_ : 0, error) &&
+      AllocatePersistent(&d_variable_point_download_,
+                         native_initialization ? point_count_ : 0, error) &&
       AllocatePersistent(&d_state_update_status_, 1, error) &&
       AllocatePersistent(&d_cost_order_, cost_count_, error) &&
       AllocatePersistent(&d_pose_meta_, pose_count_, error) &&
@@ -12422,6 +13772,8 @@ bool GpuBaDeviceContext::InitializeImpl(
     if (runtime_pool_lease_.entry == nullptr ||
         !EnsureRuntimePoolArena(&runtime_pool_lease_,
                                 initial_arena_requirement,
+                                native_device_catalog_resident_bytes_,
+                                options.memory_budget_override_bytes,
                                 &runtime_->persistent_device, error)) {
       initializing_ = false;
       Close(nullptr);
@@ -12448,8 +13800,12 @@ bool GpuBaDeviceContext::InitializeImpl(
     arena_planning_ = false;
     if (!allocated ||
         (options.memory_budget_override_bytes != 0 &&
-         required_arena_bytes > options.memory_budget_override_bytes) ||
+         (required_arena_bytes > options.memory_budget_override_bytes ||
+          native_device_catalog_resident_bytes_ >
+              options.memory_budget_override_bytes - required_arena_bytes)) ||
         !EnsureRuntimePoolArena(&runtime_pool_lease_, required_arena_bytes,
+                                native_device_catalog_resident_bytes_,
+                                options.memory_budget_override_bytes,
                                 &runtime_->persistent_device, error)) {
       if (error->empty())
         *error = "INSUFFICIENT_GPU_MEMORY for RuntimePool arena budget";
@@ -12531,7 +13887,8 @@ bool GpuBaDeviceContext::InitializeImpl(
         runtime_pool_lease_.entry->arena_capacity;
     runtime_->persistent_device.peak_resident_bytes = std::max(
         runtime_->persistent_device.peak_resident_bytes,
-        runtime_pool_lease_.entry->arena_capacity);
+        SaturatingAdd(runtime_pool_lease_.entry->arena_capacity,
+                      native_device_catalog_resident_bytes_));
     if (indexed_catalog_bound_) {
       runtime_->persistent_device.arena_slice_count = SaturatingAdd(
           runtime_->persistent_device.arena_slice_count, 6);
@@ -12658,29 +14015,23 @@ bool GpuBaDeviceContext::InitializeImpl(
     const auto graph_cameras = native_view->catalog.cameras();
     const auto graph_images = native_view->catalog.images();
     const auto graph_points = native_view->catalog.points();
-    std::unordered_map<uint32_t, const DenseCameraState*> camera_state;
-    std::unordered_map<uint32_t, const DenseImageState*> image_state;
-    std::unordered_map<uint32_t, const DensePointState*> point_state;
-    if (!BuildNativeStateLookup(native_initial_state->cameras,
-                                native_initial_state->state_generation,
-                                &camera_state, error) ||
-        !BuildNativeStateLookup(native_initial_state->images,
-                                native_initial_state->state_generation,
-                                &image_state, error) ||
-        !BuildNativeStateLookup(native_initial_state->points,
-                                native_initial_state->state_generation,
-                                &point_state, error)) {
+    native_camera_slots_ = native->camera_slots;
+    native_image_slots_ = native->image_slots;
+    native_point_slots_ = native->point_slots;
+    if (native->cameras.size() != native_camera_slots_.size() ||
+        native->images.size() != native_image_slots_.size() ||
+        native->points.size() != native_point_slots_.size()) {
+      *error = "native indexed entity storage count mismatch";
       initializing_ = false;
       Close(nullptr);
       return false;
     }
-    native_camera_slots_ = native->camera_slots;
-    native_image_slots_ = native->image_slots;
-    native_point_slots_ = native->point_slots;
+    host_camera_entities_ = native->cameras;
+    host_image_entities_ = native->images;
+    host_point_entities_ = native->points;
     for (size_t i = 0; i < native_image_slots_.size(); ++i) {
       const uint32_t slot = native_image_slots_[i];
-      const auto state = image_state.find(slot);
-      if (slot >= graph_images.size || state == image_state.end() ||
+      if (slot >= graph_images.size ||
           !image_indices.emplace(graph_images[slot].image_id,
                                  static_cast<uint32_t>(i)).second) {
         *error = "native device image entity layout is invalid";
@@ -12688,17 +14039,10 @@ bool GpuBaDeviceContext::InitializeImpl(
         Close(nullptr);
         return false;
       }
-      std::copy(state->second->quaternion.begin(),
-                state->second->quaternion.end(),
-                host_image_entities_[i].quaternion);
-      std::copy(state->second->translation.begin(),
-                state->second->translation.end(),
-                host_image_entities_[i].translation);
     }
     for (size_t i = 0; i < native_point_slots_.size(); ++i) {
       const uint32_t slot = native_point_slots_[i];
-      const auto state = point_state.find(slot);
-      if (slot >= graph_points.size || state == point_state.end() ||
+      if (slot >= graph_points.size ||
           !point_indices.emplace(graph_points[slot].point3D_id,
                                  static_cast<uint32_t>(i)).second) {
         *error = "native device point entity layout is invalid";
@@ -12706,15 +14050,11 @@ bool GpuBaDeviceContext::InitializeImpl(
         Close(nullptr);
         return false;
       }
-      std::copy(state->second->xyz.begin(), state->second->xyz.end(),
-                host_point_entities_[i].xyz);
     }
     for (size_t i = 0; i < native_camera_slots_.size(); ++i) {
       const uint32_t slot = native_camera_slots_[i];
-      const auto state = camera_state.find(slot);
-      if (slot >= graph_cameras.size || state == camera_state.end() ||
+      if (slot >= graph_cameras.size ||
           graph_cameras[slot].model_id != kOpenCvcCameraModelId ||
-          state->second->parameters.size() != 8 ||
           !camera_indices.emplace(graph_cameras[slot].camera_id,
                                   static_cast<uint32_t>(i)).second) {
         *error = "native device camera entity layout is invalid";
@@ -12722,12 +14062,9 @@ bool GpuBaDeviceContext::InitializeImpl(
         Close(nullptr);
         return false;
       }
-      std::copy(state->second->parameters.begin(),
-                state->second->parameters.end(),
-                host_camera_entities_[i].params);
     }
   }
-  for (size_t i = 0; i < visual_count_; ++i) {
+  for (size_t i = 0; !native_initialization && i < visual_count_; ++i) {
     visual_static[i].source_index = initial.visual[i].source_index;
     visual_static[i].image_id = initial.visual[i].image_id;
     visual_static[i].point3D_id = initial.visual[i].point3D_id;
@@ -12739,11 +14076,8 @@ bool GpuBaDeviceContext::InitializeImpl(
       Close(nullptr);
       return false;
     }
-    const uint32_t camera_id = native_initialization
-        ? native_view->catalog.cameras()[
-              native->image_camera_slots[image_it->second]]
-              .camera_id
-        : legacy_initial_snapshot->images[image_it->second].camera_id;
+    const uint32_t camera_id =
+        legacy_initial_snapshot->images[image_it->second].camera_id;
     const auto camera_it = camera_indices.find(camera_id);
     if (camera_it == camera_indices.end()) {
       *error = "device-state visual binding references a missing camera";
@@ -12757,8 +14091,10 @@ bool GpuBaDeviceContext::InitializeImpl(
     visual_static[i].observation[0] = initial.visual[i].observation[0];
     visual_static[i].observation[1] = initial.visual[i].observation[1];
   }
-  std::vector<DeviceLidarStaticInput> lidar_static(lidar_count_);
-  for (size_t i = 0; i < lidar_count_; ++i) {
+  std::vector<DeviceLidarStaticInput> lidar_static =
+      native_initialization ? native->lidar_static
+                            : std::vector<DeviceLidarStaticInput>(lidar_count_);
+  for (size_t i = 0; !native_initialization && i < lidar_count_; ++i) {
     lidar_static[i].source_index = initial.lidar[i].source_index;
     lidar_static[i].point3D_id = initial.lidar[i].point3D_id;
     const auto point_it = point_indices.find(initial.lidar[i].point3D_id);
@@ -12783,6 +14119,10 @@ bool GpuBaDeviceContext::InitializeImpl(
     for (int32_t& value : meta.free_translation_indices) value = -1;
   }
   std::vector<uint32_t> pose_image_indices(pose_count_);
+  if (native_initialization) {
+    variable_image_slots_.resize(pose_count_);
+    variable_image_translation_masks_.resize(pose_count_);
+  }
   for (size_t i = 0; i < pose_count_; ++i) {
     const auto image_it = image_indices.find(layer_b.poses[i].image_id);
     if (image_it == image_indices.end() || i >= layer_c.poses.size() ||
@@ -12796,6 +14136,19 @@ bool GpuBaDeviceContext::InitializeImpl(
       return false;
     }
     pose_image_indices[i] = image_it->second;
+    if (native_initialization) {
+      variable_image_slots_[i] = native_image_slots_[image_it->second];
+      uint8_t variable_mask = 0;
+      for (uint32_t component = 3; component < layer_b.poses[i].dimension;
+           ++component) {
+        const int32_t translation =
+            layer_b.poses[i].free_translation_indices[component - 3];
+        if (translation >= 0 && translation < 3)
+          variable_mask |= static_cast<uint8_t>(1u << translation);
+      }
+      variable_image_translation_masks_[i] =
+          static_cast<uint8_t>((~variable_mask) & 0x7u);
+    }
     DeviceImageUpdateMeta& meta = image_update[image_it->second];
     meta.variable_pose_index = static_cast<int32_t>(i);
     meta.delta_offset = layer_c.poses[i].offset;
@@ -12806,6 +14159,7 @@ bool GpuBaDeviceContext::InitializeImpl(
   }
   std::vector<DevicePointUpdateMeta> point_update(point_entity_count_);
   std::vector<uint32_t> point_entity_indices(point_count_);
+  if (native_initialization) variable_point_slots_.resize(point_count_);
   for (DevicePointUpdateMeta& meta : point_update)
     meta.variable_point_index = -1;
   for (size_t i = 0; i < point_count_; ++i) {
@@ -12819,9 +14173,14 @@ bool GpuBaDeviceContext::InitializeImpl(
     point_update[point_it->second].variable_point_index =
         static_cast<int32_t>(i);
     point_entity_indices[i] = point_it->second;
+    if (native_initialization)
+      variable_point_slots_[i] = native_point_slots_[point_it->second];
   }
   const bool uploaded =
-      UploadStatic(d_visual_static_, visual_static, error) &&
+      (native_initialization
+           ? UploadStatic(d_indexed_visual_bindings_,
+                          native->visual_bindings, error)
+           : UploadStatic(d_visual_static_, visual_static, error)) &&
       UploadStatic(d_lidar_static_, lidar_static, error) &&
       UploadStatic(d_camera_entities_, host_camera_entities_, error) &&
       UploadStatic(d_image_update_meta_, image_update, error) &&
@@ -13604,16 +14963,32 @@ bool GpuBaDeviceContext::RunLayerAFromDeviceState(
       arithmetic_precision_ == CudaArithmeticPrecision::kFp32MixedStable;
   if (visual_count_ != 0) {
     if (compact_layer_a_enabled_) {
-      LayerAVisualDeviceStateCompactKernel<<<
-          blocks_for(visual_count_), block_size, 0, stream_>>>(
-          d_visual_static_, state.images, state.points, state.cameras,
-          slot.compact_visual, visual_count_);
+      if (native_indexed_enabled_) {
+        LayerAVisualIndexedDeviceStateCompactKernel<<<
+            blocks_for(visual_count_), block_size, 0, stream_>>>(
+            native_device_catalog_view_, d_indexed_visual_bindings_,
+            state.images, state.points, state.cameras, slot.compact_visual,
+            visual_count_);
+      } else {
+        LayerAVisualDeviceStateCompactKernel<<<
+            blocks_for(visual_count_), block_size, 0, stream_>>>(
+            d_visual_static_, state.images, state.points, state.cameras,
+            slot.compact_visual, visual_count_);
+      }
       ++runtime_->persistent_device.compact_layer_a_calls;
     } else {
-      LayerAVisualDeviceStateKernel<<<blocks_for(visual_count_), block_size, 0,
-                                      stream_>>>(
-          d_visual_static_, state.images, state.points, state.cameras,
-          slot.visual, visual_count_);
+      if (native_indexed_enabled_) {
+        LayerAVisualIndexedDeviceStateKernel<<<
+            blocks_for(visual_count_), block_size, 0, stream_>>>(
+            native_device_catalog_view_, d_indexed_visual_bindings_,
+            state.images, state.points, state.cameras, slot.visual,
+            visual_count_);
+      } else {
+        LayerAVisualDeviceStateKernel<<<blocks_for(visual_count_), block_size,
+                                        0, stream_>>>(
+            d_visual_static_, state.images, state.points, state.cameras,
+            slot.visual, visual_count_);
+      }
     }
     if (mixed_precision) {
       if (compact_layer_a_enabled_) {
@@ -15417,18 +16792,19 @@ bool GpuBaDeviceContext::MaterializeCurrentState(
   return true;
 }
 
-bool GpuBaDeviceContext::DownloadCurrentNativeState(
+bool GpuBaDeviceContext::DownloadCurrentNativeVariableDelta(
     const NativeHostSolveView& view,
     const ActiveStateBuffer& initial_state,
     const CudaLinearizationIdentity& expected,
-    DenseActiveState* output,
+    VariableStateDelta* output,
     std::string* error) {
   if (!device_state_enabled_ || output == nullptr || error == nullptr ||
       view.identity.owner_epoch != initial_state.owner_epoch ||
-      native_image_slots_.size() != image_entity_count_ ||
-      native_point_slots_.size() != point_entity_count_ ||
-      native_camera_slots_.size() != camera_entity_count_) {
-    if (error != nullptr) *error = "native final-state download is invalid";
+      variable_image_slots_.size() != pose_count_ ||
+      variable_image_translation_masks_.size() != pose_count_ ||
+      variable_point_slots_.size() != point_count_ ||
+      !native_indexed_enabled_) {
+    if (error != nullptr) *error = "native variable-state download is invalid";
     return false;
   }
   const StateSlot& current = state_slots_[current_state_slot_];
@@ -15437,12 +16813,36 @@ bool GpuBaDeviceContext::DownloadCurrentNativeState(
     *error = "native current device state slot is invalid";
     return false;
   }
+  constexpr int kDownloadThreads = 128;
+  const auto blocks_for = [](const size_t count) {
+    return static_cast<int>((count + kDownloadThreads - 1) /
+                            kDownloadThreads);
+  };
+  if (pose_count_ != 0) {
+    GatherVariableImageEntityStateKernel<<<blocks_for(pose_count_),
+                                           kDownloadThreads, 0, stream_>>>(
+        current.images, d_pose_image_entity_indices_,
+        d_variable_image_download_, pose_count_);
+  }
+  if (point_count_ != 0) {
+    GatherVariablePointEntityStateKernel<<<blocks_for(point_count_),
+                                           kDownloadThreads, 0, stream_>>>(
+        current.points, d_point_entity_indices_, d_variable_point_download_,
+        point_count_);
+  }
+  if (cudaGetLastError() != cudaSuccess) {
+    *error = "native variable-state gather launch failed";
+    return false;
+  }
+  std::vector<DeviceImageEntityState> images(pose_count_);
+  std::vector<DevicePointEntityState> points(point_count_);
   const auto download = [&](auto* source, auto* destination) {
     if (destination->empty()) return true;
     const uint64_t bytes = destination->size() * sizeof((*destination)[0]);
     HostPhaseScope timing(CUDA_TIMING_PHASE(d2h_memcpy), bytes);
-    const cudaError_t status = cudaMemcpyAsync(
-        destination->data(), source, bytes, cudaMemcpyDeviceToHost, stream_);
+    const cudaError_t status = cudaMemcpyAsync(destination->data(), source,
+                                                bytes, cudaMemcpyDeviceToHost,
+                                                stream_);
     if (status != cudaSuccess) return false;
     ++runtime_->persistent_device.final_entity_state_d2h_calls;
     runtime_->persistent_device.final_entity_state_d2h_bytes = SaturatingAdd(
@@ -15453,58 +16853,43 @@ bool GpuBaDeviceContext::DownloadCurrentNativeState(
     return true;
   };
   ++runtime_->persistent_device.final_state_materialization_operations;
-  if (!download(current.images, &host_image_entities_) ||
-      !download(current.points, &host_point_entities_) ||
+  if (!download(d_variable_image_download_, &images) ||
+      !download(d_variable_point_download_, &points) ||
       !Synchronize(CudaSyncSite::kLayerCFinal, error)) {
-    if (error->empty()) *error = "native final-state download failed";
+    if (error->empty()) *error = "native variable-state download failed";
     return false;
   }
-  std::unordered_map<uint32_t, const DenseCameraState*> initial_cameras;
-  if (!BuildNativeStateLookup(initial_state.cameras,
-                              initial_state.state_generation,
-                              &initial_cameras, error)) {
-    return false;
-  }
-  *output = DenseActiveState();
+  *output = VariableStateDelta();
   output->owner_epoch = initial_state.owner_epoch;
+  output->catalog_revision = view.identity.catalog_revision;
+  output->catalog_generation = view.identity.catalog_generation;
+  output->view_generation = view.identity.selection_revision;
+  output->solve_generation = expected.solve_generation;
   if (expected.state_epoch >
       std::numeric_limits<uint64_t>::max() - initial_state.state_generation) {
-    *error = "native final state generation overflow";
+    *error = "native variable-state generation overflow";
     return false;
   }
   output->state_generation =
       initial_state.state_generation + expected.state_epoch;
-  output->cameras.reserve(native_camera_slots_.size());
-  for (const uint32_t slot : native_camera_slots_) {
-    const auto found = initial_cameras.find(slot);
-    if (found == initial_cameras.end()) {
-      *error = "native final state is missing fixed camera state";
-      return false;
-    }
-    DenseCameraState camera = *found->second;
-    camera.state_generation = output->state_generation;
-    output->cameras.push_back(std::move(camera));
-  }
-  output->images.reserve(native_image_slots_.size());
-  for (size_t i = 0; i < native_image_slots_.size(); ++i) {
-    DenseImageState image;
-    image.image_slot = native_image_slots_[i];
-    image.state_generation = output->state_generation;
-    std::copy(host_image_entities_[i].quaternion,
-              host_image_entities_[i].quaternion + 4,
+  output->expected_image_slots = variable_image_slots_;
+  output->expected_point_slots = variable_point_slots_;
+  output->images.reserve(pose_count_);
+  for (size_t i = 0; i < pose_count_; ++i) {
+    VariableImageStateDelta image;
+    image.image_slot = variable_image_slots_[i];
+    image.translation_subset_mask = variable_image_translation_masks_[i];
+    std::copy(images[i].quaternion, images[i].quaternion + 4,
               image.quaternion.begin());
-    std::copy(host_image_entities_[i].translation,
-              host_image_entities_[i].translation + 3,
+    std::copy(images[i].translation, images[i].translation + 3,
               image.translation.begin());
     output->images.push_back(image);
   }
-  output->points.reserve(native_point_slots_.size());
-  for (size_t i = 0; i < native_point_slots_.size(); ++i) {
-    DensePointState point;
-    point.point_slot = native_point_slots_[i];
-    point.state_generation = output->state_generation;
-    std::copy(host_point_entities_[i].xyz,
-              host_point_entities_[i].xyz + 3, point.xyz.begin());
+  output->points.reserve(point_count_);
+  for (size_t i = 0; i < point_count_; ++i) {
+    VariablePointStateDelta point;
+    point.point_slot = variable_point_slots_[i];
+    std::copy(points[i].xyz, points[i].xyz + 3, point.xyz.begin());
     output->points.push_back(point);
   }
   return true;
@@ -17263,8 +18648,10 @@ void AccumulateHostStoreRuntime(const CudaHostProblemStoreRuntimeInfo& value,
 }  // namespace
 
 bool ResolveNativeCudaConfiguration(
-    const CudaSolveProblem& problem,
     const CudaFullLmOptions& requested_options,
+    const CudaLossMode requested_loss_mode,
+    const double requested_loss_scale,
+    const LidarResidualMode lidar_mode,
     const uint64_t config_generation,
     CudaFullLmOptions* resolved_options,
     NativeCudaResolvedConfig* config,
@@ -17294,23 +18681,32 @@ bool ResolveNativeCudaConfiguration(
   CudaHessianAssemblyBackend hessian =
       CudaHessianAssemblyBackend::kCompatibilityDefault;
   std::string hessian_requested;
-  CudaLossMode loss_mode = CudaLossMode::kFromSnapshot;
-  double loss_scale = 0.0;
+  CudaLossMode loss_mode = requested_loss_mode;
+  double loss_scale = requested_loss_scale;
   if (!ResolveHessianAssemblyBackend(
           layer_c.layer_b.hessian_assembly_backend, hot, &hessian,
-          &hessian_requested, error) ||
-      !ResolveCudaLoss(problem, layer_c.layer_b, &loss_mode, &loss_scale,
-                       error)) {
+          &hessian_requested, error)) {
     return false;
   }
-  LidarResidualMode lidar_mode;
-  const std::string lidar_name = problem.metadata.lidar_residual_mode.empty()
-      ? "legacy_exact"
-      : problem.metadata.lidar_residual_mode;
-  if (!ParseLidarResidualMode(lidar_name, &lidar_mode)) {
-    *error = "unsupported lidar residual mode: " + lidar_name;
+  const bool valid_loss_scale =
+      std::isfinite(loss_scale) &&
+      ((loss_mode == CudaLossMode::kTrivial && loss_scale >= 0.0) ||
+       (loss_mode == CudaLossMode::kSoftL1 && loss_scale > 0.0));
+  if ((loss_mode != CudaLossMode::kTrivial &&
+       loss_mode != CudaLossMode::kSoftL1) ||
+      !valid_loss_scale ||
+      requested_options.max_num_iterations < 0 ||
+      requested_options.max_num_consecutive_invalid_steps < 0 ||
+      !std::isfinite(requested_options.function_tolerance) ||
+      requested_options.function_tolerance < 0.0 ||
+      !std::isfinite(requested_options.gradient_tolerance) ||
+      requested_options.gradient_tolerance < 0.0 ||
+      !std::isfinite(requested_options.parameter_tolerance) ||
+      requested_options.parameter_tolerance < 0.0) {
+    *error = "native_graph requires explicit valid loss and LM options";
     return false;
   }
+  if (loss_mode == CudaLossMode::kTrivial) loss_scale = 1.0;
 
   *resolved_options = requested_options;
   resolved_options->layer_c = layer_c;
@@ -17330,22 +18726,12 @@ bool ResolveNativeCudaConfiguration(
       resolved_options->hot_kernel_mode = CudaHotKernelMode::kTransformed;
       break;
   }
-  resolved_options->max_num_iterations = requested_options.max_num_iterations >= 0
-      ? requested_options.max_num_iterations
-      : problem.metadata.max_num_iterations;
+  resolved_options->max_num_iterations = requested_options.max_num_iterations;
   resolved_options->max_num_consecutive_invalid_steps =
-      requested_options.max_num_consecutive_invalid_steps >= 0
-          ? requested_options.max_num_consecutive_invalid_steps
-          : problem.metadata.max_consecutive_invalid_steps;
-  resolved_options->function_tolerance = requested_options.function_tolerance >= 0.0
-      ? requested_options.function_tolerance
-      : problem.metadata.function_tolerance;
-  resolved_options->gradient_tolerance = requested_options.gradient_tolerance >= 0.0
-      ? requested_options.gradient_tolerance
-      : problem.metadata.gradient_tolerance;
-  resolved_options->parameter_tolerance = requested_options.parameter_tolerance >= 0.0
-      ? requested_options.parameter_tolerance
-      : problem.metadata.parameter_tolerance;
+      requested_options.max_num_consecutive_invalid_steps;
+  resolved_options->function_tolerance = requested_options.function_tolerance;
+  resolved_options->gradient_tolerance = requested_options.gradient_tolerance;
+  resolved_options->parameter_tolerance = requested_options.parameter_tolerance;
 
   NativeCudaResolvedConfig value;
   value.resolved = true;
@@ -17392,6 +18778,50 @@ bool ResolveNativeCudaConfiguration(
   value.max_lm_diagonal = layer_c.layer_b.max_lm_diagonal;
   *config = std::move(value);
   return true;
+}
+
+bool ResolveNativeCudaConfiguration(
+    const CudaSolveProblem& problem,
+    const CudaFullLmOptions& requested_options,
+    const uint64_t config_generation,
+    CudaFullLmOptions* resolved_options,
+    NativeCudaResolvedConfig* config,
+    std::string* error) {
+  if (resolved_options == nullptr || config == nullptr || error == nullptr) {
+    if (error != nullptr) *error = "invalid native config resolver arguments";
+    return false;
+  }
+  CudaLossMode loss_mode = CudaLossMode::kFromSnapshot;
+  double loss_scale = 0.0;
+  if (!ResolveCudaLoss(problem, requested_options.layer_c.layer_b, &loss_mode,
+                       &loss_scale, error)) {
+    return false;
+  }
+  LidarResidualMode lidar_mode;
+  const std::string lidar_name = problem.metadata.lidar_residual_mode.empty()
+      ? "legacy_exact"
+      : problem.metadata.lidar_residual_mode;
+  if (!ParseLidarResidualMode(lidar_name, &lidar_mode)) {
+    *error = "unsupported lidar residual mode: " + lidar_name;
+    return false;
+  }
+  CudaFullLmOptions explicit_options = requested_options;
+  if (explicit_options.max_num_iterations < 0)
+    explicit_options.max_num_iterations = problem.metadata.max_num_iterations;
+  if (explicit_options.max_num_consecutive_invalid_steps < 0) {
+    explicit_options.max_num_consecutive_invalid_steps =
+        problem.metadata.max_consecutive_invalid_steps;
+  }
+  if (explicit_options.function_tolerance < 0.0)
+    explicit_options.function_tolerance = problem.metadata.function_tolerance;
+  if (explicit_options.gradient_tolerance < 0.0)
+    explicit_options.gradient_tolerance = problem.metadata.gradient_tolerance;
+  if (explicit_options.parameter_tolerance < 0.0) {
+    explicit_options.parameter_tolerance = problem.metadata.parameter_tolerance;
+  }
+  return ResolveNativeCudaConfiguration(
+      explicit_options, loss_mode, loss_scale, lidar_mode, config_generation,
+      resolved_options, config, error);
 }
 
 struct GpuBaHostProblemStoreControl {
@@ -21532,15 +22962,16 @@ void CommitAcceptedNativeState(
 bool RunCustomCudaSolveCore(const CudaSolveProblem* problem,
                             const Snapshot* legacy_snapshot,
                             const NativeCudaSolveRequest* native_request,
-                            LegacyKernelInputBundle::Impl* native_bundle,
+                            NativeIndexedKernelInput* native_indexed,
                             BaSolveResult* native_result,
                             const CudaFullLmOptions& options,
                             CudaFullLmResult* result,
                             std::string* error) {
   CudaCacheCallScope cache_scope;
   const bool native_mode = native_request != nullptr;
+  double native_variable_download_milliseconds = 0.0;
   if (result == nullptr || error == nullptr ||
-      native_mode != (native_bundle != nullptr) ||
+      native_mode != (native_indexed != nullptr) ||
       native_mode != (native_result != nullptr) ||
       native_mode == (problem != nullptr) ||
       (native_mode && (native_request->view == nullptr ||
@@ -22208,7 +23639,7 @@ bool RunCustomCudaSolveCore(const CudaSolveProblem* problem,
   const bool context_initialized = native_mode
       ? solve_context.InitializeNative(
             *native_request->view, *native_request->initial_state,
-            *native_bundle, step_options.layer_b,
+            *native_indexed, step_options.layer_b,
             result->runtime.resource_generation, hot_kernel_implementation,
             &result->runtime, error)
       : prepared_host_data == nullptr
@@ -22879,11 +24310,15 @@ bool RunCustomCudaSolveCore(const CudaSolveProblem* problem,
       result->termination_type != CudaTerminationType::kFailure) {
     bool materialized = false;
     if (native_mode) {
-      materialized = solve_context.persistent_device()->DownloadCurrentNativeState(
+      const auto variable_download_start = std::chrono::steady_clock::now();
+      materialized = solve_context.persistent_device()
+          ->DownloadCurrentNativeVariableDelta(
           *native_request->view, *native_request->initial_state,
-          current_identity, &native_result->final_state, error);
-      if (materialized)
-        ++native_result->runtime.dense_active_state_device_download_calls;
+          current_identity, &native_result->variable_delta, error);
+      native_variable_download_milliseconds =
+          std::chrono::duration<double, std::milli>(
+              std::chrono::steady_clock::now() - variable_download_start)
+              .count();
     } else {
       Snapshot materialized_final;
       materialized = solve_context.persistent_device()->MaterializeCurrentState(
@@ -23082,34 +24517,50 @@ bool RunCustomCudaSolveCore(const CudaSolveProblem* problem,
         result->error_classification ==
             CudaSolveErrorClass::kResourceCleanup ||
         result->runtime.resource_cleanup_failures != 0;
-    native_result->runtime.legacy_kernel_input_bundle_calls =
-        native_bundle->runtime.legacy_kernel_input_bundle_calls;
-    native_result->runtime.build_cuda_layer_a_inputs_calls =
-        native_bundle->runtime.build_cuda_layer_a_inputs_calls;
-    native_result->runtime.build_static_layout_calls =
-        native_bundle->runtime.build_static_layout_calls;
-    native_result->runtime.build_cost_layout_calls =
-        native_bundle->runtime.build_cost_layout_calls;
-    native_result->runtime.build_layer_b_topology_calls =
-        native_bundle->runtime.build_layer_b_topology_calls;
-    native_result->runtime.build_layer_c_topology_calls =
-        native_bundle->runtime.build_layer_c_topology_calls;
-    native_result->runtime.temporary_visual_input_bytes =
-        native_bundle->runtime.temporary_visual_input_bytes;
-    native_result->runtime.temporary_lidar_input_bytes =
-        native_bundle->runtime.temporary_lidar_input_bytes;
-    native_result->runtime.temporary_legacy_kernel_abi = true;
+    native_result->runtime = native_indexed->runtime;
+    native_result->runtime.legacy_kernel_input_bundle_calls = 0;
+    native_result->runtime.build_cuda_layer_a_inputs_calls = 0;
+    native_result->runtime.build_static_layout_calls = 0;
+    native_result->runtime.build_cost_layout_calls = 0;
+    native_result->runtime.build_layer_b_topology_calls = 0;
+    native_result->runtime.build_layer_c_topology_calls = 0;
+    native_result->runtime.temporary_visual_input_bytes = 0;
+    native_result->runtime.temporary_lidar_input_bytes = 0;
+    native_result->runtime.repeated_residual_state_packing_bytes = 0;
+    native_result->runtime.temporary_legacy_kernel_abi = false;
     native_result->runtime.native_lm_controller_handoff_complete = true;
-    native_result->runtime.real_cost_layout_entries =
-        native_bundle->runtime.real_cost_layout_entries;
-    native_result->runtime.real_pose_adjacency_entries =
-        native_bundle->runtime.real_pose_adjacency_entries;
-    native_result->runtime.real_point_adjacency_entries =
-        native_bundle->runtime.real_point_adjacency_entries;
-    native_result->runtime.real_edge_adjacency_entries =
-        native_bundle->runtime.real_edge_adjacency_entries;
-    native_result->runtime.real_schur_pair_contributions =
-        native_bundle->runtime.real_schur_pair_contributions;
+    const CudaPersistentDeviceRuntimeInfo& device =
+        result->runtime.persistent_device;
+    native_result->runtime.device_store_lookup_calls =
+        device.native_device_store_lookup_calls;
+    native_result->runtime.device_store_reuse_calls =
+        device.native_device_store_reuse_calls;
+    native_result->runtime.device_store_full_upload_calls =
+        device.native_device_store_full_upload_calls;
+    native_result->runtime.device_store_full_upload_bytes =
+        device.native_device_store_full_upload_bytes;
+    native_result->runtime.device_store_patch_upload_calls =
+        device.native_device_store_patch_upload_calls;
+    native_result->runtime.device_store_patch_upload_bytes =
+        device.native_device_store_patch_upload_bytes;
+    native_result->runtime.device_store_growth_d2d_calls =
+        device.native_device_store_growth_d2d_calls;
+    native_result->runtime.device_store_growth_d2d_bytes =
+        device.native_device_store_growth_d2d_bytes;
+    native_result->runtime.device_store_invalidations =
+        device.native_device_store_invalidations;
+    native_result->runtime.device_store_generation =
+        device.native_device_store_generation;
+    native_result->runtime.variable_state_delta_device_download_calls =
+        (native_result->variable_delta.images.empty() ? 0 : 1) +
+        (native_result->variable_delta.points.empty() ? 0 : 1);
+    native_result->runtime.variable_state_delta_device_download_bytes =
+        native_result->variable_delta.images.size() *
+            sizeof(DeviceImageEntityState) +
+        native_result->variable_delta.points.size() *
+            sizeof(DevicePointEntityState);
+    native_result->runtime.variable_state_download_milliseconds =
+        native_variable_download_milliseconds;
   }
   return result->success;
 }
@@ -23130,6 +24581,56 @@ bool RunCustomCudaSolve(const CudaSolveProblem& problem,
                                 options, result, error);
 }
 
+bool MakeCudaFullLmOptionsFromNativeConfig(
+    const NativeCudaResolvedConfig& config,
+    CudaFullLmOptions* options,
+    std::string* error) {
+  if (options == nullptr || error == nullptr || !config.resolved ||
+      config.config_generation == 0) {
+    if (error != nullptr) *error = "native resolved configuration is invalid";
+    return false;
+  }
+  CudaFullLmOptions result;
+  result.arithmetic_precision = config.arithmetic_precision;
+  result.device_context_mode = config.device_context;
+  result.hot_kernel_mode = config.hot_kernel;
+  result.execution_profile = config.execution_profile;
+  result.audit_profile = config.audit_profile;
+  result.performance_mode = config.performance_mode;
+  result.current_linearization_cache_mode = config.linearization_cache;
+  result.pair_chunk_limit_bytes_for_testing = config.pair_chunk_limit_bytes;
+  result.max_num_iterations = config.max_num_iterations;
+  result.max_num_consecutive_invalid_steps =
+      config.max_consecutive_invalid_steps;
+  result.function_tolerance = config.function_tolerance;
+  result.gradient_tolerance = config.gradient_tolerance;
+  result.parameter_tolerance = config.parameter_tolerance;
+  result.max_solver_time_in_seconds = config.max_solver_time_in_seconds;
+  result.initial_trust_region_radius = config.initial_trust_region_radius;
+  result.min_trust_region_radius = config.min_trust_region_radius;
+  result.max_trust_region_radius = config.max_trust_region_radius;
+  result.min_relative_decrease = config.min_relative_decrease;
+  result.layer_c.schur_contribution_backend = config.schur_backend;
+  result.layer_c.schur_segment_size_for_testing = config.schur_segment_size;
+  result.layer_c.layer_b.layer_a.device = config.device;
+  result.layer_c.layer_b.layer_a.block_size = config.block_size;
+  result.layer_c.layer_b.layer_a.memory_mode = config.memory_mode;
+  result.layer_c.layer_b.layer_a.residual_order = config.residual_order;
+  result.layer_c.layer_b.loss_mode = config.loss_mode;
+  result.layer_c.layer_b.loss_scale = config.loss_scale;
+  result.layer_c.layer_b.cost_reduction_threads =
+      config.cost_reduction_threads;
+  result.layer_c.layer_b.reduction_mode = config.reduction_mode;
+  result.layer_c.layer_b.min_lm_diagonal = config.min_lm_diagonal;
+  result.layer_c.layer_b.max_lm_diagonal = config.max_lm_diagonal;
+  result.layer_c.layer_b.hessian_assembly_backend = config.hessian_backend;
+  result.layer_c.layer_b.hessian_segment_size_for_testing =
+      config.hessian_segment_size;
+  *options = std::move(result);
+  error->clear();
+  return true;
+}
+
 bool RunCustomCudaSolve(const NativeCudaSolveRequest& request,
                         BaSolveResult* result,
                         std::string* error) {
@@ -23140,15 +24641,25 @@ bool RunCustomCudaSolve(const NativeCudaSolveRequest& request,
   }
   *result = BaSolveResult();
   error->clear();
-  LegacyKernelInputBundle bundle;
-  if (!BuildLegacyKernelInputBundle(*request.view, *request.initial_state,
-                                    &bundle, error)) {
+  if (request.device_store == nullptr ||
+      request.device_store->owner_epoch_ != request.view->identity.owner_epoch ||
+      request.device_store->state_ == nullptr) {
+    *error = "native CUDA request has no matching mapping device store";
     result->error = *error;
     return false;
   }
+  NativeIndexedKernelInput indexed;
+  if (!BuildNativeIndexedKernelInput(*request.view, *request.initial_state,
+                                     &indexed, error)) {
+    result->error = *error;
+    return false;
+  }
+  indexed.device_store_state =
+      std::static_pointer_cast<DeviceBaProblemStoreState>(
+          request.device_store->state_);
   CudaFullLmResult controller_result;
   const bool success = RunCustomCudaSolveCore(
-      nullptr, nullptr, &request, bundle.impl_.get(), result,
+      nullptr, nullptr, &request, &indexed, result,
       *request.options, &controller_result, error);
   if (!success && result->error.empty()) result->error = *error;
   return success;

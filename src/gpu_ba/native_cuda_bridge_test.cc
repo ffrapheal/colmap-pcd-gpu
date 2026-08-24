@@ -15,6 +15,8 @@ namespace {
 
 struct ShadowFixture {
   HostBaGraphStore store{44};
+  std::shared_ptr<DeviceBaProblemStoreHandle> device_store =
+      CreateDeviceBaProblemStore(44);
   CatalogReadLease lease;
   DenseActiveState dense_state;
   BaSolveIntent intent;
@@ -93,7 +95,7 @@ bool BuildShadowFixture(ShadowFixture* fixture, std::string* error) {
   image.translation = {{0.1, 0.2, 0.3}};
   fixture->dense_state.images.push_back(image);
   image.image_slot = 1;
-  image.quaternion = {{0.0, 2.0, 0.0, 0.0}};
+  image.quaternion = {{0.0, 1.0, 0.0, 0.0}};
   image.translation = {{0.4, 0.5, 0.6}};
   fixture->dense_state.images.push_back(image);
   DensePointState point;
@@ -544,6 +546,7 @@ BOOST_AUTO_TEST_CASE(NativeRequestRunsSharedLmControllerAndDownloadsDeviceState)
   request.view = &view;
   request.initial_state = &state;
   request.options = &options;
+  request.device_store = fixture.device_store;
   CudaFullLmResult legacy_result;
   std::string legacy_error;
   const bool legacy_success = RunCustomCudaSolve(
@@ -575,11 +578,12 @@ BOOST_AUTO_TEST_CASE(NativeRequestRunsSharedLmControllerAndDownloadsDeviceState)
   BOOST_CHECK_EQUAL(result.final_cost, legacy_result.final_cost);
   BOOST_CHECK_GT(result.trial_iterations, 0);
   BOOST_CHECK(result.runtime.native_lm_controller_handoff_complete);
-  BOOST_CHECK_EQUAL(result.runtime.dense_active_state_device_download_calls, 1);
-  BOOST_CHECK_EQUAL(result.final_state.cameras.size(), state.cameras.size());
-  BOOST_CHECK_EQUAL(result.final_state.images.size(), state.images.size());
-  BOOST_CHECK_EQUAL(result.final_state.points.size(), state.points.size());
-  BOOST_CHECK_EQUAL(result.final_state.state_generation,
+  BOOST_CHECK_EQUAL(result.runtime.dense_active_state_device_download_calls, 0);
+  BOOST_CHECK_GT(result.runtime.variable_state_delta_device_download_calls, 0);
+  BOOST_CHECK(result.variable_delta.cameras.empty());
+  BOOST_CHECK_EQUAL(result.variable_delta.images.size(), 1);
+  BOOST_CHECK_EQUAL(result.variable_delta.points.size(), 1);
+  BOOST_CHECK_EQUAL(result.variable_delta.state_generation,
                     state.state_generation +
                         legacy_result.runtime.final_internal_state_epoch);
   BOOST_TEST_MESSAGE("native full-LM trace: trials="
@@ -592,44 +596,178 @@ BOOST_AUTO_TEST_CASE(NativeRequestRunsSharedLmControllerAndDownloadsDeviceState)
   BOOST_CHECK(std::isfinite(result.initial_cost));
   BOOST_CHECK(std::isfinite(result.final_cost));
   BOOST_CHECK_LE(result.final_cost, result.initial_cost);
-  BOOST_CHECK_EQUAL(result.runtime.legacy_kernel_input_bundle_calls, 1);
-  BOOST_CHECK_EQUAL(result.runtime.build_cuda_layer_a_inputs_calls, 1);
-  BOOST_CHECK_EQUAL(result.runtime.build_static_layout_calls, 1);
-  BOOST_CHECK_EQUAL(result.runtime.build_cost_layout_calls, 1);
-  BOOST_CHECK_EQUAL(result.runtime.build_layer_b_topology_calls, 1);
-  BOOST_CHECK_EQUAL(result.runtime.build_layer_c_topology_calls, 1);
-  BOOST_REQUIRE_EQUAL(result.final_state.cameras.size(),
-                      legacy_result.final_state.cameras.size());
-  BOOST_REQUIRE_EQUAL(result.final_state.images.size(),
-                      legacy_result.final_state.images.size());
-  BOOST_REQUIRE_EQUAL(result.final_state.points.size(),
-                      legacy_result.final_state.points.size());
-  for (size_t i = 0; i < result.final_state.cameras.size(); ++i) {
-    BOOST_CHECK_EQUAL_COLLECTIONS(
-        result.final_state.cameras[i].parameters.begin(),
-        result.final_state.cameras[i].parameters.end(),
-        legacy_result.final_state.cameras[i].params.begin(),
-        legacy_result.final_state.cameras[i].params.end());
+  BOOST_CHECK_EQUAL(result.runtime.legacy_kernel_input_bundle_calls, 0);
+  BOOST_CHECK_EQUAL(result.runtime.build_cuda_layer_a_inputs_calls, 0);
+  BOOST_CHECK_EQUAL(result.runtime.build_static_layout_calls, 0);
+  BOOST_CHECK_EQUAL(result.runtime.build_cost_layout_calls, 0);
+  BOOST_CHECK_EQUAL(result.runtime.build_layer_b_topology_calls, 0);
+  BOOST_CHECK_EQUAL(result.runtime.build_layer_c_topology_calls, 0);
+  BOOST_CHECK_EQUAL(result.runtime.repeated_residual_state_packing_bytes, 0);
+  BOOST_CHECK_GT(result.runtime.device_store_full_upload_calls, 0);
+  const VariableImageStateDelta& image = result.variable_delta.images.front();
+  const VariablePointStateDelta& point = result.variable_delta.points.front();
+  BOOST_CHECK_EQUAL(fixture.lease.images()[image.image_slot].image_id, 20);
+  BOOST_CHECK_EQUAL(fixture.lease.points()[point.point_slot].point3D_id, 30);
+  const auto legacy_image = std::find_if(
+      legacy_result.final_state.images.begin(),
+      legacy_result.final_state.images.end(),
+      [](const ImageSnapshot& value) { return value.image_id == 20; });
+  const auto legacy_point = std::find_if(
+      legacy_result.final_state.points.begin(),
+      legacy_result.final_state.points.end(),
+      [](const PointSnapshot& value) { return value.point3D_id == 30; });
+  BOOST_REQUIRE(legacy_image != legacy_result.final_state.images.end());
+  BOOST_REQUIRE(legacy_point != legacy_result.final_state.points.end());
+  BOOST_CHECK_EQUAL_COLLECTIONS(image.quaternion.begin(), image.quaternion.end(),
+                                legacy_image->qvec.begin(),
+                                legacy_image->qvec.end());
+  BOOST_CHECK_EQUAL_COLLECTIONS(image.translation.begin(),
+                                image.translation.end(),
+                                legacy_image->tvec.begin(),
+                                legacy_image->tvec.end());
+  BOOST_CHECK_EQUAL_COLLECTIONS(point.xyz.begin(), point.xyz.end(),
+                                legacy_point->xyz.begin(),
+                                legacy_point->xyz.end());
+  BaSolveResult repeated;
+  BOOST_REQUIRE_MESSAGE(RunCustomCudaSolve(request, &repeated, &error), error);
+  BOOST_CHECK_EQUAL(repeated.runtime.device_store_full_upload_calls, 0);
+  BOOST_CHECK_EQUAL(repeated.runtime.device_store_reuse_calls, 1);
+  BOOST_CHECK_EQUAL(repeated.runtime.legacy_kernel_input_bundle_calls, 0);
+  BOOST_CHECK_EQUAL(repeated.final_cost, result.final_cost);
+}
+
+BOOST_AUTO_TEST_CASE(
+    NativeDeviceStorePatchGrowthContextAndFailedPublishRecover) {
+  ShadowFixture fixture;
+  std::string error;
+  BOOST_REQUIRE_MESSAGE(BuildShadowFixture(&fixture, &error), error);
+  NativeHostSolveMaterializer materializer;
+  NativeHostSolveView view;
+  ActiveStateBuffer state;
+  NativeHostSolvePreparationRuntime preparation;
+  const auto materialize = [&]() {
+    view = NativeHostSolveView();
+    state = ActiveStateBuffer();
+    preparation = NativeHostSolvePreparationRuntime();
+    fixture.intent.catalog_revision = fixture.lease.topology_revision();
+    fixture.intent.catalog_generation = fixture.lease.generation();
+    return materializer.Materialize(fixture.lease, fixture.intent,
+                                    fixture.dense_state, &view, &state,
+                                    &preparation, &error);
+  };
+  BOOST_REQUIRE_MESSAGE(materialize(), error);
+  CudaFullLmOptions options = NativeFullLmOptions(view.config);
+  const auto run_native = [&](const CudaFullLmOptions& run_options,
+                              BaSolveResult* result) {
+    NativeCudaSolveRequest request{&view, &state, &run_options,
+                                   fixture.device_store};
+    return RunCustomCudaSolve(request, result, &error);
+  };
+  BaSolveResult cold;
+  BOOST_REQUIRE_MESSAGE(run_native(options, &cold), error);
+  BOOST_CHECK_EQUAL(cold.runtime.device_store_full_upload_calls, 1);
+  const uint64_t cold_generation = cold.runtime.device_store_generation;
+
+  view = NativeHostSolveView();
+  fixture.lease = CatalogReadLease();
+  CoalescedBaGraphMutation xy_patch;
+  xy_patch.owner_epoch = 44;
+  xy_patch.revision_before = 3;
+  xy_patch.revision_after = 4;
+  xy_patch.observation_upserts.push_back(
+      {20, 0, 30, {{18.0, 19.0}}});
+  HostBaGraphUpdateResult update;
+  BOOST_REQUIRE_MESSAGE(
+      fixture.store.ApplyCoalescedMutation(xy_patch, &update, &error), error);
+  fixture.lease = fixture.store.AcquireReadLease();
+  ++fixture.intent.selection_revision;
+  BOOST_REQUIRE_MESSAGE(materialize(), error);
+  options = NativeFullLmOptions(view.config);
+  fixture.reference.observations[0].xy = {{18.0, 19.0}};
+  CudaFullLmResult patch_reference;
+  BOOST_REQUIRE_MESSAGE(
+      RunCustomCudaSolve(fixture.reference, options, &patch_reference, &error),
+      error);
+  BaSolveResult patched;
+  BOOST_REQUIRE_MESSAGE(run_native(options, &patched), error);
+  BOOST_CHECK_EQUAL(patched.runtime.device_store_patch_upload_calls, 1);
+  BOOST_CHECK_EQUAL(patched.runtime.device_store_full_upload_calls, 0);
+  BOOST_CHECK_EQUAL(patched.runtime.device_store_growth_d2d_calls, 0);
+  BOOST_CHECK_GT(patched.runtime.device_store_patch_upload_bytes, 0);
+  BOOST_CHECK_EQUAL(patched.initial_cost, patch_reference.initial_cost);
+  BOOST_CHECK_EQUAL(patched.runtime.device_store_generation,
+                    cold_generation + 1);
+
+  view = NativeHostSolveView();
+  fixture.lease = CatalogReadLease();
+  CoalescedBaGraphMutation growth;
+  growth.owner_epoch = 44;
+  growth.revision_before = 4;
+  growth.revision_after = 5;
+  for (uint32_t index = 0; index < 62; ++index) {
+    const uint32_t image_id = 1000 + index;
+    const uint64_t point_id = 2000 + index;
+    growth.image_upserts.push_back({image_id, 7, true});
+    growth.point_upserts.push_back({point_id});
+    growth.observation_upserts.push_back(
+        {image_id, 0, point_id,
+         {{static_cast<double>(index), static_cast<double>(index + 1)}}});
   }
-  for (size_t i = 0; i < result.final_state.images.size(); ++i) {
-    BOOST_CHECK_EQUAL_COLLECTIONS(
-        result.final_state.images[i].quaternion.begin(),
-        result.final_state.images[i].quaternion.end(),
-        legacy_result.final_state.images[i].qvec.begin(),
-        legacy_result.final_state.images[i].qvec.end());
-    BOOST_CHECK_EQUAL_COLLECTIONS(
-        result.final_state.images[i].translation.begin(),
-        result.final_state.images[i].translation.end(),
-        legacy_result.final_state.images[i].tvec.begin(),
-        legacy_result.final_state.images[i].tvec.end());
-  }
-  for (size_t i = 0; i < result.final_state.points.size(); ++i) {
-    BOOST_CHECK_EQUAL_COLLECTIONS(
-        result.final_state.points[i].xyz.begin(),
-        result.final_state.points[i].xyz.end(),
-        legacy_result.final_state.points[i].xyz.begin(),
-        legacy_result.final_state.points[i].xyz.end());
-  }
+  BOOST_REQUIRE_MESSAGE(
+      fixture.store.ApplyCoalescedMutation(growth, &update, &error), error);
+  fixture.lease = fixture.store.AcquireReadLease();
+  ++fixture.intent.selection_revision;
+  BOOST_REQUIRE_MESSAGE(materialize(), error);
+  options = NativeFullLmOptions(view.config);
+  BaSolveResult grown;
+  BOOST_REQUIRE_MESSAGE(run_native(options, &grown), error);
+  BOOST_CHECK_EQUAL(grown.runtime.device_store_patch_upload_calls, 1);
+  BOOST_CHECK_EQUAL(grown.runtime.device_store_full_upload_calls, 0);
+  BOOST_CHECK_EQUAL(grown.runtime.device_store_growth_d2d_calls, 1);
+  BOOST_CHECK_GT(grown.runtime.device_store_growth_d2d_bytes, 0);
+  BOOST_CHECK_EQUAL(grown.initial_cost, patched.initial_cost);
+
+  BOOST_REQUIRE_MESSAGE(ResetCudaRuntimePoolForTesting(&error), error);
+  BaSolveResult context_recovery;
+  BOOST_REQUIRE_MESSAGE(run_native(options, &context_recovery), error);
+  BOOST_CHECK_EQUAL(context_recovery.runtime.device_store_reuse_calls, 0);
+  BOOST_CHECK_EQUAL(context_recovery.runtime.device_store_full_upload_calls, 1);
+  BOOST_CHECK_GT(context_recovery.runtime.device_store_generation,
+                 grown.runtime.device_store_generation);
+
+  CudaFullLmOptions tiny_budget = options;
+  tiny_budget.layer_c.layer_b.memory_budget_override_bytes = 1;
+  BaSolveResult budget_failure;
+  BOOST_CHECK(!run_native(tiny_budget, &budget_failure));
+  BOOST_CHECK(error.find("INSUFFICIENT_GPU_MEMORY") != std::string::npos);
+
+  view = NativeHostSolveView();
+  fixture.lease = CatalogReadLease();
+  CoalescedBaGraphMutation second_patch;
+  second_patch.owner_epoch = 44;
+  second_patch.revision_before = 5;
+  second_patch.revision_after = 6;
+  second_patch.observation_upserts.push_back(
+      {20, 0, 30, {{20.0, 21.0}}});
+  BOOST_REQUIRE_MESSAGE(
+      fixture.store.ApplyCoalescedMutation(second_patch, &update, &error),
+      error);
+  fixture.lease = fixture.store.AcquireReadLease();
+  ++fixture.intent.selection_revision;
+  BOOST_REQUIRE_MESSAGE(materialize(), error);
+  options = NativeFullLmOptions(view.config);
+  BOOST_REQUIRE_MESSAGE(FailNextDeviceBaProblemStorePublishForTesting(
+                            fixture.device_store, &error),
+                        error);
+  BaSolveResult injected;
+  BOOST_CHECK(!run_native(options, &injected));
+  BOOST_CHECK(error.find("publish failure injected") != std::string::npos);
+  BaSolveResult recovered;
+  BOOST_REQUIRE_MESSAGE(run_native(options, &recovered), error);
+  BOOST_CHECK_EQUAL(recovered.runtime.device_store_reuse_calls, 0);
+  BOOST_CHECK_EQUAL(recovered.runtime.device_store_full_upload_calls, 1);
+  BOOST_CHECK_EQUAL(recovered.runtime.device_store_generation,
+                    context_recovery.runtime.device_store_generation + 1);
 }
 
 BOOST_AUTO_TEST_CASE(
@@ -650,7 +788,8 @@ BOOST_AUTO_TEST_CASE(
   CudaFullLmResult legacy;
   BOOST_REQUIRE_MESSAGE(
       RunCustomCudaSolve(fixture.reference, options, &legacy, &error), error);
-  NativeCudaSolveRequest request{&view, &state, &options};
+  NativeCudaSolveRequest request{&view, &state, &options,
+                                 fixture.device_store};
   BaSolveResult native;
   BOOST_REQUIRE_MESSAGE(RunCustomCudaSolve(request, &native, &error), error);
   BOOST_REQUIRE_GE(legacy.accepted_commits, 1);
@@ -674,37 +813,33 @@ BOOST_AUTO_TEST_CASE(
   BOOST_CHECK(std::isfinite(native.max_backward_error));
   BOOST_CHECK_EQUAL(native.initial_cost, legacy.initial_cost);
   BOOST_CHECK_EQUAL(native.final_cost, legacy.final_cost);
-  BOOST_CHECK_EQUAL(native.final_state.state_generation,
+  BOOST_CHECK_EQUAL(native.variable_delta.state_generation,
                     state.state_generation + native.final_internal_state_epoch);
-  BOOST_CHECK_EQUAL(native.runtime.dense_active_state_device_download_calls, 1);
-  BOOST_REQUIRE_EQUAL(native.final_state.cameras.size(),
-                      legacy.final_state.cameras.size());
-  BOOST_REQUIRE_EQUAL(native.final_state.images.size(),
-                      legacy.final_state.images.size());
-  BOOST_REQUIRE_EQUAL(native.final_state.points.size(),
-                      legacy.final_state.points.size());
-  for (size_t i = 0; i < native.final_state.cameras.size(); ++i) {
+  BOOST_CHECK_EQUAL(native.runtime.dense_active_state_device_download_calls, 0);
+  BOOST_CHECK_GT(native.runtime.variable_state_delta_device_download_calls, 0);
+  BOOST_CHECK(native.variable_delta.cameras.empty());
+  for (size_t i = 0; i < native.variable_delta.images.size(); ++i) {
+    const uint32_t image_id =
+        fixture.lease.images()[native.variable_delta.images[i].image_slot]
+            .image_id;
+    const auto legacy_image = std::find_if(
+        legacy.final_state.images.begin(), legacy.final_state.images.end(),
+        [image_id](const ImageSnapshot& value) {
+          return value.image_id == image_id;
+        });
+    BOOST_REQUIRE(legacy_image != legacy.final_state.images.end());
     BOOST_CHECK_EQUAL_COLLECTIONS(
-        native.final_state.cameras[i].parameters.begin(),
-        native.final_state.cameras[i].parameters.end(),
-        legacy.final_state.cameras[i].params.begin(),
-        legacy.final_state.cameras[i].params.end());
+        native.variable_delta.images[i].quaternion.begin(),
+        native.variable_delta.images[i].quaternion.end(),
+        legacy_image->qvec.begin(), legacy_image->qvec.end());
+    BOOST_CHECK_EQUAL_COLLECTIONS(
+        native.variable_delta.images[i].translation.begin(),
+        native.variable_delta.images[i].translation.end(),
+        legacy_image->tvec.begin(), legacy_image->tvec.end());
   }
-  for (size_t i = 0; i < native.final_state.images.size(); ++i) {
-    BOOST_CHECK_EQUAL_COLLECTIONS(
-        native.final_state.images[i].quaternion.begin(),
-        native.final_state.images[i].quaternion.end(),
-        legacy.final_state.images[i].qvec.begin(),
-        legacy.final_state.images[i].qvec.end());
-    BOOST_CHECK_EQUAL_COLLECTIONS(
-        native.final_state.images[i].translation.begin(),
-        native.final_state.images[i].translation.end(),
-        legacy.final_state.images[i].tvec.begin(),
-        legacy.final_state.images[i].tvec.end());
-  }
-  for (size_t i = 0; i < native.final_state.points.size(); ++i) {
+  for (size_t i = 0; i < native.variable_delta.points.size(); ++i) {
     const uint64_t point3D_id =
-        fixture.lease.points()[native.final_state.points[i].point_slot]
+        fixture.lease.points()[native.variable_delta.points[i].point_slot]
             .point3D_id;
     const auto legacy_point = std::find_if(
         legacy.final_state.points.begin(), legacy.final_state.points.end(),
@@ -713,8 +848,8 @@ BOOST_AUTO_TEST_CASE(
         });
     BOOST_REQUIRE(legacy_point != legacy.final_state.points.end());
     BOOST_CHECK_EQUAL_COLLECTIONS(
-        native.final_state.points[i].xyz.begin(),
-        native.final_state.points[i].xyz.end(),
+        native.variable_delta.points[i].xyz.begin(),
+        native.variable_delta.points[i].xyz.end(),
         legacy_point->xyz.begin(), legacy_point->xyz.end());
   }
 }

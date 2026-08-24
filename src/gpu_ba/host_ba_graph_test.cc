@@ -41,7 +41,7 @@ DenseActiveState MakeState() {
   image.translation = {{0.1, 0.2, 0.3}};
   state.images.push_back(image);
   image.image_slot = 1;
-  image.quaternion = {{0.0, 2.0, 0.0, 0.0}};
+  image.quaternion = {{0.0, 1.0, 0.0, 0.0}};
   image.translation = {{0.4, 0.5, 0.6}};
   state.images.push_back(image);
   DensePointState point;
@@ -551,6 +551,7 @@ BOOST_AUTO_TEST_CASE(GlobalWholeAndSelectionRevisionRemainExplicitIdentity) {
   BOOST_REQUIRE(store.ColdBuild(MakeGraph(), &update, &error));
   const CatalogReadLease lease = store.AcquireReadLease();
   DenseActiveState state = MakeState();
+  state.images[0].quaternion = {{1.0, 0.0, 0.0, 0.0}};
   NativeHostSolveMaterializer materializer;
   for (const BaKind kind : {BaKind::kGlobal, BaKind::kWhole}) {
     BaSolveIntent intent = MakeIntent(lease);

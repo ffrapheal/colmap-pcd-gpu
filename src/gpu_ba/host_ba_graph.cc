@@ -1505,35 +1505,6 @@ bool HostBaGraphStore::IsCurrent(const CatalogReadLease& lease) const noexcept {
 
 namespace {
 
-const TranslationSubsetPolicy* FindTranslationPolicy(
-    const BaSolveIntent& intent, const uint32_t slot) {
-  for (const TranslationSubsetPolicy& policy : intent.translation_subsets) {
-    if (policy.image_slot == slot) return &policy;
-  }
-  return nullptr;
-}
-
-const CameraParameterPolicy* FindCameraPolicy(const BaSolveIntent& intent,
-                                               const uint32_t slot) {
-  for (const CameraParameterPolicy& policy : intent.camera_policies) {
-    if (policy.camera_slot == slot) return &policy;
-  }
-  return nullptr;
-}
-
-const PointFixedPolicy* FindPointPolicy(const BaSolveIntent& intent,
-                                        const uint32_t slot) {
-  for (const PointFixedPolicy& policy : intent.point_policies) {
-    if (policy.point_slot == slot) return &policy;
-  }
-  return nullptr;
-}
-
-bool ContainsSlot(const std::vector<uint32_t>& slots,
-                  const uint32_t slot) noexcept {
-  return std::find(slots.begin(), slots.end(), slot) != slots.end();
-}
-
 struct ResidualCandidate {
   ResidualKind kind = ResidualKind::kVisual;
   uint32_t source_slot = kBaGraphInvalidSlot;
@@ -1583,6 +1554,7 @@ bool NativeHostSolveMaterializer::Materialize(
   error->clear();
   const auto start = std::chrono::steady_clock::now();
   ++runtime->calls;
+  const uint8_t loss_mode = static_cast<uint8_t>(intent.config.loss_mode);
 
   if (!catalog.valid() || catalog.abi_version() != kHostBaGraphAbiVersion ||
       intent.abi_version != kNativeHostSolveViewAbiVersion ||
@@ -1596,9 +1568,10 @@ bool NativeHostSolveMaterializer::Materialize(
       static_cast<uint8_t>(intent.config.hessian_backend) == 0 ||
       static_cast<uint8_t>(intent.config.schur_backend) == 0 ||
       static_cast<uint8_t>(intent.config.hot_kernel) == 0 ||
-      static_cast<uint8_t>(intent.config.loss_mode) == 0 ||
+      loss_mode == 0 ||
       !std::isfinite(intent.config.loss_scale) ||
-      intent.config.loss_scale <= 0.0 ||
+      (loss_mode == 2 && intent.config.loss_scale <= 0.0) ||
+      (loss_mode == 1 && intent.config.loss_scale < 0.0) ||
       !std::isfinite(intent.config.lidar_near_zero_threshold) ||
       intent.config.lidar_near_zero_threshold < 0.0 ||
       intent.config.max_num_iterations < 0 ||
@@ -1665,6 +1638,47 @@ bool NativeHostSolveMaterializer::Materialize(
     return false;
   }
 
+  std::unordered_map<uint32_t, const TranslationSubsetPolicy*>
+      translation_policy_by_slot;
+  std::unordered_map<uint32_t, const CameraParameterPolicy*>
+      camera_policy_by_slot;
+  std::unordered_map<uint32_t, const PointFixedPolicy*> point_policy_by_slot;
+  std::unordered_set<uint32_t> explicit_variable_point_slots;
+  std::unordered_set<uint32_t> explicit_constant_point_slots;
+  std::unordered_set<uint32_t> boundary_image_slots;
+  translation_policy_by_slot.reserve(intent.translation_subsets.size());
+  camera_policy_by_slot.reserve(intent.camera_policies.size());
+  point_policy_by_slot.reserve(intent.point_policies.size());
+  explicit_variable_point_slots.reserve(
+      intent.explicit_variable_point_slots.size());
+  explicit_constant_point_slots.reserve(
+      intent.explicit_constant_point_slots.size());
+  boundary_image_slots.reserve(intent.explicit_variable_point_slots.size() +
+                               intent.explicit_constant_point_slots.size());
+  for (const TranslationSubsetPolicy& policy : intent.translation_subsets) {
+    if (!translation_policy_by_slot.emplace(policy.image_slot, &policy).second)
+      return SetError("duplicate native translation policy", error);
+  }
+  for (const CameraParameterPolicy& policy : intent.camera_policies) {
+    if (!camera_policy_by_slot.emplace(policy.camera_slot, &policy).second)
+      return SetError("duplicate native camera policy", error);
+  }
+  for (const PointFixedPolicy& policy : intent.point_policies) {
+    if (!point_policy_by_slot.emplace(policy.point_slot, &policy).second)
+      return SetError("duplicate native point policy", error);
+  }
+  for (const uint32_t slot : intent.explicit_variable_point_slots) {
+    if (!explicit_variable_point_slots.insert(slot).second)
+      return SetError("duplicate native explicit variable point", error);
+  }
+  for (const uint32_t slot : intent.explicit_constant_point_slots) {
+    if (explicit_variable_point_slots.count(slot) != 0 ||
+        !explicit_constant_point_slots.insert(slot).second) {
+      return SetError("duplicate or conflicting native explicit constant point",
+                      error);
+    }
+  }
+
   view->identity.owner_epoch = catalog.owner_epoch();
   view->identity.catalog_revision = catalog.topology_revision();
   view->identity.catalog_generation = catalog.generation();
@@ -1708,9 +1722,10 @@ bool NativeHostSolveMaterializer::Materialize(
       else
         view->active_image_slots.push_back(slot);
       if (!activate_camera(images[slot].camera_slot)) return false;
-    } else if (!boundary && ContainsSlot(view->boundary_image_slots, slot)) {
+    } else if (!boundary && boundary_image_slots.count(slot) != 0) {
       return SetError("native solve image is both active and boundary", error);
     }
+    if (boundary) boundary_image_slots.insert(slot);
     return true;
   };
   const auto select_observation = [&](const uint32_t slot,
@@ -1807,9 +1822,27 @@ bool NativeHostSolveMaterializer::Materialize(
     if (!visit_incidence(
             point.adjacency_head, point.adjacency_count, point_slot, false,
             [&](const uint32_t observation_slot) {
+              const uint32_t image_slot =
+                  observations[observation_slot].image_slot;
               const bool boundary =
-                  image_active_stamps_[
-                      observations[observation_slot].image_slot] != stamp;
+                  boundary_image_slots.count(image_slot) != 0 ||
+                  image_active_stamps_[image_slot] != stamp;
+              return select_observation(observation_slot, boundary);
+            })) {
+      return false;
+    }
+  }
+  for (const uint32_t point_slot : intent.explicit_constant_point_slots) {
+    if (!activate_point(point_slot)) return false;
+    const HostBaPointSlot& point = points[point_slot];
+    if (!visit_incidence(
+            point.adjacency_head, point.adjacency_count, point_slot, false,
+            [&](const uint32_t observation_slot) {
+              const uint32_t image_slot =
+                  observations[observation_slot].image_slot;
+              const bool boundary =
+                  boundary_image_slots.count(image_slot) != 0 ||
+                  image_active_stamps_[image_slot] != stamp;
               return select_observation(observation_slot, boundary);
             })) {
       return false;
@@ -1846,7 +1879,7 @@ bool NativeHostSolveMaterializer::Materialize(
   for (const TranslationSubsetPolicy& policy : intent.translation_subsets) {
     if (policy.image_slot >= images.size ||
         image_active_stamps_[policy.image_slot] != stamp ||
-        ContainsSlot(view->boundary_image_slots, policy.image_slot) ||
+        boundary_image_slots.count(policy.image_slot) != 0 ||
         !translation_policy_slots.insert(policy.image_slot).second ||
         (policy.constant_mask & ~uint8_t{0x7}) != 0) {
       return SetError("native translation policy is invalid", error);
@@ -1880,8 +1913,10 @@ bool NativeHostSolveMaterializer::Materialize(
     ImageFixedPolicyResult policy;
     policy.image_slot = slot;
     policy.pose_constant = fixed_pose_slots.count(slot) != 0 ? 1 : 0;
+    const auto translation_found = translation_policy_by_slot.find(slot);
     const TranslationSubsetPolicy* translation =
-        FindTranslationPolicy(intent, slot);
+        translation_found == translation_policy_by_slot.end()
+            ? nullptr : translation_found->second;
     if (translation != nullptr) {
       if ((translation->constant_mask & ~uint8_t{0x7}) != 0) {
         return SetError("native translation subset mask is invalid", error);
@@ -1907,7 +1942,10 @@ bool NativeHostSolveMaterializer::Materialize(
     CameraFixedPolicyResult result;
     result.camera_slot = slot;
     result.ambient_size = camera.parameter_count;
-    const CameraParameterPolicy* policy = FindCameraPolicy(intent, slot);
+    const auto policy_found = camera_policy_by_slot.find(slot);
+    const CameraParameterPolicy* policy =
+        policy_found == camera_policy_by_slot.end() ? nullptr
+                                                    : policy_found->second;
     result.constant = policy == nullptr || policy->constant ? 1 : 0;
     if (policy != nullptr) result.fixed_parameter_indices =
                                policy->fixed_parameter_indices;
@@ -1942,7 +1980,10 @@ bool NativeHostSolveMaterializer::Materialize(
   for (const uint32_t slot : view->active_point_slots) {
     PointFixedPolicyResult result;
     result.point_slot = slot;
-    const PointFixedPolicy* policy = FindPointPolicy(intent, slot);
+    const auto policy_found = point_policy_by_slot.find(slot);
+    const PointFixedPolicy* policy =
+        policy_found == point_policy_by_slot.end() ? nullptr
+                                                   : policy_found->second;
     if (policy != nullptr) {
       result.constant = policy->constant ? 1 : 0;
       result.config_role = policy->config_role;
@@ -1953,12 +1994,19 @@ bool NativeHostSolveMaterializer::Materialize(
     const uint32_t selected_count =
         selected == selected_point_observations.end() ? 0 : selected->second;
     if (points[slot].track_length > selected_count) result.constant = 1;
-    if (ContainsSlot(intent.explicit_variable_point_slots, slot)) {
+    if (explicit_variable_point_slots.count(slot) != 0) {
       if (policy != nullptr && policy->constant) {
         return SetError(
             "native point is both explicitly variable and constant", error);
       }
       result.constant = 0;
+    }
+    if (explicit_constant_point_slots.count(slot) != 0) {
+      if (policy == nullptr || !policy->constant) {
+        return SetError(
+            "native explicit constant point lacks a constant policy", error);
+      }
+      result.constant = 1;
     }
     view->fixed.points.push_back(result);
   }
@@ -2180,9 +2228,19 @@ bool NativeHostSolveMaterializer::Materialize(
       return SetError("native solve is missing active image state", error);
     }
     DenseImageState state = gathered_state.images[image_state_indices_[slot]];
+    double input_norm2 = 0.0;
+    for (const double value : state.quaternion) input_norm2 += value * value;
+    const bool fixed_input = fixed_pose_slots.count(slot) != 0 ||
+                             boundary_image_slots.count(slot) != 0;
     if (!IsFiniteArray(state.quaternion) || !IsFiniteArray(state.translation) ||
+        (fixed_input &&
+         (!std::isfinite(input_norm2) ||
+          std::abs(std::sqrt(input_norm2) - 1.0) > 1e-12)) ||
         !NormalizeQuaternion(state.quaternion, &state.quaternion)) {
-      return SetError("native image state normalization failed", error);
+      return SetError(fixed_input
+                          ? "native fixed quaternion is not normalized"
+                          : "native image state normalization failed",
+                      error);
     }
     active_state->images.push_back(state);
     runtime->state_values_copied += 7;

@@ -36,6 +36,7 @@
 #include <cmath>
 #include <fstream>
 #include <iomanip>
+#include <limits>
 #include <mutex>
 #include <sstream>
 
@@ -278,7 +279,7 @@ size_t BundleAdjustmentConfig::NumResiduals(
 }
 
 void BundleAdjustmentConfig::AddImage(const image_t image_id) {
-  image_ids_.insert(image_id);
+  if (image_ids_.insert(image_id).second) ordered_image_ids_.push_back(image_id);
 }
 
 void BundleAdjustmentConfig::AddLidarPoint(const point3D_t& point3D_id, const class LidarPoint& lidar_point) {
@@ -294,7 +295,12 @@ bool BundleAdjustmentConfig::HasImage(const image_t image_id) const {
 }
 
 void BundleAdjustmentConfig::RemoveImage(const image_t image_id) {
-  image_ids_.erase(image_id);
+  if (image_ids_.erase(image_id) != 0) {
+    ordered_image_ids_.erase(
+        std::remove(ordered_image_ids_.begin(), ordered_image_ids_.end(),
+                    image_id),
+        ordered_image_ids_.end());
+  }
 }
 
 void BundleAdjustmentConfig::SetConstantCamera(const camera_t camera_id) {
@@ -344,6 +350,10 @@ bool BundleAdjustmentConfig::HasConstantTvec(const image_t image_id) const {
 
 const std::unordered_set<image_t>& BundleAdjustmentConfig::Images() const {
   return image_ids_;
+}
+
+const std::vector<image_t>& BundleAdjustmentConfig::OrderedImages() const {
+  return ordered_image_ids_;
 }
 
 const std::unordered_set<point3D_t>& BundleAdjustmentConfig::VariablePoints()
@@ -1224,6 +1234,32 @@ void WriteExecutionTelemetry(const std::string& path,
        << value.indexed_device_catalog_prefix_bytes
        << ",\"indexed_device_catalog_arena_generation\":"
        << value.indexed_device_catalog_arena_generation
+       << ",\"native_device_store_lookup_calls\":"
+       << value.native_device_store_lookup_calls
+       << ",\"native_device_store_reuse_calls\":"
+       << value.native_device_store_reuse_calls
+       << ",\"native_device_store_full_upload_calls\":"
+       << value.native_device_store_full_upload_calls
+       << ",\"native_device_store_full_upload_bytes\":"
+       << value.native_device_store_full_upload_bytes
+       << ",\"native_device_store_patch_upload_calls\":"
+       << value.native_device_store_patch_upload_calls
+       << ",\"native_device_store_patch_upload_bytes\":"
+       << value.native_device_store_patch_upload_bytes
+       << ",\"native_device_store_growth_d2d_calls\":"
+       << value.native_device_store_growth_d2d_calls
+       << ",\"native_device_store_growth_d2d_bytes\":"
+       << value.native_device_store_growth_d2d_bytes
+       << ",\"native_device_store_invalidations\":"
+       << value.native_device_store_invalidations
+       << ",\"native_variable_state_d2h_calls\":"
+       << value.native_variable_state_d2h_calls
+       << ",\"native_variable_state_d2h_bytes\":"
+       << value.native_variable_state_d2h_bytes
+       << ",\"native_legacy_kernel_input_bundle_calls\":"
+       << value.native_legacy_kernel_input_bundle_calls
+       << ",\"native_repeated_residual_state_packing_bytes\":"
+       << value.native_repeated_residual_state_packing_bytes
        << ",\"host_store_host_resident_bytes\":"
        << value.host_store_host_resident_bytes
        << ",\"host_store_host_peak_bytes\":"
@@ -1271,6 +1307,10 @@ void WriteExecutionTelemetry(const std::string& path,
   WriteJsonNumber(file, value.legacy_cpu_preparation_milliseconds);
   file << ",\"fast_cpu_preparation_milliseconds\":";
   WriteJsonNumber(file, value.fast_cpu_preparation_milliseconds);
+  file << ",\"native_indexed_packing_milliseconds\":";
+  WriteJsonNumber(file, value.native_indexed_packing_milliseconds);
+  file << ",\"native_variable_state_download_milliseconds\":";
+  WriteJsonNumber(file, value.native_variable_state_download_milliseconds);
   file << ",\"trigger_image_id\":" << value.trigger_image_id
        << ",\"refinement_index\":" << value.refinement_index;
   file << "}\n";
@@ -1925,6 +1965,40 @@ void ProjectCudaSummary(const gpu_ba::CudaSolveProblem& snapshot,
                  : ceres::FAILURE);
   summary->message = cuda.termination_reason;
 }
+
+void ProjectNativeCudaSummary(const gpu_ba::NativeHostSolveView& view,
+                              const gpu_ba::BaSolveResult& native,
+                              const double wall_seconds,
+                              ceres::Solver::Summary* summary) {
+  *summary = ceres::Solver::Summary();
+  summary->num_parameter_blocks =
+      static_cast<int>(view.parameter_ordinals.size());
+  summary->num_parameters = static_cast<int>(view.ambient_parameter_count);
+  summary->num_residual_blocks = static_cast<int>(view.residual_block_count);
+  summary->num_residuals = static_cast<int>(view.scalar_residual_count);
+  for (const gpu_ba::ParameterOrdinal& parameter : view.parameter_ordinals) {
+    if (parameter.constant) continue;
+    ++summary->num_parameter_blocks_reduced;
+    summary->num_parameters_reduced += parameter.ambient_size;
+    summary->num_effective_parameters_reduced += parameter.tangent_size;
+  }
+  summary->num_residual_blocks_reduced = summary->num_residual_blocks;
+  summary->num_residuals_reduced = summary->num_residuals;
+  summary->initial_cost = native.initial_cost;
+  summary->final_cost = native.final_cost;
+  summary->num_successful_steps = native.accepted_steps;
+  summary->num_unsuccessful_steps =
+      native.rejected_steps + native.invalid_steps;
+  summary->total_time_in_seconds = wall_seconds;
+  summary->minimizer_time_in_seconds = wall_seconds;
+  summary->termination_type = native.success
+      ? (native.termination_reason == "maximum_trial_iterations" ||
+                 native.termination_reason == "maximum_solver_time"
+             ? ceres::NO_CONVERGENCE
+             : ceres::CONVERGENCE)
+      : ceres::FAILURE;
+  summary->message = native.termination_reason;
+}
 #endif  // GPU_BA_CUDA_ENABLED
 
 #ifdef GPU_BA_ENABLED
@@ -2008,6 +2082,238 @@ BuildFidelityParameterConstraints(
 #endif  // GPU_BA_ENABLED
 }  // namespace
 
+#ifdef GPU_BA_CUDA_ENABLED
+bool ResolveNativeBundleAdjustmentCudaConfiguration(
+    const BundleAdjustmentOptions& options,
+    const ceres::Solver::Options& effective_solver_options,
+    const uint64_t config_generation,
+    gpu_ba::CudaFullLmOptions* resolved_options,
+    gpu_ba::NativeCudaResolvedConfig* config,
+    std::string* error) {
+  if (resolved_options == nullptr || config == nullptr || error == nullptr ||
+      config_generation == 0) {
+    if (error != nullptr) *error = "invalid native BA config arguments";
+    return false;
+  }
+  gpu_ba::CudaLossMode loss_mode;
+  switch (options.loss_function_type) {
+    case BundleAdjustmentOptions::LossFunctionType::TRIVIAL:
+      loss_mode = gpu_ba::CudaLossMode::kTrivial;
+      break;
+    case BundleAdjustmentOptions::LossFunctionType::SOFT_L1:
+      loss_mode = gpu_ba::CudaLossMode::kSoftL1;
+      break;
+    case BundleAdjustmentOptions::LossFunctionType::CAUCHY:
+      *error = "UNSUPPORTED_CONFIGURATION: native_graph Cauchy loss";
+      return false;
+  }
+  gpu_ba::LidarResidualMode lidar_mode;
+  if (!gpu_ba::ParseLidarResidualMode(options.ba_lidar_residual, &lidar_mode)) {
+    *error = "UNSUPPORTED_CONFIGURATION: native_graph lidar mode";
+    return false;
+  }
+  const gpu_ba::CudaFullLmOptions requested =
+      CreateProductionCudaOptions(options, effective_solver_options);
+  return gpu_ba::ResolveNativeCudaConfiguration(
+      requested, loss_mode, options.loss_function_scale, lidar_mode,
+      config_generation, resolved_options, config, error);
+}
+
+bool BuildNativeBaSolveIntent(
+    const BundleAdjustmentOptions& options,
+    const BundleAdjustmentConfig& config,
+    const Reconstruction& reconstruction,
+    const uint64_t owner_epoch,
+    const uint64_t topology_revision,
+    const uint64_t selection_revision,
+    const gpu_ba::BaKind kind,
+    gpu_ba::NativeBaSolveIntent* intent,
+    std::string* error) {
+  if (intent == nullptr || error == nullptr || owner_epoch == 0 ||
+      topology_revision == 0 || selection_revision == 0 ||
+      reconstruction.StructureOwnerEpoch() != owner_epoch ||
+      reconstruction.StructureRevision() != topology_revision) {
+    if (error != nullptr) *error = "invalid native BA intent identity";
+    return false;
+  }
+  gpu_ba::CudaFullLmOptions resolved_options;
+  gpu_ba::NativeCudaResolvedConfig resolved_config;
+  if (!ResolveNativeBundleAdjustmentCudaConfiguration(
+          options, options.solver_options, selection_revision,
+          &resolved_options, &resolved_config, error)) {
+    return false;
+  }
+
+  gpu_ba::NativeBaSolveIntent result;
+  result.owner_epoch = owner_epoch;
+  result.reconstruction_identity =
+      reinterpret_cast<uintptr_t>(&reconstruction);
+  result.expected_topology_revision = topology_revision;
+  result.selection_revision = selection_revision;
+  result.kind = kind;
+  result.config = resolved_config;
+  result.active_image_ids.reserve(config.OrderedImages().size());
+  result.translation_policies.reserve(config.OrderedImages().size());
+  std::unordered_set<camera_t> seen_cameras;
+  seen_cameras.reserve(config.OrderedImages().size());
+  for (const image_t image_id : config.OrderedImages()) {
+    if (!reconstruction.ExistsImage(image_id)) {
+      *error = "native BA intent selected image is missing";
+      return false;
+    }
+    const Image& image = reconstruction.Image(image_id);
+    if (!image.IsRegistered() || !reconstruction.ExistsCamera(image.CameraId())) {
+      *error = "native BA intent selected image is not registered";
+      return false;
+    }
+    result.active_image_ids.push_back(image_id);
+    const bool fixed_pose =
+        !options.refine_extrinsics || config.HasConstantPose(image_id);
+    if (fixed_pose) result.fixed_pose_ids.push_back(image_id);
+    gpu_ba::NativeBaTranslationPolicy translation;
+    translation.image_id = image_id;
+    if (!fixed_pose && config.HasConstantTvec(image_id)) {
+      for (const int index : config.ConstantTvec(image_id)) {
+        if (index < 0 || index >= 3) {
+          *error = "native BA intent translation subset is invalid";
+          return false;
+        }
+        translation.constant_mask |= static_cast<uint8_t>(1u << index);
+      }
+    }
+    result.translation_policies.push_back(translation);
+
+    if (seen_cameras.insert(image.CameraId()).second) {
+      const Camera& camera = reconstruction.Camera(image.CameraId());
+      gpu_ba::NativeBaCameraPolicy policy;
+      policy.camera_id = image.CameraId();
+      if (!options.refine_focal_length) {
+        for (const size_t index : camera.FocalLengthIdxs())
+          policy.fixed_parameter_indices.push_back(index);
+      }
+      if (!options.refine_principal_point) {
+        for (const size_t index : camera.PrincipalPointIdxs())
+          policy.fixed_parameter_indices.push_back(index);
+      }
+      if (!options.refine_extra_params) {
+        for (const size_t index : camera.ExtraParamsIdxs())
+          policy.fixed_parameter_indices.push_back(index);
+      }
+      std::sort(policy.fixed_parameter_indices.begin(),
+                policy.fixed_parameter_indices.end());
+      policy.fixed_parameter_indices.erase(
+          std::unique(policy.fixed_parameter_indices.begin(),
+                      policy.fixed_parameter_indices.end()),
+          policy.fixed_parameter_indices.end());
+      policy.constant = config.IsConstantCamera(image.CameraId()) ||
+                        policy.fixed_parameter_indices.size() ==
+                            camera.Params().size();
+      result.camera_policies.push_back(std::move(policy));
+    }
+  }
+
+  std::vector<point3D_t> variable_points(config.VariablePoints().begin(),
+                                         config.VariablePoints().end());
+  std::vector<point3D_t> constant_points(config.ConstantPoints().begin(),
+                                         config.ConstantPoints().end());
+  std::sort(variable_points.begin(), variable_points.end());
+  std::sort(constant_points.begin(), constant_points.end());
+  result.explicit_variable_point_ids.assign(variable_points.begin(),
+                                            variable_points.end());
+  result.explicit_constant_point_ids.assign(constant_points.begin(),
+                                            constant_points.end());
+  const auto append_point_policy = [&](const point3D_t point_id,
+                                       const bool constant,
+                                       const uint8_t role) {
+    gpu_ba::NativeBaPointPolicy policy;
+    policy.point3D_id = point_id;
+    policy.constant = constant;
+    policy.config_role = role;
+    const auto range = config.LidarSearchRanges().find(point_id);
+    policy.has_search_range = range != config.LidarSearchRanges().end();
+    policy.search_range = policy.has_search_range ? range->second : 0.0;
+    result.point_policies.push_back(policy);
+  };
+  for (const point3D_t point_id : variable_points) {
+    if (!reconstruction.ExistsPoint3D(point_id)) {
+      *error = "native BA intent variable point is missing";
+      return false;
+    }
+    append_point_policy(point_id, false, 1);
+  }
+  for (const point3D_t point_id : constant_points) {
+    if (!reconstruction.ExistsPoint3D(point_id)) {
+      *error = "native BA intent constant point is missing";
+      return false;
+    }
+    append_point_policy(point_id, true, 2);
+  }
+
+  std::vector<point3D_t> lidar_points;
+  if (options.if_add_lidar_constraint) {
+    lidar_points.reserve(config.lidar_maps_.size());
+    for (const auto& item : config.lidar_maps_)
+      lidar_points.push_back(item.first);
+  }
+  std::sort(lidar_points.begin(), lidar_points.end());
+  result.lidar_map_generation = topology_revision;
+  result.lidar_match_config_generation = selection_revision;
+  for (const point3D_t point_id : lidar_points) {
+    if (!reconstruction.ExistsPoint3D(point_id)) {
+      *error = "native BA intent LiDAR point is missing";
+      return false;
+    }
+    LidarPoint lidar = config.lidar_maps_.at(point_id);
+    const Eigen::Vector4d plane_value = lidar.LidarABCD();
+    const Eigen::Vector3d xyz_value = lidar.LidarXYZ();
+    bool finite = true;
+    for (int index = 0; index < 4; ++index)
+      finite = finite && std::isfinite(plane_value[index]);
+    for (int index = 0; index < 3; ++index)
+      finite = finite && std::isfinite(xyz_value[index]);
+    if (!finite) continue;
+    double weight = 0.0;
+    const LidarPointType type = lidar.Type();
+    if (type == LidarPointType::Proj) {
+      weight = options.proj_lidar_constraint_weight;
+    } else if (type == LidarPointType::Icp) {
+      weight = options.icp_lidar_constraint_weight;
+    } else if (type == LidarPointType::IcpGround) {
+      weight = options.icp_ground_lidar_constraint_weight;
+    } else {
+      continue;
+    }
+    if (!std::isfinite(weight)) {
+      *error = "native BA intent LiDAR weight is nonfinite";
+      return false;
+    }
+    gpu_ba::NativeBaLidarConstraint constraint;
+    constraint.point3D_id = point_id;
+    constraint.constraint_slot = result.lidar_constraints.size();
+    constraint.physical_identity =
+        (static_cast<uint64_t>(point_id) << 2) ^
+        static_cast<uint64_t>(type);
+    constraint.lidar_type = static_cast<uint8_t>(type);
+    for (int index = 0; index < 4; ++index)
+      constraint.plane[index] = plane_value[index];
+    for (int index = 0; index < 3; ++index)
+      constraint.lidar_xyz[index] = xyz_value[index];
+    constraint.weight = weight;
+    const auto range = config.LidarSearchRanges().find(point_id);
+    constraint.search_range =
+        range == config.LidarSearchRanges().end() ? 0.0 : range->second;
+    if (!std::isfinite(constraint.search_range)) {
+      *error = "native BA intent LiDAR search range is nonfinite";
+      return false;
+    }
+    result.lidar_constraints.push_back(constraint);
+  }
+  *intent = std::move(result);
+  error->clear();
+  return true;
+}
+#endif  // GPU_BA_CUDA_ENABLED
+
 BundleAdjuster::BundleAdjuster(const BundleAdjustmentOptions& options,
                                const BundleAdjustmentConfig& config)
     : options_(options), config_(config) {
@@ -2023,6 +2329,222 @@ void BundleAdjuster::SetOptimazePhrase(const OptimazePhrase& phrase) {
 void BundleAdjuster::SetCudaHostStoreBinding(
     const gpu_ba::CudaHostStoreBinding& binding) noexcept {
   cuda_host_store_binding_ = binding;
+}
+
+bool BundleAdjuster::SolveNative(
+    Reconstruction* reconstruction,
+    const gpu_ba::NativeBaSolveIntent& intent) {
+  CHECK_NOTNULL(reconstruction);
+  CHECK(!solve_called_) << "Cannot use the same BundleAdjuster multiple times";
+  solve_called_ = true;
+  problem_.reset();
+#ifdef GPU_BA_ENABLED
+  snapshot_recorder_.reset();
+  active_spec_builder_.reset();
+#endif
+  summary_ = ceres::Solver::Summary();
+  execution_result_ = BundleAdjustmentExecutionResult();
+  const auto solve_start = std::chrono::steady_clock::now();
+  execution_result_.requested_backend = options_.ba_backend;
+  execution_result_.executed_backend = "custom_cuda";
+  execution_result_.problem_source_requested = "native_graph";
+  execution_result_.problem_source_effective = "native_graph";
+  execution_result_.summary_source = "native_graph_projection";
+  execution_result_.host_store_mode_requested =
+      options_.ba_cuda_host_problem_store;
+  execution_result_.host_store_mode_effective = "host_prepared_store";
+  execution_result_.ceres_problem_created = false;
+  execution_result_.snapshot_recorder_created = false;
+  execution_result_.snapshot_materialization_calls = 0;
+  execution_result_.active_spec_build_calls = 0;
+  execution_result_.registered_images = reconstruction->NumRegImages();
+  const auto finish = [&](const bool success) {
+    execution_result_.success = success;
+    execution_result_.wall_seconds =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                      solve_start)
+            .count();
+    WriteExecutionTelemetry(options_.ba_telemetry_path, execution_result_);
+    return success;
+  };
+#ifndef GPU_BA_CUDA_ENABLED
+  execution_result_.executed_backend = "none";
+  execution_result_.termination = "failure";
+  execution_result_.diagnostic_message =
+      "native_graph requires a CUDA-enabled build";
+  SetStableError(&execution_result_, StableBaError::kUnsupportedConfiguration);
+  return finish(false);
+#else
+  execution_result_.ba_kind = gpu_ba::BaKindName(intent.kind);
+  const gpu_ba::BaKind phrase_kind =
+      optimize_phrase_ == OptimazePhrase::Local
+          ? gpu_ba::BaKind::kLocal
+          : (optimize_phrase_ == OptimazePhrase::WholeMap
+                 ? gpu_ba::BaKind::kWhole
+                 : gpu_ba::BaKind::kGlobal);
+  if (options_.ba_backend != "custom_cuda" ||
+      options_.ba_cuda_problem_source !=
+          gpu_ba::CudaProblemSource::kNativeGraph ||
+      cuda_host_store_binding_.mode !=
+          gpu_ba::CudaHostProblemStoreMode::kHostPreparedStore ||
+      intent.kind != phrase_kind || !intent.config.resolved) {
+    execution_result_.termination = "failure";
+    execution_result_.diagnostic_message =
+        "native_graph direct handoff configuration is invalid";
+    SetStableError(&execution_result_,
+                   StableBaError::kUnsupportedConfiguration);
+    return finish(false);
+  }
+  gpu_ba::CudaFullLmOptions cuda_options;
+  std::string error;
+  if (!gpu_ba::MakeCudaFullLmOptionsFromNativeConfig(
+          intent.config, &cuda_options, &error)) {
+    execution_result_.termination = "failure";
+    execution_result_.diagnostic_message = error;
+    SetStableError(&execution_result_,
+                   StableBaError::kUnsupportedConfiguration);
+    return finish(false);
+  }
+  gpu_ba::PreparedNativeActiveSolve prepared;
+  const auto prepare_start = std::chrono::steady_clock::now();
+  if (!gpu_ba::PrepareCudaNativeBaSolve(
+          intent, reconstruction, cuda_options, cuda_host_store_binding_,
+          &prepared, &error)) {
+    execution_result_.termination = "failure";
+    execution_result_.diagnostic_message = error;
+    SetStableError(&execution_result_,
+                   StableBaError::kUnsupportedConfiguration);
+    return finish(false);
+  }
+  execution_result_.host_store_preparation_total_milliseconds =
+      std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - prepare_start)
+          .count();
+  const gpu_ba::NativeHostSolveView* view = prepared.view();
+  CHECK_NOTNULL(view);
+  execution_result_.residuals = view->scalar_residual_count;
+  execution_result_.residual_blocks = view->residual_block_count;
+  execution_result_.parameter_blocks = view->parameter_ordinals.size();
+  execution_result_.parameters = view->ambient_parameter_count;
+  execution_result_.effective_parameters = view->effective_parameter_count;
+  const auto cuda_start = std::chrono::steady_clock::now();
+  gpu_ba::BaSolveResult native;
+  const bool cuda_ok = gpu_ba::RunCustomCudaSolve(
+      prepared.request(), &native, &error);
+  const double cuda_wall = std::chrono::duration<double>(
+      std::chrono::steady_clock::now() - cuda_start).count();
+  execution_result_.custom_cuda_caller_wall_seconds = cuda_wall;
+  execution_result_.problem_source_prepare_and_cuda_wall_seconds =
+      std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                    prepare_start)
+          .count();
+  execution_result_.trial_steps = native.trial_iterations;
+  execution_result_.accepted_steps = native.accepted_steps;
+  execution_result_.accepted_commits = native.accepted_commits;
+  execution_result_.rejected_steps = native.rejected_steps;
+  execution_result_.invalid_steps = native.invalid_steps;
+  execution_result_.initial_cost = native.initial_cost;
+  execution_result_.final_cost = native.final_cost;
+  execution_result_.max_backward_error = native.max_backward_error;
+  execution_result_.native_device_store_lookup_calls =
+      native.runtime.device_store_lookup_calls;
+  execution_result_.native_device_store_reuse_calls =
+      native.runtime.device_store_reuse_calls;
+  execution_result_.native_device_store_full_upload_calls =
+      native.runtime.device_store_full_upload_calls;
+  execution_result_.native_device_store_full_upload_bytes =
+      native.runtime.device_store_full_upload_bytes;
+  execution_result_.native_device_store_patch_upload_calls =
+      native.runtime.device_store_patch_upload_calls;
+  execution_result_.native_device_store_patch_upload_bytes =
+      native.runtime.device_store_patch_upload_bytes;
+  execution_result_.native_device_store_growth_d2d_calls =
+      native.runtime.device_store_growth_d2d_calls;
+  execution_result_.native_device_store_growth_d2d_bytes =
+      native.runtime.device_store_growth_d2d_bytes;
+  execution_result_.native_device_store_invalidations =
+      native.runtime.device_store_invalidations;
+  execution_result_.native_variable_state_d2h_calls =
+      native.runtime.variable_state_delta_device_download_calls;
+  execution_result_.native_variable_state_d2h_bytes =
+      native.runtime.variable_state_delta_device_download_bytes;
+  execution_result_.native_legacy_kernel_input_bundle_calls =
+      native.runtime.legacy_kernel_input_bundle_calls;
+  execution_result_.native_repeated_residual_state_packing_bytes =
+      native.runtime.repeated_residual_state_packing_bytes;
+  execution_result_.native_indexed_packing_milliseconds =
+      native.runtime.indexed_packing_milliseconds;
+  execution_result_.native_variable_state_download_milliseconds =
+      native.runtime.variable_state_download_milliseconds;
+  const double cost_tolerance =
+      std::max(1e-8, 1e-10 * std::max(1.0, native.initial_cost));
+  const bool backward_error_contract =
+      native.trial_iterations == 0 ||
+      (native.backward_error_samples != 0 &&
+       std::isfinite(native.max_backward_error));
+  const bool numerical_contract =
+      cuda_ok && native.success && std::isfinite(native.initial_cost) &&
+      std::isfinite(native.final_cost) && native.initial_cost >= 0.0 &&
+      native.final_cost >= 0.0 &&
+      native.final_cost <= native.initial_cost + cost_tolerance &&
+      native.accepted_decisions == native.accepted_commits &&
+      backward_error_contract &&
+      !native.resource_cleanup_failed &&
+      native.runtime.legacy_kernel_input_bundle_calls == 0 &&
+      native.runtime.repeated_residual_state_packing_bytes == 0;
+  if (numerical_contract) {
+    std::string commit_error;
+    if (!gpu_ba::ValidateAndCommitNativeBaDelta(
+            intent, prepared, native.variable_delta, reconstruction,
+            &commit_error)) {
+      prepared.Complete(&error);
+      execution_result_.termination = "failure";
+      execution_result_.diagnostic_message = commit_error;
+      SetStableError(&execution_result_, StableBaError::kCommitIntegrityError);
+      return finish(false);
+    }
+    ProjectNativeCudaSummary(*view, native, cuda_wall, &summary_);
+    execution_result_.termination = native.termination_reason;
+    prepared.Release();
+    return finish(true);
+  }
+  prepared.Complete(&error);
+  execution_result_.termination = "failure";
+  execution_result_.diagnostic_message = error.empty() ? native.error : error;
+  SetStableError(&execution_result_, StableBaError::kCustomCudaFailed);
+  if (!options_.ba_fallback_to_ceres) return finish(false);
+
+  BundleAdjustmentOptions fallback_options = options_;
+  fallback_options.ba_backend = "ceres_cpu";
+  fallback_options.ba_fallback_to_ceres = false;
+  fallback_options.ba_cuda_problem_source =
+      gpu_ba::CudaProblemSource::kLegacySnapshot;
+  fallback_options.ba_cuda_host_problem_store = "disabled";
+  fallback_options.ba_telemetry_path.clear();
+  BundleAdjuster fallback(fallback_options, config_);
+  fallback.SetOptimazePhrase(optimize_phrase_);
+  const bool fallback_ok = fallback.Solve(reconstruction);
+  summary_ = fallback.Summary();
+  const BundleAdjustmentExecutionResult fallback_result =
+      fallback.ExecutionResult();
+  execution_result_.fallback_used = true;
+  execution_result_.fallback_reason = native.error;
+  execution_result_.ceres_solve_calls = fallback_result.ceres_solve_calls;
+  execution_result_.ceres_problem_created =
+      fallback_result.ceres_problem_created;
+  execution_result_.ceres_cost_function_creations =
+      fallback_result.ceres_cost_function_creations;
+  execution_result_.ceres_add_residual_calls =
+      fallback_result.ceres_add_residual_calls;
+  execution_result_.termination = fallback_result.termination;
+  execution_result_.executed_backend = fallback_result.executed_backend;
+  if (!fallback_ok) {
+    SetStableError(&execution_result_, StableBaError::kCeresFallbackFailed);
+  } else {
+    execution_result_.stable_error.clear();
+  }
+  return finish(fallback_ok);
+#endif
 }
 
 #ifdef GPU_BA_ENABLED
@@ -2154,11 +2676,7 @@ bool BundleAdjuster::Solve(Reconstruction* reconstruction) {
   const auto finish = [&](const bool success) {
 #ifdef GPU_BA_CUDA_ENABLED
     if (prepared_native_solve.valid()) {
-      std::string complete_error;
-      if (!prepared_native_solve.Complete(&complete_error) &&
-          execution_result_.diagnostic_message.empty()) {
-        execution_result_.diagnostic_message = complete_error;
-      }
+      prepared_native_solve.Release();
     }
     if (prepared_indexed_solve.valid()) {
       std::string complete_error;
@@ -2817,6 +3335,36 @@ bool BundleAdjuster::Solve(Reconstruction* reconstruction) {
     if (native_graph_requested) {
       execution_result_.max_backward_error =
           native_result.max_backward_error;
+      execution_result_.native_device_store_lookup_calls =
+          native_result.runtime.device_store_lookup_calls;
+      execution_result_.native_device_store_reuse_calls =
+          native_result.runtime.device_store_reuse_calls;
+      execution_result_.native_device_store_full_upload_calls =
+          native_result.runtime.device_store_full_upload_calls;
+      execution_result_.native_device_store_full_upload_bytes =
+          native_result.runtime.device_store_full_upload_bytes;
+      execution_result_.native_device_store_patch_upload_calls =
+          native_result.runtime.device_store_patch_upload_calls;
+      execution_result_.native_device_store_patch_upload_bytes =
+          native_result.runtime.device_store_patch_upload_bytes;
+      execution_result_.native_device_store_growth_d2d_calls =
+          native_result.runtime.device_store_growth_d2d_calls;
+      execution_result_.native_device_store_growth_d2d_bytes =
+          native_result.runtime.device_store_growth_d2d_bytes;
+      execution_result_.native_device_store_invalidations =
+          native_result.runtime.device_store_invalidations;
+      execution_result_.native_variable_state_d2h_calls =
+          native_result.runtime.variable_state_delta_device_download_calls;
+      execution_result_.native_variable_state_d2h_bytes =
+          native_result.runtime.variable_state_delta_device_download_bytes;
+      execution_result_.native_legacy_kernel_input_bundle_calls =
+          native_result.runtime.legacy_kernel_input_bundle_calls;
+      execution_result_.native_repeated_residual_state_packing_bytes =
+          native_result.runtime.repeated_residual_state_packing_bytes;
+      execution_result_.native_indexed_packing_milliseconds =
+          native_result.runtime.indexed_packing_milliseconds;
+      execution_result_.native_variable_state_download_milliseconds =
+          native_result.runtime.variable_state_download_milliseconds;
     }
 
     const double cost_tolerance =
@@ -2848,7 +3396,7 @@ bool BundleAdjuster::Solve(Reconstruction* reconstruction) {
       const bool commit_ok = native_graph_requested
           ? gpu_ba::ValidateAndCommitNativeBaState(
                 native_inputs, prepared_native_solve,
-                native_result.final_state, reconstruction, &commit_error)
+                native_result.variable_delta, reconstruction, &commit_error)
           : (typed_problem_requested
                  ? gpu_ba::ValidateAndCommitActiveBaState(
                        active_spec, cuda_result.final_state, reconstruction,
@@ -2889,20 +3437,7 @@ bool BundleAdjuster::Solve(Reconstruction* reconstruction) {
             prepared_indexed_solve.runtime_info(), &execution_result_);
       }
       if (prepared_native_solve.valid()) {
-        std::string complete_error;
-        if (!prepared_native_solve.Complete(&complete_error)) {
-          SetStableError(&execution_result_,
-                         StableBaError::kCommitIntegrityError);
-          execution_result_.diagnostic_message = complete_error;
-          execution_result_.termination = "failure";
-          std::string restore_error;
-          if (!restore_transaction(true, &restore_error)) {
-            SetStableError(&execution_result_,
-                           StableBaError::kTransactionRestoreFailed);
-            execution_result_.diagnostic_message = restore_error;
-          }
-          return finish(false);
-        }
+        prepared_native_solve.Release();
       }
       if (prepared_host_view.valid()) {
         std::string complete_error;
