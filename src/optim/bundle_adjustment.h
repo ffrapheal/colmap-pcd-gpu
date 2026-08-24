@@ -46,6 +46,7 @@
 #include "base/camera_rig.h"
 #include "base/reconstruction.h"
 #include "gpu_ba/host_problem_store.h"
+#include "gpu_ba/host_ba_graph.h"
 #include "gpu_ba/active_ba_solve_spec.h"
 #include "util/alignment.h"
 
@@ -94,6 +95,8 @@ struct BundleAdjustmentOptions {
   std::string ba_cuda_host_problem_store = "disabled";
   gpu_ba::CudaProblemSource ba_cuda_problem_source =
       gpu_ba::CudaProblemSource::kLegacySnapshot;
+  gpu_ba::CudaPreparedSelectionCacheMode ba_cuda_prepared_selection_cache =
+      gpu_ba::CudaPreparedSelectionCacheMode::kDisabled;
   std::string ba_lidar_residual = "legacy_exact";
   std::string ba_telemetry_path;
   uint64_t ba_refinement_index = 0;
@@ -328,6 +331,43 @@ struct BundleAdjustmentExecutionResult {
   uint64_t native_legacy_kernel_input_bundle_calls = 0;
   uint64_t native_repeated_residual_state_packing_bytes = 0;
   double native_indexed_packing_milliseconds = 0.0;
+  uint64_t native_indexed_plan_build_calls = 0;
+  uint64_t native_plan_prepare_requests = 0;
+  uint64_t native_host_plan_hits = 0;
+  uint64_t native_host_plan_misses = 0;
+  uint64_t native_host_plan_bypasses = 0;
+  uint64_t native_host_plan_dependency_misses = 0;
+  uint64_t native_host_plan_hash_collisions = 0;
+  uint64_t native_host_plan_build_calls = 0;
+  uint64_t native_host_plan_evictions = 0;
+  uint64_t native_host_plan_resident_bytes = 0;
+  uint64_t native_host_plan_peak_bytes = 0;
+  uint64_t native_static_materialize_calls = 0;
+  uint64_t native_dynamic_state_gather_calls = 0;
+  uint64_t native_plan_vector_copy_bytes_on_hit = 0;
+  uint64_t native_intent_incidence_traversal_visits = 0;
+  uint64_t native_materializer_incidence_traversal_visits = 0;
+  uint64_t native_device_selection_hits = 0;
+  uint64_t native_device_selection_misses = 0;
+  uint64_t native_device_selection_bypasses = 0;
+  uint64_t native_device_selection_lookup_calls = 0;
+  uint64_t native_device_selection_upload_calls = 0;
+  uint64_t native_device_selection_evictions = 0;
+  uint64_t native_device_selection_context_invalidations = 0;
+  uint64_t native_device_selection_poison_events = 0;
+  uint64_t native_device_selection_static_h2d_calls = 0;
+  uint64_t native_device_selection_static_h2d_bytes = 0;
+  uint64_t native_device_selection_static_h2d_saved_calls = 0;
+  uint64_t native_device_selection_static_h2d_saved_bytes = 0;
+  uint64_t native_device_selection_resident_bytes = 0;
+  uint64_t native_device_selection_peak_bytes = 0;
+  uint64_t native_device_selection_cached_workspace_bytes = 0;
+  double native_intent_resolution_milliseconds = 0.0;
+  double native_plan_lookup_milliseconds = 0.0;
+  double native_plan_build_milliseconds = 0.0;
+  double native_plan_bind_milliseconds = 0.0;
+  double native_static_materialize_milliseconds = 0.0;
+  double native_dynamic_state_gather_milliseconds = 0.0;
   double native_variable_state_download_milliseconds = 0.0;
   double native_intent_build_milliseconds = 0.0;
   uint64_t host_store_host_resident_bytes = 0;

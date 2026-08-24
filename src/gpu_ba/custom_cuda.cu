@@ -20,11 +20,13 @@
 #include <cstring>
 #include <deque>
 #include <exception>
+#include <functional>
 #include <iomanip>
 #include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <numeric>
 #include <set>
 #include <sstream>
 #include <tuple>
@@ -38,6 +40,7 @@ namespace colmap {
 namespace gpu_ba {
 
 struct NativeIndexedKernelInput;
+struct DevicePreparedSelectionAllocation;
 
 namespace {
 
@@ -2691,6 +2694,14 @@ struct DeviceBaProblemStoreState {
   uint64_t fail_next_publish_for_testing = 0;
   uint64_t fail_next_context_query_for_testing = 0;
   uint64_t context_query_count_for_testing = 0;
+  std::unordered_map<uint64_t, std::weak_ptr<void>> host_selection_plans;
+  std::shared_ptr<void> indexed_build_scratch;
+  std::unordered_map<uint64_t, std::shared_ptr<void>> device_selection_plans;
+  std::unordered_map<uint64_t, uint64_t> device_selection_lru;
+  std::unordered_map<uint64_t, uint64_t> device_selection_bytes;
+  uint64_t device_selection_clock = 0;
+  uint64_t device_selection_resident_bytes = 0;
+  uint64_t device_selection_peak_bytes = 0;
 };
 
 bool DeviceBaPointerBelongsToContext(const void* pointer,
@@ -10171,7 +10182,7 @@ class GpuBaDeviceContext {
                   std::string* error);
   bool InitializeNative(const NativeHostSolveView& view,
                         const ActiveStateBuffer& initial_state,
-                        const NativeIndexedKernelInput& native,
+                        NativeIndexedKernelInput& native,
                         const CudaLayerBOptions& options,
                         uint64_t solve_generation,
                         uint64_t topology_generation,
@@ -10309,7 +10320,7 @@ class GpuBaDeviceContext {
   bool InitializeImpl(const Snapshot* legacy_initial_snapshot,
                       const NativeHostSolveView* native_view,
                       const ActiveStateBuffer* native_initial_state,
-                      const NativeIndexedKernelInput* native,
+                      NativeIndexedKernelInput* native,
                       const PackedLayerAState& initial,
                       const CostLayout& cost_layout,
                       const LayerBTopology& layer_b,
@@ -10481,7 +10492,10 @@ class GpuBaDeviceContext {
   CudaRuntimePoolLease runtime_pool_lease_;
   std::shared_ptr<DeviceBaProblemStoreAllocation>
       native_device_catalog_generation_;
+  std::shared_ptr<DevicePreparedSelectionAllocation>
+      native_device_selection_generation_;
   uint64_t native_device_catalog_resident_bytes_ = 0;
+  uint64_t native_device_selection_resident_bytes_ = 0;
   uint64_t arena_offset_ = 0;
   bool arena_planning_ = false;
   bool indexed_catalog_bound_ = false;
@@ -10617,9 +10631,9 @@ class GpuBaDeviceContext {
   std::vector<DeviceImageEntityState> host_image_entities_;
   std::vector<DevicePointEntityState> host_point_entities_;
   std::vector<DeviceCameraEntityState> host_camera_entities_;
-  std::vector<uint32_t> native_camera_slots_;
-  std::vector<uint32_t> native_image_slots_;
-  std::vector<uint32_t> native_point_slots_;
+  const std::vector<uint32_t>* native_camera_slots_ = nullptr;
+  const std::vector<uint32_t>* native_image_slots_ = nullptr;
+  const std::vector<uint32_t>* native_point_slots_ = nullptr;
   std::vector<uint32_t> variable_image_slots_;
   std::vector<uint8_t> variable_image_translation_masks_;
   std::vector<uint32_t> variable_point_slots_;
@@ -10815,6 +10829,25 @@ struct LegacyKernelInputBundle::Impl {
   bool layer_c_ready = false;
 };
 
+struct NativeIndexedStaticPlan {
+  uint64_t publication_id = 0;
+  std::vector<DeviceIndexedVisualBinding> visual_bindings;
+  std::vector<DeviceLidarStaticInput> lidar_static;
+  std::vector<uint32_t> camera_slots;
+  std::vector<uint32_t> image_slots;
+  std::vector<uint32_t> point_slots;
+  std::vector<uint32_t> visual_image_slots;
+  std::vector<uint32_t> visual_point_slots;
+  std::vector<uint32_t> lidar_point_slots;
+  CostLayout cost_layout;
+  LayerBTopology layer_b_topology;
+  LayerCTopology layer_c_topology;
+  std::vector<DeviceImageUpdateMeta> image_update_meta;
+  std::vector<DevicePointUpdateMeta> point_update_meta;
+  std::vector<uint32_t> pose_image_entity_indices;
+  std::vector<uint32_t> point_entity_indices;
+};
+
 struct NativeIndexedKernelInput {
   std::vector<DeviceIndexedVisualBinding> visual_bindings;
   std::vector<DeviceLidarStaticInput> lidar_static;
@@ -10830,9 +10863,68 @@ struct NativeIndexedKernelInput {
   CostLayout cost_layout;
   LayerBTopology layer_b_topology;
   LayerCTopology layer_c_topology;
+  std::vector<DeviceImageUpdateMeta> image_update_meta;
+  std::vector<DevicePointUpdateMeta> point_update_meta;
+  std::vector<uint32_t> pose_image_entity_indices;
+  std::vector<uint32_t> point_entity_indices;
+  std::shared_ptr<const NativeIndexedStaticPlan> prepared_static;
   NativeHostSolveViewIdentity identity;
   std::shared_ptr<DeviceBaProblemStoreState> device_store_state;
   BaSolveResult::Runtime runtime;
+
+  const NativeIndexedStaticPlan* Static() const noexcept {
+    return prepared_static.get();
+  }
+  const std::vector<DeviceIndexedVisualBinding>& VisualBindings()
+      const noexcept {
+    return prepared_static == nullptr ? visual_bindings
+                                      : prepared_static->visual_bindings;
+  }
+  const std::vector<DeviceLidarStaticInput>& LidarStatic() const noexcept {
+    return prepared_static == nullptr ? lidar_static
+                                      : prepared_static->lidar_static;
+  }
+  const std::vector<uint32_t>& CameraSlots() const noexcept {
+    return prepared_static == nullptr ? camera_slots
+                                      : prepared_static->camera_slots;
+  }
+  const std::vector<uint32_t>& ImageSlots() const noexcept {
+    return prepared_static == nullptr ? image_slots
+                                      : prepared_static->image_slots;
+  }
+  const std::vector<uint32_t>& PointSlots() const noexcept {
+    return prepared_static == nullptr ? point_slots
+                                      : prepared_static->point_slots;
+  }
+  const CostLayout& Cost() const noexcept {
+    return prepared_static == nullptr ? cost_layout
+                                      : prepared_static->cost_layout;
+  }
+  const LayerBTopology& LayerB() const noexcept {
+    return prepared_static == nullptr ? layer_b_topology
+                                      : prepared_static->layer_b_topology;
+  }
+  const LayerCTopology& LayerC() const noexcept {
+    return prepared_static == nullptr ? layer_c_topology
+                                      : prepared_static->layer_c_topology;
+  }
+  const std::vector<DeviceImageUpdateMeta>& ImageUpdateMeta() const noexcept {
+    return prepared_static == nullptr ? image_update_meta
+                                      : prepared_static->image_update_meta;
+  }
+  const std::vector<DevicePointUpdateMeta>& PointUpdateMeta() const noexcept {
+    return prepared_static == nullptr ? point_update_meta
+                                      : prepared_static->point_update_meta;
+  }
+  const std::vector<uint32_t>& PoseImageEntityIndices() const noexcept {
+    return prepared_static == nullptr
+               ? pose_image_entity_indices
+               : prepared_static->pose_image_entity_indices;
+  }
+  const std::vector<uint32_t>& PointEntityIndices() const noexcept {
+    return prepared_static == nullptr ? point_entity_indices
+                                      : prepared_static->point_entity_indices;
+  }
 };
 
 LegacyKernelInputBundle::LegacyKernelInputBundle() : impl_(new Impl()) {}
@@ -10914,19 +11006,19 @@ bool NativeFinite(const T& values) {
 
 const ImageFixedPolicyResult* NativeImagePolicy(
     const NativeHostSolveView& view, const uint32_t slot) {
-  for (const ImageFixedPolicyResult& value : view.fixed.images)
+  for (const ImageFixedPolicyResult& value : view.Fixed().images)
     if (value.image_slot == slot) return &value;
   return nullptr;
 }
 const PointFixedPolicyResult* NativePointPolicy(
     const NativeHostSolveView& view, const uint32_t slot) {
-  for (const PointFixedPolicyResult& value : view.fixed.points)
+  for (const PointFixedPolicyResult& value : view.Fixed().points)
     if (value.point_slot == slot) return &value;
   return nullptr;
 }
 const LidarConstraintRecord* NativeLidarConstraint(
     const NativeHostSolveView& view, const uint32_t slot) {
-  for (const LidarConstraintRecord& value : view.lidar.constraints)
+  for (const LidarConstraintRecord& value : view.LidarConstraints())
     if (value.constraint_slot == slot) return &value;
   return nullptr;
 }
@@ -10970,13 +11062,13 @@ bool BuildCudaLayerAInputs(const NativeHostSolveView& view,
   const auto graph_observations = view.catalog.observations();
   const uint32_t invalid = std::numeric_limits<uint32_t>::max();
   bundle.visual_output_by_execution_ordinal.assign(
-      view.residual_ordinals.size(), invalid);
+      view.ResidualOrdinals().size(), invalid);
   bundle.lidar_output_by_execution_ordinal.assign(
-      view.residual_ordinals.size(), invalid);
-  bundle.packed.visual.reserve(view.visual_observation_slots.size());
-  bundle.packed.lidar.reserve(view.lidar.constraints.size());
-  for (const ResidualOrdinal& ordinal : view.residual_ordinals) {
-    if (ordinal.execution_ordinal >= view.residual_ordinals.size()) {
+      view.ResidualOrdinals().size(), invalid);
+  bundle.packed.visual.reserve(view.VisualObservationSlots().size());
+  bundle.packed.lidar.reserve(view.LidarConstraints().size());
+  for (const ResidualOrdinal& ordinal : view.ResidualOrdinals()) {
+    if (ordinal.execution_ordinal >= view.ResidualOrdinals().size()) {
       *error = "native residual execution ordinal is out of bounds";
       return false;
     }
@@ -11079,12 +11171,12 @@ bool BuildStaticLayout(const NativeHostSolveView& view,
   LegacyKernelInputBundle::Impl& bundle = *output->impl_;
   if (!bundle.layer_a_ready || !NativeBundleIdentityReady(view, bundle, error))
     return false;
-  bundle.camera_slots = view.active_camera_slots;
-  bundle.image_slots = view.active_image_slots;
+  bundle.camera_slots = view.ActiveCameraSlots();
+  bundle.image_slots = view.ActiveImageSlots();
   bundle.image_slots.insert(bundle.image_slots.end(),
-                            view.boundary_image_slots.begin(),
-                            view.boundary_image_slots.end());
-  bundle.point_slots = view.active_point_slots;
+                            view.BoundaryImageSlots().begin(),
+                            view.BoundaryImageSlots().end());
+  bundle.point_slots = view.ActivePointSlots();
   const auto images = view.catalog.images();
   bundle.image_camera_slots.clear();
   bundle.image_camera_slots.reserve(bundle.image_slots.size());
@@ -11112,11 +11204,11 @@ bool BuildCostLayout(const NativeHostSolveView& view,
   cost.residual_order = view.config.residual_order;
   cost.visual_count = bundle.packed.visual.size();
   cost.lidar_count = bundle.packed.lidar.size();
-  cost.entries.reserve(view.residual_ordinals.size());
+  cost.entries.reserve(view.ResidualOrdinals().size());
   uint64_t layout_id = 1469598103934665603ull;
   HashTag(&layout_id, 0x4e4154495645434full);
   HashWord(&layout_id, static_cast<uint64_t>(cost.residual_order));
-  for (const ResidualOrdinal& ordinal : view.residual_ordinals) {
+  for (const ResidualOrdinal& ordinal : view.ResidualOrdinals()) {
     DeviceCostEntry entry;
     entry.residual_kind = ordinal.kind == ResidualKind::kVisual ? 0 : 1;
     entry.output_index = ordinal.kind == ResidualKind::kVisual
@@ -11157,9 +11249,9 @@ bool BuildLayerBTopology(const NativeHostSolveView& view,
   std::vector<const ImageFixedPolicyResult*> variable_images;
   std::vector<const PointFixedPolicyResult*> variable_points;
   if (view.config.residual_order == CudaResidualOrder::kCanonical) {
-    for (const ImageFixedPolicyResult& policy : view.fixed.images)
+    for (const ImageFixedPolicyResult& policy : view.Fixed().images)
       if (!policy.pose_constant) variable_images.push_back(&policy);
-    for (const PointFixedPolicyResult& policy : view.fixed.points)
+    for (const PointFixedPolicyResult& policy : view.Fixed().points)
       if (!policy.constant) variable_points.push_back(&policy);
     std::sort(variable_images.begin(), variable_images.end(),
               [&images](const auto* lhs, const auto* rhs) {
@@ -11174,7 +11266,7 @@ bool BuildLayerBTopology(const NativeHostSolveView& view,
   } else {
     std::unordered_set<uint32_t> seen_images;
     std::unordered_set<uint32_t> seen_points;
-    for (const ParameterOrdinal& parameter : view.parameter_ordinals) {
+    for (const ParameterOrdinal& parameter : view.ParameterOrdinals()) {
       if (parameter.kind == ParameterKind::kQuaternion && !parameter.constant &&
           seen_images.insert(static_cast<uint32_t>(parameter.entity_slot)).second) {
         const auto* policy = NativeImagePolicy(
@@ -11220,7 +11312,7 @@ bool BuildLayerBTopology(const NativeHostSolveView& view,
   }
   const auto observations = view.catalog.observations();
   std::map<std::pair<uint32_t, uint32_t>, std::vector<uint32_t>> edge_entries;
-  for (const ResidualOrdinal& ordinal : view.residual_ordinals) {
+  for (const ResidualOrdinal& ordinal : view.ResidualOrdinals()) {
     if (ordinal.kind != ResidualKind::kVisual) continue;
     const HostBaObservationSlot& observation = observations[ordinal.source_slot];
     const int32_t pose = pose_by_image_slot[observation.image_slot];
@@ -11407,11 +11499,75 @@ bool BuildIndexedLayerBExecutionPlan(
   return true;
 }
 
+struct NativeStampedIndex {
+  std::vector<uint32_t> stamps;
+  std::vector<int32_t> values;
+  uint32_t generation = 0;
+
+  bool Begin(const size_t size, std::string* error) {
+    try {
+      if (stamps.size() < size) {
+        stamps.resize(size, 0);
+        values.resize(size);
+      }
+    } catch (const std::bad_alloc&) {
+      *error = "native indexed stamped lookup allocation failed";
+      return false;
+    } catch (const std::length_error&) {
+      *error = "native indexed stamped lookup size overflow";
+      return false;
+    }
+    if (++generation == 0) {
+      std::fill(stamps.begin(), stamps.end(), 0);
+      generation = 1;
+    }
+    return true;
+  }
+
+  int32_t Get(const uint32_t slot) const noexcept {
+    return slot < stamps.size() && stamps[slot] == generation ? values[slot]
+                                                              : -1;
+  }
+
+  bool Set(const uint32_t slot, const int32_t value) noexcept {
+    if (slot >= stamps.size() || stamps[slot] == generation) return false;
+    stamps[slot] = generation;
+    values[slot] = value;
+    return true;
+  }
+};
+
+struct NativeIndexedBuildScratch {
+  NativeStampedIndex camera_entity;
+  NativeStampedIndex image_entity;
+  NativeStampedIndex point_entity;
+  NativeStampedIndex camera_state;
+  NativeStampedIndex image_state;
+  NativeStampedIndex point_state;
+  NativeStampedIndex image_policy;
+  NativeStampedIndex point_policy;
+  NativeStampedIndex variable_image_seen;
+  NativeStampedIndex variable_point_seen;
+  NativeStampedIndex pose_by_image;
+  NativeStampedIndex variable_point_by_slot;
+  std::unordered_map<uint64_t, uint32_t> edge_index;
+  std::vector<uint64_t> edge_keys;
+  std::vector<uint32_t> edge_counts;
+  std::vector<uint32_t> edge_order;
+  std::vector<uint32_t> edge_sorted_by_temporary;
+  std::vector<uint32_t> pose_counts;
+  std::vector<uint32_t> point_counts;
+  std::vector<uint32_t> pose_cursors;
+  std::vector<uint32_t> point_cursors;
+  std::vector<uint32_t> edge_cursors;
+};
+
 bool BuildNativeIndexedKernelInput(const NativeHostSolveView& view,
                                    const ActiveStateBuffer& state,
+                                   NativeIndexedBuildScratch* scratch,
                                    NativeIndexedKernelInput* output,
                                    std::string* error) {
-  if (output == nullptr || error == nullptr ||
+  if (scratch == nullptr || output == nullptr || error == nullptr ||
       !ValidateNativeHostSolveView(view, state, error)) {
     return false;
   }
@@ -11422,68 +11578,80 @@ bool BuildNativeIndexedKernelInput(const NativeHostSolveView& view,
   const auto graph_images = view.catalog.images();
   const auto graph_points = view.catalog.points();
   const auto graph_observations = view.catalog.observations();
-  std::vector<int32_t> camera_entity(graph_cameras.size, -1);
-  std::vector<int32_t> image_entity(graph_images.size, -1);
-  std::vector<int32_t> point_entity(graph_points.size, -1);
-  std::vector<int32_t> camera_state(graph_cameras.size, -1);
-  std::vector<int32_t> image_state(graph_images.size, -1);
-  std::vector<int32_t> point_state(graph_points.size, -1);
+  if (!scratch->camera_entity.Begin(graph_cameras.size, error) ||
+      !scratch->image_entity.Begin(graph_images.size, error) ||
+      !scratch->point_entity.Begin(graph_points.size, error) ||
+      !scratch->camera_state.Begin(graph_cameras.size, error) ||
+      !scratch->image_state.Begin(graph_images.size, error) ||
+      !scratch->point_state.Begin(graph_points.size, error) ||
+      !scratch->image_policy.Begin(graph_images.size, error) ||
+      !scratch->point_policy.Begin(graph_points.size, error) ||
+      !scratch->variable_image_seen.Begin(graph_images.size, error) ||
+      !scratch->variable_point_seen.Begin(graph_points.size, error) ||
+      !scratch->pose_by_image.Begin(graph_images.size, error) ||
+      !scratch->variable_point_by_slot.Begin(graph_points.size, error)) {
+    return false;
+  }
   for (size_t i = 0; i < state.cameras.size(); ++i) {
-    if (state.cameras[i].camera_slot >= camera_state.size() ||
-        camera_state[state.cameras[i].camera_slot] != -1 ||
+    if (i > static_cast<size_t>(std::numeric_limits<int32_t>::max()) ||
+        !scratch->camera_state.Set(state.cameras[i].camera_slot,
+                                   static_cast<int32_t>(i)) ||
         state.cameras[i].state_generation != state.state_generation) {
       *error = "native indexed camera state identity is invalid";
       return false;
     }
-    camera_state[state.cameras[i].camera_slot] = static_cast<int32_t>(i);
   }
   for (size_t i = 0; i < state.images.size(); ++i) {
-    if (state.images[i].image_slot >= image_state.size() ||
-        image_state[state.images[i].image_slot] != -1 ||
+    if (i > static_cast<size_t>(std::numeric_limits<int32_t>::max()) ||
+        !scratch->image_state.Set(state.images[i].image_slot,
+                                  static_cast<int32_t>(i)) ||
         state.images[i].state_generation != state.state_generation) {
       *error = "native indexed image state identity is invalid";
       return false;
     }
-    image_state[state.images[i].image_slot] = static_cast<int32_t>(i);
   }
   for (size_t i = 0; i < state.points.size(); ++i) {
-    if (state.points[i].point_slot >= point_state.size() ||
-        point_state[state.points[i].point_slot] != -1 ||
+    if (i > static_cast<size_t>(std::numeric_limits<int32_t>::max()) ||
+        !scratch->point_state.Set(state.points[i].point_slot,
+                                  static_cast<int32_t>(i)) ||
         state.points[i].state_generation != state.state_generation) {
       *error = "native indexed point state identity is invalid";
       return false;
     }
-    point_state[state.points[i].point_slot] = static_cast<int32_t>(i);
   }
-  result.camera_slots = view.active_camera_slots;
-  result.image_slots = view.active_image_slots;
+  result.camera_slots = view.ActiveCameraSlots();
+  result.image_slots = view.ActiveImageSlots();
   result.image_slots.insert(result.image_slots.end(),
-                            view.boundary_image_slots.begin(),
-                            view.boundary_image_slots.end());
-  result.point_slots = view.active_point_slots;
+                            view.BoundaryImageSlots().begin(),
+                            view.BoundaryImageSlots().end());
+  result.point_slots = view.ActivePointSlots();
   result.cameras.resize(result.camera_slots.size());
   result.images.resize(result.image_slots.size());
   result.points.resize(result.point_slots.size());
   for (size_t i = 0; i < result.camera_slots.size(); ++i) {
     const uint32_t slot = result.camera_slots[i];
-    if (slot >= camera_state.size() || camera_state[slot] < 0 ||
-        state.cameras[camera_state[slot]].parameters.size() != 8) {
+    const int32_t state_index = scratch->camera_state.Get(slot);
+    if (i > static_cast<size_t>(std::numeric_limits<int32_t>::max()) ||
+        state_index < 0 ||
+        state.cameras[state_index].parameters.size() != 8 ||
+        !scratch->camera_entity.Set(slot, static_cast<int32_t>(i))) {
       *error = "native indexed camera entity is incomplete";
       return false;
     }
-    camera_entity[slot] = static_cast<int32_t>(i);
-    std::copy(state.cameras[camera_state[slot]].parameters.begin(),
-              state.cameras[camera_state[slot]].parameters.end(),
+    std::copy(state.cameras[state_index].parameters.begin(),
+              state.cameras[state_index].parameters.end(),
               result.cameras[i].params);
   }
   for (size_t i = 0; i < result.image_slots.size(); ++i) {
     const uint32_t slot = result.image_slots[i];
-    if (slot >= image_state.size() || image_state[slot] < 0) {
+    const int32_t state_index = scratch->image_state.Get(slot);
+    if (i > static_cast<size_t>(std::numeric_limits<int32_t>::max()) ||
+        state_index < 0 ||
+        !scratch->image_entity.Set(slot, static_cast<int32_t>(i))) {
       *error = "native indexed image entity is incomplete";
       return false;
     }
-    image_entity[slot] = static_cast<int32_t>(i);
-    const DenseImageState& value = state.images[image_state[slot]];
+    const DenseImageState& value = state.images[state_index];
     std::copy(value.quaternion.begin(), value.quaternion.end(),
               result.images[i].quaternion);
     std::copy(value.translation.begin(), value.translation.end(),
@@ -11491,23 +11659,25 @@ bool BuildNativeIndexedKernelInput(const NativeHostSolveView& view,
   }
   for (size_t i = 0; i < result.point_slots.size(); ++i) {
     const uint32_t slot = result.point_slots[i];
-    if (slot >= point_state.size() || point_state[slot] < 0) {
+    const int32_t state_index = scratch->point_state.Get(slot);
+    if (i > static_cast<size_t>(std::numeric_limits<int32_t>::max()) ||
+        state_index < 0 ||
+        !scratch->point_entity.Set(slot, static_cast<int32_t>(i))) {
       *error = "native indexed point entity is incomplete";
       return false;
     }
-    point_entity[slot] = static_cast<int32_t>(i);
-    const DensePointState& value = state.points[point_state[slot]];
+    const DensePointState& value = state.points[state_index];
     std::copy(value.xyz.begin(), value.xyz.end(), result.points[i].xyz);
   }
-  std::vector<uint32_t> visual_output(view.residual_ordinals.size(),
+  std::vector<uint32_t> visual_output(view.ResidualOrdinals().size(),
                                       kBaGraphInvalidSlot);
-  std::vector<uint32_t> lidar_output(view.residual_ordinals.size(),
+  std::vector<uint32_t> lidar_output(view.ResidualOrdinals().size(),
                                      kBaGraphInvalidSlot);
   std::unordered_map<uint32_t, const LidarConstraintRecord*> lidar_by_slot;
-  for (const LidarConstraintRecord& value : view.lidar.constraints)
+  for (const LidarConstraintRecord& value : view.LidarConstraints())
     lidar_by_slot.emplace(value.constraint_slot, &value);
-  for (const ResidualOrdinal& ordinal : view.residual_ordinals) {
-    if (ordinal.execution_ordinal >= view.residual_ordinals.size()) {
+  for (const ResidualOrdinal& ordinal : view.ResidualOrdinals()) {
+    if (ordinal.execution_ordinal >= view.ResidualOrdinals().size()) {
       *error = "native indexed residual ordinal is invalid";
       return false;
     }
@@ -11520,14 +11690,11 @@ bool BuildNativeIndexedKernelInput(const NativeHostSolveView& view,
           graph_observations[ordinal.source_slot];
       if (!observation.header.alive ||
           ordinal.physical_identity != observation.source_identity ||
-          observation.image_slot >= image_entity.size() ||
-          observation.point_slot >= point_entity.size() ||
-          image_entity[observation.image_slot] < 0 ||
-          point_entity[observation.point_slot] < 0 ||
+          scratch->image_entity.Get(observation.image_slot) < 0 ||
+          scratch->point_entity.Get(observation.point_slot) < 0 ||
           observation.image_slot >= graph_images.size ||
-          graph_images[observation.image_slot].camera_slot >=
-              camera_entity.size() ||
-          camera_entity[graph_images[observation.image_slot].camera_slot] < 0) {
+          scratch->camera_entity.Get(
+              graph_images[observation.image_slot].camera_slot) < 0) {
         *error = "native indexed visual binding is incomplete";
         return false;
       }
@@ -11535,10 +11702,13 @@ bool BuildNativeIndexedKernelInput(const NativeHostSolveView& view,
       binding.source_index = ordinal.source_insertion_index;
       binding.physical_identity = ordinal.physical_identity;
       binding.observation_slot = ordinal.source_slot;
-      binding.image_entity_index = image_entity[observation.image_slot];
-      binding.point_entity_index = point_entity[observation.point_slot];
+      binding.image_entity_index =
+          scratch->image_entity.Get(observation.image_slot);
+      binding.point_entity_index =
+          scratch->point_entity.Get(observation.point_slot);
       binding.camera_entity_index =
-          camera_entity[graph_images[observation.image_slot].camera_slot];
+          scratch->camera_entity.Get(
+              graph_images[observation.image_slot].camera_slot);
       visual_output[ordinal.execution_ordinal] =
           static_cast<uint32_t>(result.visual_bindings.size());
       result.visual_bindings.push_back(binding);
@@ -11548,15 +11718,15 @@ bool BuildNativeIndexedKernelInput(const NativeHostSolveView& view,
       const auto found = lidar_by_slot.find(ordinal.source_slot);
       if (found == lidar_by_slot.end() ||
           ordinal.physical_identity != found->second->physical_identity ||
-          found->second->point_slot >= point_entity.size() ||
-          point_entity[found->second->point_slot] < 0) {
+          scratch->point_entity.Get(found->second->point_slot) < 0) {
         *error = "native indexed LiDAR binding is incomplete";
         return false;
       }
       DeviceLidarStaticInput value{};
       value.source_index = ordinal.source_insertion_index;
       value.point3D_id = graph_points[found->second->point_slot].point3D_id;
-      value.point_entity_index = point_entity[found->second->point_slot];
+      value.point_entity_index =
+          scratch->point_entity.Get(found->second->point_slot);
       std::copy(found->second->plane.begin(), found->second->plane.end(),
                 value.plane);
       value.weight = found->second->weight;
@@ -11572,7 +11742,7 @@ bool BuildNativeIndexedKernelInput(const NativeHostSolveView& view,
   result.cost_layout.visual_count = result.visual_bindings.size();
   result.cost_layout.lidar_count = result.lidar_static.size();
   uint64_t layout_id = 1469598103934665603ull;
-  for (const ResidualOrdinal& ordinal : view.residual_ordinals) {
+  for (const ResidualOrdinal& ordinal : view.ResidualOrdinals()) {
     DeviceCostEntry entry{};
     entry.residual_kind = ordinal.kind == ResidualKind::kVisual ? 0 : 1;
     entry.output_index = entry.residual_kind == 0
@@ -11588,10 +11758,31 @@ bool BuildNativeIndexedKernelInput(const NativeHostSolveView& view,
 
   std::vector<const ImageFixedPolicyResult*> variable_images;
   std::vector<const PointFixedPolicyResult*> variable_points;
-  for (const ImageFixedPolicyResult& value : view.fixed.images)
-    if (!value.pose_constant) variable_images.push_back(&value);
-  for (const PointFixedPolicyResult& value : view.fixed.points)
-    if (!value.constant) variable_points.push_back(&value);
+  for (size_t i = 0; i < view.Fixed().images.size(); ++i) {
+    const ImageFixedPolicyResult& value = view.Fixed().images[i];
+    if (i > static_cast<size_t>(std::numeric_limits<int32_t>::max()) ||
+        !scratch->image_policy.Set(value.image_slot, static_cast<int32_t>(i))) {
+      *error = "native indexed image policy is duplicate or invalid";
+      return false;
+    }
+    if (view.config.residual_order == CudaResidualOrder::kCanonical &&
+        !value.pose_constant) {
+      variable_images.push_back(&value);
+    }
+  }
+  for (size_t i = 0; i < view.Fixed().points.size(); ++i) {
+    const PointFixedPolicyResult& value = view.Fixed().points[i];
+    if (i > static_cast<size_t>(std::numeric_limits<int32_t>::max()) ||
+        !scratch->point_policy.Set(value.point_slot,
+                                   static_cast<int32_t>(i))) {
+      *error = "native indexed point policy is duplicate or invalid";
+      return false;
+    }
+    if (view.config.residual_order == CudaResidualOrder::kCanonical &&
+        !value.constant) {
+      variable_points.push_back(&value);
+    }
+  }
   if (view.config.residual_order == CudaResidualOrder::kCanonical) {
     std::sort(variable_images.begin(), variable_images.end(),
               [&](const auto* a, const auto* b) {
@@ -11604,38 +11795,31 @@ bool BuildNativeIndexedKernelInput(const NativeHostSolveView& view,
                        graph_points[b->point_slot].point3D_id;
               });
   } else {
-    std::unordered_map<uint32_t, const ImageFixedPolicyResult*> image_policy;
-    std::unordered_map<uint32_t, const PointFixedPolicyResult*> point_policy;
-    for (const auto& value : view.fixed.images)
-      image_policy.emplace(value.image_slot, &value);
-    for (const auto& value : view.fixed.points)
-      point_policy.emplace(value.point_slot, &value);
-    variable_images.clear();
-    variable_points.clear();
-    for (const ParameterOrdinal& parameter : view.parameter_ordinals) {
+    for (const ParameterOrdinal& parameter : view.ParameterOrdinals()) {
       if (parameter.constant) continue;
       if (parameter.kind == ParameterKind::kQuaternion) {
-        const auto found = image_policy.find(parameter.entity_slot);
-        if (found != image_policy.end() &&
-            std::find(variable_images.begin(), variable_images.end(),
-                      found->second) == variable_images.end())
-          variable_images.push_back(found->second);
+        const int32_t policy = scratch->image_policy.Get(parameter.entity_slot);
+        if (policy >= 0 &&
+            scratch->variable_image_seen.Set(parameter.entity_slot, policy)) {
+          variable_images.push_back(&view.Fixed().images[policy]);
+        }
       } else if (parameter.kind == ParameterKind::kPoint3D) {
-        const auto found = point_policy.find(parameter.entity_slot);
-        if (found != point_policy.end() &&
-            std::find(variable_points.begin(), variable_points.end(),
-                      found->second) == variable_points.end())
-          variable_points.push_back(found->second);
+        const int32_t policy = scratch->point_policy.Get(parameter.entity_slot);
+        if (policy >= 0 &&
+            scratch->variable_point_seen.Set(parameter.entity_slot, policy)) {
+          variable_points.push_back(&view.Fixed().points[policy]);
+        }
       }
     }
   }
-  std::vector<int32_t> pose_by_image(graph_images.size, -1);
-  std::vector<int32_t> variable_point_by_slot(graph_points.size, -1);
-  std::vector<std::vector<uint32_t>> pose_entries(variable_images.size());
-  std::vector<std::vector<DevicePointAdjacency>> point_entries(
-      variable_points.size());
   result.layer_b_topology.poses.resize(variable_images.size());
   for (size_t i = 0; i < variable_images.size(); ++i) {
+    if (i > static_cast<size_t>(std::numeric_limits<int32_t>::max()) ||
+        !scratch->pose_by_image.Set(variable_images[i]->image_slot,
+                                    static_cast<int32_t>(i))) {
+      *error = "native indexed variable image selection is invalid";
+      return false;
+    }
     const auto& policy = *variable_images[i];
     DevicePoseMeta& meta = result.layer_b_topology.poses[i];
     meta.image_id = graph_images[policy.image_slot].image_id;
@@ -11645,64 +11829,191 @@ bool BuildNativeIndexedKernelInput(const NativeHostSolveView& view,
       if ((policy.translation_subset_mask & (1u << component)) == 0)
         meta.free_translation_indices[meta.dimension++ - 3] = component;
     }
-    pose_by_image[policy.image_slot] = static_cast<int32_t>(i);
   }
   result.layer_b_topology.points.resize(variable_points.size());
   for (size_t i = 0; i < variable_points.size(); ++i) {
+    if (i > static_cast<size_t>(std::numeric_limits<int32_t>::max()) ||
+        !scratch->variable_point_by_slot.Set(variable_points[i]->point_slot,
+                                             static_cast<int32_t>(i))) {
+      *error = "native indexed variable point selection is invalid";
+      return false;
+    }
     result.layer_b_topology.points[i].point3D_id =
         graph_points[variable_points[i]->point_slot].point3D_id;
-    variable_point_by_slot[variable_points[i]->point_slot] =
-        static_cast<int32_t>(i);
   }
-  std::map<std::pair<uint32_t, uint32_t>, std::vector<uint32_t>> edge_entries;
+  scratch->pose_counts.assign(variable_images.size(), 0);
+  scratch->point_counts.assign(variable_points.size(), 0);
+  scratch->edge_index.clear();
+  scratch->edge_keys.clear();
+  scratch->edge_counts.clear();
+  scratch->edge_order.clear();
+  scratch->edge_sorted_by_temporary.clear();
+  try {
+    scratch->edge_index.reserve(result.visual_bindings.size());
+    scratch->edge_keys.reserve(result.visual_bindings.size());
+    scratch->edge_counts.reserve(result.visual_bindings.size());
+  } catch (const std::bad_alloc&) {
+    *error = "native indexed edge lookup allocation failed";
+    return false;
+  }
   for (size_t visual_index = 0; visual_index < result.visual_bindings.size();
        ++visual_index) {
+    if (visual_index > static_cast<size_t>(std::numeric_limits<uint32_t>::max())) {
+      *error = "native indexed visual adjacency offset overflow";
+      return false;
+    }
     const uint32_t image_slot = result.visual_image_slots[visual_index];
     const uint32_t point_slot = result.visual_point_slots[visual_index];
-    const int32_t pose = pose_by_image[image_slot];
-    const int32_t point = variable_point_by_slot[point_slot];
-    if (pose >= 0) pose_entries[pose].push_back(visual_index);
-    if (pose >= 0 && point >= 0)
-      edge_entries[{static_cast<uint32_t>(pose),
-                    static_cast<uint32_t>(point)}]
-          .push_back(visual_index);
+    const int32_t pose = scratch->pose_by_image.Get(image_slot);
+    const int32_t point = scratch->variable_point_by_slot.Get(point_slot);
+    if (pose >= 0) {
+      if (scratch->pose_counts[pose] == std::numeric_limits<uint32_t>::max()) {
+        *error = "native indexed pose adjacency count overflow";
+        return false;
+      }
+      ++scratch->pose_counts[pose];
+    }
+    if (pose >= 0 && point >= 0) {
+      const uint64_t key = (static_cast<uint64_t>(pose) << 32) |
+                           static_cast<uint32_t>(point);
+      auto found = scratch->edge_index.find(key);
+      if (found == scratch->edge_index.end()) {
+        if (scratch->edge_keys.size() >=
+            static_cast<size_t>(std::numeric_limits<uint32_t>::max())) {
+          *error = "native indexed edge count overflow";
+          return false;
+        }
+        found = scratch->edge_index
+                    .emplace(key,
+                             static_cast<uint32_t>(scratch->edge_keys.size()))
+                    .first;
+        scratch->edge_keys.push_back(key);
+        scratch->edge_counts.push_back(0);
+      }
+      uint32_t& count = scratch->edge_counts[found->second];
+      if (count == std::numeric_limits<uint32_t>::max()) {
+        *error = "native indexed edge adjacency count overflow";
+        return false;
+      }
+      ++count;
+    }
   }
   for (const DeviceCostEntry& entry : result.cost_layout.entries) {
     const uint32_t point_slot = entry.residual_kind == 0
         ? result.visual_point_slots[entry.output_index]
         : result.lidar_point_slots[entry.output_index];
-    const int32_t point = variable_point_by_slot[point_slot];
-    if (point >= 0)
-      point_entries[point].push_back({entry.output_index, entry.residual_kind});
+    const int32_t point = scratch->variable_point_by_slot.Get(point_slot);
+    if (point >= 0) {
+      if (scratch->point_counts[point] == std::numeric_limits<uint32_t>::max()) {
+        *error = "native indexed point adjacency count overflow";
+        return false;
+      }
+      ++scratch->point_counts[point];
+    }
   }
+  uint64_t pose_adjacency_count = 0;
   for (size_t i = 0; i < result.layer_b_topology.poses.size(); ++i) {
     auto& meta = result.layer_b_topology.poses[i];
-    meta.adjacency_begin = result.layer_b_topology.pose_adjacency.size();
-    result.layer_b_topology.pose_adjacency.insert(
-        result.layer_b_topology.pose_adjacency.end(), pose_entries[i].begin(),
-        pose_entries[i].end());
-    meta.adjacency_end = result.layer_b_topology.pose_adjacency.size();
+    if (pose_adjacency_count > std::numeric_limits<uint32_t>::max() ||
+        scratch->pose_counts[i] >
+            std::numeric_limits<uint32_t>::max() - pose_adjacency_count) {
+      *error = "native indexed pose adjacency offset overflow";
+      return false;
+    }
+    meta.adjacency_begin = static_cast<uint32_t>(pose_adjacency_count);
+    pose_adjacency_count += scratch->pose_counts[i];
+    meta.adjacency_end = static_cast<uint32_t>(pose_adjacency_count);
   }
+  uint64_t point_adjacency_count = 0;
   for (size_t i = 0; i < result.layer_b_topology.points.size(); ++i) {
     auto& meta = result.layer_b_topology.points[i];
-    meta.adjacency_begin = result.layer_b_topology.point_adjacency.size();
-    result.layer_b_topology.point_adjacency.insert(
-        result.layer_b_topology.point_adjacency.end(),
-        point_entries[i].begin(), point_entries[i].end());
-    meta.adjacency_end = result.layer_b_topology.point_adjacency.size();
+    if (point_adjacency_count > std::numeric_limits<uint32_t>::max() ||
+        scratch->point_counts[i] >
+            std::numeric_limits<uint32_t>::max() - point_adjacency_count) {
+      *error = "native indexed point adjacency offset overflow";
+      return false;
+    }
+    meta.adjacency_begin = static_cast<uint32_t>(point_adjacency_count);
+    point_adjacency_count += scratch->point_counts[i];
+    meta.adjacency_end = static_cast<uint32_t>(point_adjacency_count);
   }
-  for (const auto& value : edge_entries) {
+  result.layer_b_topology.pose_adjacency.resize(pose_adjacency_count);
+  result.layer_b_topology.point_adjacency.resize(point_adjacency_count);
+  scratch->pose_cursors.resize(result.layer_b_topology.poses.size());
+  scratch->point_cursors.resize(result.layer_b_topology.points.size());
+  for (size_t i = 0; i < scratch->pose_cursors.size(); ++i)
+    scratch->pose_cursors[i] = result.layer_b_topology.poses[i].adjacency_begin;
+  for (size_t i = 0; i < scratch->point_cursors.size(); ++i)
+    scratch->point_cursors[i] = result.layer_b_topology.points[i].adjacency_begin;
+  for (size_t visual_index = 0; visual_index < result.visual_bindings.size();
+       ++visual_index) {
+    const int32_t pose =
+        scratch->pose_by_image.Get(result.visual_image_slots[visual_index]);
+    if (pose >= 0)
+      result.layer_b_topology.pose_adjacency[scratch->pose_cursors[pose]++] =
+          static_cast<uint32_t>(visual_index);
+  }
+  for (const DeviceCostEntry& entry : result.cost_layout.entries) {
+    const uint32_t point_slot = entry.residual_kind == 0
+        ? result.visual_point_slots[entry.output_index]
+        : result.lidar_point_slots[entry.output_index];
+    const int32_t point = scratch->variable_point_by_slot.Get(point_slot);
+    if (point >= 0) {
+      result.layer_b_topology.point_adjacency[
+          scratch->point_cursors[point]++] =
+          {entry.output_index, entry.residual_kind};
+    }
+  }
+  scratch->edge_order.resize(scratch->edge_keys.size());
+  std::iota(scratch->edge_order.begin(), scratch->edge_order.end(), 0u);
+  std::sort(scratch->edge_order.begin(), scratch->edge_order.end(),
+            [&](const uint32_t a, const uint32_t b) {
+              return scratch->edge_keys[a] < scratch->edge_keys[b];
+            });
+  scratch->edge_sorted_by_temporary.resize(scratch->edge_keys.size());
+  scratch->edge_cursors.resize(scratch->edge_keys.size());
+  result.layer_b_topology.edges.resize(scratch->edge_keys.size());
+  uint64_t edge_adjacency_count = 0;
+  for (size_t sorted = 0; sorted < scratch->edge_order.size(); ++sorted) {
+    const uint32_t temporary = scratch->edge_order[sorted];
+    const uint64_t key = scratch->edge_keys[temporary];
     DeviceEdgeMeta edge{};
-    edge.pose_index = value.first.first;
-    edge.point_index = value.first.second;
+    edge.pose_index = static_cast<uint32_t>(key >> 32);
+    edge.point_index = static_cast<uint32_t>(key);
     edge.pose_dimension =
         result.layer_b_topology.poses[edge.pose_index].dimension;
-    edge.adjacency_begin = result.layer_b_topology.edge_adjacency.size();
-    result.layer_b_topology.edge_adjacency.insert(
-        result.layer_b_topology.edge_adjacency.end(), value.second.begin(),
-        value.second.end());
-    edge.adjacency_end = result.layer_b_topology.edge_adjacency.size();
-    result.layer_b_topology.edges.push_back(edge);
+    if (edge_adjacency_count > std::numeric_limits<uint32_t>::max() ||
+        scratch->edge_counts[temporary] >
+            std::numeric_limits<uint32_t>::max() - edge_adjacency_count) {
+      *error = "native indexed edge adjacency offset overflow";
+      return false;
+    }
+    edge.adjacency_begin = static_cast<uint32_t>(edge_adjacency_count);
+    edge_adjacency_count += scratch->edge_counts[temporary];
+    edge.adjacency_end = static_cast<uint32_t>(edge_adjacency_count);
+    result.layer_b_topology.edges[sorted] = edge;
+    scratch->edge_sorted_by_temporary[temporary] =
+        static_cast<uint32_t>(sorted);
+    scratch->edge_cursors[sorted] = edge.adjacency_begin;
+  }
+  result.layer_b_topology.edge_adjacency.resize(edge_adjacency_count);
+  for (size_t visual_index = 0; visual_index < result.visual_bindings.size();
+       ++visual_index) {
+    const int32_t pose =
+        scratch->pose_by_image.Get(result.visual_image_slots[visual_index]);
+    const int32_t point = scratch->variable_point_by_slot.Get(
+        result.visual_point_slots[visual_index]);
+    if (pose < 0 || point < 0) continue;
+    const uint64_t key = (static_cast<uint64_t>(pose) << 32) |
+                         static_cast<uint32_t>(point);
+    const auto found = scratch->edge_index.find(key);
+    if (found == scratch->edge_index.end()) {
+      *error = "native indexed edge lookup lost a counted binding";
+      return false;
+    }
+    const uint32_t edge = scratch->edge_sorted_by_temporary[found->second];
+    result.layer_b_topology.edge_adjacency[scratch->edge_cursors[edge]++] =
+        static_cast<uint32_t>(visual_index);
   }
   if (!BuildIndexedLayerBExecutionPlan(
           result, view.config.hessian_backend,
@@ -11717,6 +12028,45 @@ bool BuildNativeIndexedKernelInput(const NativeHostSolveView& view,
     return false;
   }
   result.runtime.indexed_plan_build_calls = 1;
+  result.image_update_meta.resize(result.image_slots.size());
+  result.point_update_meta.resize(result.point_slots.size());
+  result.pose_image_entity_indices.resize(result.layer_b_topology.poses.size());
+  result.point_entity_indices.resize(result.layer_b_topology.points.size());
+  for (DeviceImageUpdateMeta& value : result.image_update_meta)
+    value.variable_pose_index = -1;
+  for (DevicePointUpdateMeta& value : result.point_update_meta)
+    value.variable_point_index = -1;
+  for (size_t i = 0; i < result.layer_b_topology.poses.size(); ++i) {
+    const HostBaImageSlot* image = view.catalog.FindImageById(
+        result.layer_b_topology.poses[i].image_id);
+    if (image == nullptr ||
+        scratch->image_entity.Get(image->header.slot) < 0) {
+      *error = "native indexed pose update mapping is incomplete";
+      return false;
+    }
+    const uint32_t entity = scratch->image_entity.Get(image->header.slot);
+    result.pose_image_entity_indices[i] = entity;
+    DeviceImageUpdateMeta& meta = result.image_update_meta[entity];
+    meta.variable_pose_index = static_cast<int32_t>(i);
+    meta.delta_offset = result.layer_c_topology.poses[i].offset;
+    meta.dimension = result.layer_b_topology.poses[i].dimension;
+    for (size_t j = 0; j < 3; ++j)
+      meta.free_translation_indices[j] =
+          result.layer_b_topology.poses[i].free_translation_indices[j];
+  }
+  for (size_t i = 0; i < result.layer_b_topology.points.size(); ++i) {
+    const HostBaPointSlot* point = view.catalog.FindPointById(
+        result.layer_b_topology.points[i].point3D_id);
+    if (point == nullptr ||
+        scratch->point_entity.Get(point->header.slot) < 0) {
+      *error = "native indexed point update mapping is incomplete";
+      return false;
+    }
+    const uint32_t entity = scratch->point_entity.Get(point->header.slot);
+    result.point_entity_indices[i] = entity;
+    result.point_update_meta[entity].variable_point_index =
+        static_cast<int32_t>(i);
+  }
   result.runtime.indexed_visual_binding_bytes =
       result.visual_bindings.size() * sizeof(DeviceIndexedVisualBinding);
   result.runtime.real_cost_layout_entries = result.cost_layout.entries.size();
@@ -11733,6 +12083,690 @@ bool BuildNativeIndexedKernelInput(const NativeHostSolveView& view,
           std::chrono::steady_clock::now() - start)
           .count();
   *output = std::move(result);
+  return true;
+}
+
+std::shared_ptr<NativeIndexedStaticPlan> ExtractNativeIndexedStaticPlan(
+    NativeIndexedKernelInput* input,
+    const uint64_t publication_id) {
+  auto plan = std::make_shared<NativeIndexedStaticPlan>();
+  plan->publication_id = publication_id;
+  plan->visual_bindings = std::move(input->visual_bindings);
+  plan->lidar_static = std::move(input->lidar_static);
+  plan->camera_slots = std::move(input->camera_slots);
+  plan->image_slots = std::move(input->image_slots);
+  plan->point_slots = std::move(input->point_slots);
+  plan->visual_image_slots = std::move(input->visual_image_slots);
+  plan->visual_point_slots = std::move(input->visual_point_slots);
+  plan->lidar_point_slots = std::move(input->lidar_point_slots);
+  plan->cost_layout = std::move(input->cost_layout);
+  plan->layer_b_topology = std::move(input->layer_b_topology);
+  plan->layer_c_topology = std::move(input->layer_c_topology);
+  plan->image_update_meta = std::move(input->image_update_meta);
+  plan->point_update_meta = std::move(input->point_update_meta);
+  plan->pose_image_entity_indices =
+      std::move(input->pose_image_entity_indices);
+  plan->point_entity_indices = std::move(input->point_entity_indices);
+  input->prepared_static = plan;
+  return plan;
+}
+
+bool BindNativeIndexedDynamicState(
+    const NativeHostSolveView& view,
+    const ActiveStateBuffer& state,
+    const std::shared_ptr<const NativeIndexedStaticPlan>& plan,
+    NativeIndexedKernelInput* output,
+    std::string* error) {
+  if (output == nullptr || error == nullptr || plan == nullptr ||
+      !ValidateNativeHostSolveView(view, state, error)) {
+    return false;
+  }
+  const auto start = std::chrono::steady_clock::now();
+  NativeIndexedKernelInput result;
+  result.identity = view.identity;
+  result.prepared_static = plan;
+  std::unordered_map<uint32_t, const DenseCameraState*> cameras;
+  std::unordered_map<uint32_t, const DenseImageState*> images;
+  std::unordered_map<uint32_t, const DensePointState*> points;
+  if (!BuildNativeStateLookup(state.cameras, state.state_generation, &cameras,
+                              error) ||
+      !BuildNativeStateLookup(state.images, state.state_generation, &images,
+                              error) ||
+      !BuildNativeStateLookup(state.points, state.state_generation, &points,
+                              error)) {
+    return false;
+  }
+  result.cameras.resize(plan->camera_slots.size());
+  result.images.resize(plan->image_slots.size());
+  result.points.resize(plan->point_slots.size());
+  for (size_t i = 0; i < plan->camera_slots.size(); ++i) {
+    const auto found = cameras.find(plan->camera_slots[i]);
+    if (found == cameras.end() || found->second->parameters.size() != 8 ||
+        !NativeFinite(found->second->parameters)) {
+      *error = "cached indexed camera state is incomplete";
+      return false;
+    }
+    std::copy(found->second->parameters.begin(),
+              found->second->parameters.end(), result.cameras[i].params);
+  }
+  for (size_t i = 0; i < plan->image_slots.size(); ++i) {
+    const auto found = images.find(plan->image_slots[i]);
+    if (found == images.end()) {
+      *error = "cached indexed image state is incomplete";
+      return false;
+    }
+    std::copy(found->second->quaternion.begin(),
+              found->second->quaternion.end(), result.images[i].quaternion);
+    std::copy(found->second->translation.begin(),
+              found->second->translation.end(), result.images[i].translation);
+  }
+  for (size_t i = 0; i < plan->point_slots.size(); ++i) {
+    const auto found = points.find(plan->point_slots[i]);
+    if (found == points.end()) {
+      *error = "cached indexed point state is incomplete";
+      return false;
+    }
+    std::copy(found->second->xyz.begin(), found->second->xyz.end(),
+              result.points[i].xyz);
+  }
+  result.runtime.indexed_plan_build_calls = 0;
+  result.runtime.indexed_packing_milliseconds =
+      std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - start).count();
+  *output = std::move(result);
+  return true;
+}
+
+bool PrepareNativeIndexedKernelInput(
+    const NativeHostSolveView& view,
+    const ActiveStateBuffer& state,
+    const std::shared_ptr<DeviceBaProblemStoreState>& device_store,
+    NativeIndexedKernelInput* output,
+    std::string* error) {
+  if (device_store == nullptr || output == nullptr || error == nullptr) {
+    if (error != nullptr) *error = "native indexed preparation is invalid";
+    return false;
+  }
+  std::shared_ptr<NativeIndexedBuildScratch> scratch;
+  {
+    std::lock_guard<std::mutex> lock(device_store->mutex);
+    try {
+      if (device_store->indexed_build_scratch == nullptr) {
+        scratch = std::make_shared<NativeIndexedBuildScratch>();
+        device_store->indexed_build_scratch = scratch;
+      } else {
+        scratch = std::static_pointer_cast<NativeIndexedBuildScratch>(
+            device_store->indexed_build_scratch);
+      }
+    } catch (const std::bad_alloc&) {
+      *error = "native indexed reusable scratch allocation failed";
+      return false;
+    }
+  }
+  const bool cache_enabled =
+      view.config.prepared_selection_cache ==
+          CudaPreparedSelectionCacheMode::kEnabled &&
+      view.prepared_plan != nullptr &&
+      view.prepared_plan->publication_id != 0;
+  if (!cache_enabled) {
+    return BuildNativeIndexedKernelInput(view, state, scratch.get(), output,
+                                         error);
+  }
+  std::shared_ptr<const NativeIndexedStaticPlan> plan;
+  {
+    std::lock_guard<std::mutex> lock(device_store->mutex);
+    const auto found = device_store->host_selection_plans.find(
+        view.prepared_plan->publication_id);
+    if (found != device_store->host_selection_plans.end()) {
+      const std::shared_ptr<void> locked = found->second.lock();
+      if (locked != nullptr) {
+        plan = std::static_pointer_cast<const NativeIndexedStaticPlan>(
+            locked);
+      } else {
+        device_store->host_selection_plans.erase(found);
+      }
+    }
+  }
+  if (plan != nullptr) {
+    return BindNativeIndexedDynamicState(view, state, plan, output, error);
+  }
+  if (!BuildNativeIndexedKernelInput(view, state, scratch.get(), output,
+                                     error)) {
+    return false;
+  }
+  std::shared_ptr<NativeIndexedStaticPlan> mutable_plan;
+  try {
+    mutable_plan = ExtractNativeIndexedStaticPlan(
+        output, view.prepared_plan->publication_id);
+  } catch (const std::bad_alloc&) {
+    *error = "native indexed static plan allocation failed";
+    return false;
+  }
+  {
+    std::lock_guard<std::mutex> lock(device_store->mutex);
+    for (auto it = device_store->host_selection_plans.begin();
+         it != device_store->host_selection_plans.end();) {
+      if (it->second.expired()) {
+        it = device_store->host_selection_plans.erase(it);
+      } else {
+        ++it;
+      }
+    }
+    device_store->host_selection_plans[mutable_plan->publication_id] =
+        mutable_plan;
+  }
+  return true;
+}
+
+constexpr uint32_t kDevicePreparedSelectionAbiVersion = 1;
+constexpr size_t kDevicePreparedSelectionMaxEntries = 4;
+constexpr uint64_t kDevicePreparedSelectionMaxBudget = 256ull << 20;
+
+struct DevicePreparedSelectionAllocation {
+  int device = -1;
+  uintptr_t cuda_context = 0;
+  uint64_t pool_entry_incarnation = 0;
+  uint64_t owner_epoch = 0;
+  uint64_t slot_namespace_epoch = 0;
+  uint64_t publication_id = 0;
+  uint32_t abi_version = kDevicePreparedSelectionAbiVersion;
+  CudaArithmeticPrecision precision = CudaArithmeticPrecision::kFp64;
+  uint64_t resident_bytes = 0;
+  uint64_t static_h2d_calls = 0;
+  bool published = false;
+  uint64_t selection_budget = 0;
+  std::array<uint64_t, kDevicePreparedSelectionMaxEntries + 1>
+      pending_victim_ids{};
+  size_t pending_victim_count = 0;
+  std::shared_ptr<const NativeIndexedStaticPlan> host_plan;
+  std::atomic<bool> abandon_cleanup{false};
+  DeviceIndexedVisualBinding* visual_bindings = nullptr;
+  DeviceLidarStaticInput* lidar_static = nullptr;
+  DeviceCostEntry* cost_order = nullptr;
+  DevicePoseMeta* pose_meta = nullptr;
+  DevicePointMeta* point_meta = nullptr;
+  DeviceEdgeMeta* edge_meta = nullptr;
+  uint32_t* pose_adjacency = nullptr;
+  DevicePointAdjacency* point_adjacency = nullptr;
+  uint32_t* edge_adjacency = nullptr;
+  DeviceVisualAssemblyBinding* atomic_visual_bindings = nullptr;
+  DeviceLidarAssemblyBinding* atomic_lidar_bindings = nullptr;
+  DeviceAssemblySegment* pose_segments = nullptr;
+  DeviceAssemblySegment* point_segments = nullptr;
+  DeviceAssemblySegment* edge_segments = nullptr;
+  DeviceAssemblyTargetRange* pose_ranges = nullptr;
+  DeviceAssemblyTargetRange* point_ranges = nullptr;
+  DeviceAssemblyTargetRange* edge_ranges = nullptr;
+  uint32_t* point_direct_indices = nullptr;
+  DeviceSolvePoseMeta* solve_pose_meta = nullptr;
+  DeviceSolvePointMeta* solve_point_meta = nullptr;
+  DevicePairMeta* pair_meta = nullptr;
+  DevicePairContribution* pair_contributions = nullptr;
+  uint32_t* segment_direct_pair_indices = nullptr;
+  DeviceSchurSegment* schur_segments = nullptr;
+  DeviceSchurPairSegmentRange* schur_pair_ranges = nullptr;
+  uint32_t* pose_edges = nullptr;
+  uint32_t* point_edges = nullptr;
+  DeviceImageUpdateMeta* image_update_meta = nullptr;
+  DevicePointUpdateMeta* point_update_meta = nullptr;
+  uint32_t* pose_image_entity_indices = nullptr;
+  uint32_t* point_entity_indices = nullptr;
+
+  void Quarantine() noexcept { abandon_cleanup.store(true); }
+  ~DevicePreparedSelectionAllocation() noexcept {
+    const std::array<void*, 31> pointers = {
+        visual_bindings, lidar_static, cost_order, pose_meta, point_meta,
+        edge_meta, pose_adjacency, point_adjacency, edge_adjacency,
+        atomic_visual_bindings, atomic_lidar_bindings, pose_segments,
+        point_segments, edge_segments, pose_ranges, point_ranges, edge_ranges,
+        point_direct_indices, solve_pose_meta, solve_point_meta, pair_meta,
+        pair_contributions, segment_direct_pair_indices, schur_segments,
+        schur_pair_ranges, pose_edges, point_edges, image_update_meta,
+        point_update_meta, pose_image_entity_indices, point_entity_indices};
+    if (abandon_cleanup.load()) {
+      for (void* pointer : pointers) {
+        if (pointer != nullptr) {
+          AbandonCudaResourceWithoutTeardown(
+              reinterpret_cast<uintptr_t>(pointer),
+              CudaTeardownType::kAllocation);
+        }
+      }
+      return;
+    }
+    if (device >= 0) CleanupCudaSetDevice(device);
+    for (void* pointer : pointers)
+      if (pointer != nullptr) CleanupCudaFree(pointer, device);
+  }
+};
+
+template <typename T>
+bool AllocateAndUploadPreparedSelection(
+    T** destination,
+    const std::vector<T>& source,
+    const int device,
+    const cudaStream_t stream,
+    DevicePreparedSelectionAllocation* allocation,
+    std::string* error) {
+  if (source.empty()) {
+    *destination = nullptr;
+    return true;
+  }
+  if (source.size() > std::numeric_limits<size_t>::max() / sizeof(T)) {
+    *error = "prepared selection allocation size overflow";
+    return false;
+  }
+  const size_t bytes = source.size() * sizeof(T);
+  void* pointer = nullptr;
+  cudaError_t status = cudaMalloc(&pointer, bytes);
+  if (status != cudaSuccess ||
+      !RegisterPoolResource(reinterpret_cast<uintptr_t>(pointer),
+                            CudaTeardownType::kAllocation, device)) {
+    if (status == cudaSuccess) CleanupCudaFree(pointer, device);
+    *error = std::string("prepared selection allocation failed: ") +
+             CudaErrorText(status);
+    return false;
+  }
+  *destination = static_cast<T*>(pointer);
+  status = cudaMemcpyAsync(*destination, source.data(), bytes,
+                           cudaMemcpyHostToDevice, stream);
+  if (status != cudaSuccess) {
+    *error = std::string("prepared selection upload failed: ") +
+             CudaErrorText(status);
+    return false;
+  }
+  allocation->resident_bytes =
+      SaturatingAdd(allocation->resident_bytes, bytes);
+  ++allocation->static_h2d_calls;
+  return true;
+}
+
+bool ValidatePreparedSelectionContext(
+    const DevicePreparedSelectionAllocation& allocation,
+    const uintptr_t expected_context,
+    uint64_t* query_count,
+    std::string* error) {
+  if (allocation.cuda_context != expected_context) return false;
+  const std::array<const void*, 31> pointers = {
+      allocation.visual_bindings, allocation.lidar_static,
+      allocation.cost_order, allocation.pose_meta, allocation.point_meta,
+      allocation.edge_meta, allocation.pose_adjacency,
+      allocation.point_adjacency, allocation.edge_adjacency,
+      allocation.atomic_visual_bindings, allocation.atomic_lidar_bindings,
+      allocation.pose_segments, allocation.point_segments,
+      allocation.edge_segments, allocation.pose_ranges,
+      allocation.point_ranges, allocation.edge_ranges,
+      allocation.point_direct_indices, allocation.solve_pose_meta,
+      allocation.solve_point_meta, allocation.pair_meta,
+      allocation.pair_contributions,
+      allocation.segment_direct_pair_indices, allocation.schur_segments,
+      allocation.schur_pair_ranges, allocation.pose_edges,
+      allocation.point_edges, allocation.image_update_meta,
+      allocation.point_update_meta, allocation.pose_image_entity_indices,
+      allocation.point_entity_indices};
+  for (const void* pointer : pointers) {
+    if (!DeviceBaPointerBelongsToContext(pointer, expected_context,
+                                         query_count, error)) return false;
+  }
+  return true;
+}
+
+bool EnsureDevicePreparedSelection(
+    CudaRuntimePoolEntry* pooled,
+    NativeIndexedKernelInput* native,
+    const NativeHostSolveView& view,
+    const CudaArithmeticPrecision precision,
+    const uint64_t memory_budget_bytes,
+    const uint64_t global_catalog_bytes,
+    std::shared_ptr<DevicePreparedSelectionAllocation>* pinned,
+    std::string* error) {
+  if (pooled == nullptr || native == nullptr || native->device_store_state == nullptr ||
+      native->prepared_static == nullptr || view.prepared_plan == nullptr ||
+      pinned == nullptr || error == nullptr) return false;
+  BaSolveResult::Runtime& runtime = native->runtime;
+  ++runtime.device_selection_lookup_calls;
+  const uint64_t publication_id = view.prepared_plan->publication_id;
+  if (publication_id == 0) {
+    --runtime.device_selection_lookup_calls;
+    ++runtime.device_selection_bypasses;
+    return true;
+  }
+  std::lock_guard<std::mutex> lock(native->device_store_state->mutex);
+  auto& store = *native->device_store_state;
+  auto found = store.device_selection_plans.find(publication_id);
+  uint64_t replaced_bytes = 0;
+  bool replace_existing = false;
+  if (found != store.device_selection_plans.end()) {
+    auto current =
+        std::static_pointer_cast<DevicePreparedSelectionAllocation>(
+            found->second);
+    if (current->device != pooled->device ||
+        current->cuda_context != pooled->key.context) {
+      current->Quarantine();
+      ++runtime.device_selection_context_invalidations;
+      ++runtime.device_selection_poison_events;
+      g_cuda_resource_health = CudaResourceHealth::kTainted;
+      g_cuda_taint_cleanup_complete = false;
+      pooled->externally_cleared = true;
+      *error = "prepared selection CUDA context identity mismatch";
+      return false;
+    }
+    const bool identity_match =
+        current->owner_epoch == view.identity.owner_epoch &&
+        current->slot_namespace_epoch ==
+            view.prepared_plan->slot_namespace_epoch &&
+        current->publication_id == publication_id &&
+        current->abi_version == kDevicePreparedSelectionAbiVersion &&
+        current->precision == precision && !current->abandon_cleanup.load();
+    bool context_valid = identity_match;
+    if (context_valid && current->pool_entry_incarnation !=
+                             pooled->context_incarnation) {
+      context_valid = ValidatePreparedSelectionContext(
+          *current, pooled->key.context,
+          &store.context_query_count_for_testing, error);
+      if (context_valid) {
+        current->pool_entry_incarnation = pooled->context_incarnation;
+      } else {
+        current->Quarantine();
+        ++runtime.device_selection_context_invalidations;
+        ++runtime.device_selection_poison_events;
+        g_cuda_resource_health = CudaResourceHealth::kTainted;
+        g_cuda_taint_cleanup_complete = false;
+        pooled->externally_cleared = true;
+        return false;
+      }
+    }
+    if (context_valid) {
+      ++runtime.device_selection_hit_calls;
+      runtime.device_selection_static_h2d_saved_calls =
+          current->static_h2d_calls;
+      runtime.device_selection_static_h2d_saved_bytes =
+          current->resident_bytes;
+      runtime.device_selection_resident_bytes =
+          store.device_selection_resident_bytes;
+      runtime.device_selection_peak_bytes = store.device_selection_peak_bytes;
+      store.device_selection_lru[publication_id] =
+          ++store.device_selection_clock;
+      *pinned = std::move(current);
+      return true;
+    }
+    // A publication/layout mismatch is a normal cache miss. Keep the trusted
+    // Ready generation published until the replacement has completed on the
+    // solve stream.
+    replace_existing = true;
+    replaced_bytes = store.device_selection_bytes[publication_id];
+  }
+  ++runtime.device_selection_miss_calls;
+  const NativeIndexedStaticPlan& plan = *native->prepared_static;
+  uint64_t required = 0;
+  const auto add = [&](const size_t count, const size_t size) {
+    if (size != 0 && count > std::numeric_limits<uint64_t>::max() / size)
+      return false;
+    const uint64_t bytes = count * size;
+    if (bytes > std::numeric_limits<uint64_t>::max() - required) return false;
+    required += bytes;
+    return true;
+  };
+#define ADD_SELECTION_BYTES(name)                                           \
+  if (!add(plan.name.size(), sizeof(plan.name[0]))) {                        \
+    *error = "prepared selection resident size overflow";                   \
+    return false;                                                           \
+  }
+  ADD_SELECTION_BYTES(visual_bindings);
+  ADD_SELECTION_BYTES(lidar_static);
+  ADD_SELECTION_BYTES(cost_layout.entries);
+  ADD_SELECTION_BYTES(layer_b_topology.poses);
+  ADD_SELECTION_BYTES(layer_b_topology.points);
+  ADD_SELECTION_BYTES(layer_b_topology.edges);
+  ADD_SELECTION_BYTES(layer_b_topology.pose_adjacency);
+  ADD_SELECTION_BYTES(layer_b_topology.point_adjacency);
+  ADD_SELECTION_BYTES(layer_b_topology.edge_adjacency);
+  ADD_SELECTION_BYTES(layer_b_topology.atomic_visual_bindings);
+  ADD_SELECTION_BYTES(layer_b_topology.atomic_lidar_bindings);
+  ADD_SELECTION_BYTES(layer_b_topology.pose_segments);
+  ADD_SELECTION_BYTES(layer_b_topology.point_segments);
+  ADD_SELECTION_BYTES(layer_b_topology.edge_segments);
+  ADD_SELECTION_BYTES(layer_b_topology.pose_segment_ranges);
+  ADD_SELECTION_BYTES(layer_b_topology.point_segment_ranges);
+  ADD_SELECTION_BYTES(layer_b_topology.edge_segment_ranges);
+  ADD_SELECTION_BYTES(layer_b_topology.point_direct_indices);
+  ADD_SELECTION_BYTES(layer_c_topology.poses);
+  ADD_SELECTION_BYTES(layer_c_topology.points);
+  ADD_SELECTION_BYTES(layer_c_topology.pairs);
+  ADD_SELECTION_BYTES(layer_c_topology.pair_contributions);
+  ADD_SELECTION_BYTES(layer_c_topology.segment_direct_pair_indices);
+  ADD_SELECTION_BYTES(layer_c_topology.segments);
+  ADD_SELECTION_BYTES(layer_c_topology.segment_pair_ranges);
+  ADD_SELECTION_BYTES(layer_c_topology.pose_edges);
+  ADD_SELECTION_BYTES(layer_c_topology.point_edges);
+  ADD_SELECTION_BYTES(image_update_meta);
+  ADD_SELECTION_BYTES(point_update_meta);
+  ADD_SELECTION_BYTES(pose_image_entity_indices);
+  ADD_SELECTION_BYTES(point_entity_indices);
+#undef ADD_SELECTION_BYTES
+  uint64_t budget = kDevicePreparedSelectionMaxBudget;
+  if (memory_budget_bytes != 0)
+    budget = std::min(budget, memory_budget_bytes / 4);
+  if (required > budget) {
+    --runtime.device_selection_miss_calls;
+    ++runtime.device_selection_bypasses;
+    return true;
+  }
+  std::array<uint64_t, kDevicePreparedSelectionMaxEntries> victims{};
+  size_t victim_count = 0;
+  const auto is_victim = [&](const uint64_t candidate) {
+    return std::find(victims.begin(), victims.begin() + victim_count,
+                     candidate) != victims.begin() + victim_count;
+  };
+  uint64_t retained_bytes =
+      store.device_selection_resident_bytes - replaced_bytes;
+  size_t retained_entries =
+      store.device_selection_plans.size() - (replace_existing ? 1 : 0);
+  while (retained_entries >= kDevicePreparedSelectionMaxEntries ||
+         retained_bytes + required > budget) {
+    uint64_t victim_id = 0;
+    uint64_t victim_tick = std::numeric_limits<uint64_t>::max();
+    for (const auto& value : store.device_selection_plans) {
+      if ((replace_existing && value.first == publication_id) ||
+          value.second.use_count() != 1 ||
+          is_victim(value.first)) {
+        continue;
+      }
+      const uint64_t tick = store.device_selection_lru[value.first];
+      if (tick < victim_tick) {
+        victim_id = value.first;
+        victim_tick = tick;
+      }
+    }
+    if (victim_id == 0) {
+      --runtime.device_selection_miss_calls;
+      ++runtime.device_selection_bypasses;
+      return true;
+    }
+    assert(victim_count < victims.size());
+    victims[victim_count++] = victim_id;
+    retained_bytes -= store.device_selection_bytes[victim_id];
+    --retained_entries;
+  }
+  uint64_t total = global_catalog_bytes;
+  if (!CheckedDeviceBaBudgetAdd(retained_bytes, &total) ||
+      !CheckedDeviceBaBudgetAdd(pooled->arena_capacity, &total) ||
+      !CheckedDeviceBaBudgetAdd(required, &total) ||
+      (memory_budget_bytes != 0 && total > memory_budget_bytes)) {
+    *error = "INSUFFICIENT_GPU_MEMORY for prepared selection store";
+    return false;
+  }
+  std::shared_ptr<DevicePreparedSelectionAllocation> pending;
+  try {
+    pending = std::make_shared<DevicePreparedSelectionAllocation>();
+  } catch (const std::bad_alloc&) {
+    *error = "prepared selection allocation metadata failed";
+    return false;
+  }
+  pending->device = pooled->device;
+  pending->cuda_context = pooled->key.context;
+  pending->pool_entry_incarnation = pooled->context_incarnation;
+  pending->owner_epoch = view.identity.owner_epoch;
+  pending->slot_namespace_epoch = view.prepared_plan->slot_namespace_epoch;
+  pending->publication_id = publication_id;
+  pending->precision = precision;
+  pending->selection_budget = budget;
+  pending->host_plan = native->prepared_static;
+  if (replace_existing) {
+    pending->pending_victim_ids[pending->pending_victim_count++] =
+        publication_id;
+  }
+  for (size_t i = 0; i < victim_count; ++i) {
+    assert(pending->pending_victim_count < pending->pending_victim_ids.size());
+    pending->pending_victim_ids[pending->pending_victim_count++] = victims[i];
+  }
+#define UPLOAD_SELECTION(field, source)                                      \
+  if (!AllocateAndUploadPreparedSelection(&pending->field, source,            \
+                                           pooled->device, pooled->stream,     \
+                                           pending.get(), error)) return false
+  UPLOAD_SELECTION(visual_bindings, plan.visual_bindings);
+  UPLOAD_SELECTION(lidar_static, plan.lidar_static);
+  UPLOAD_SELECTION(cost_order, plan.cost_layout.entries);
+  UPLOAD_SELECTION(pose_meta, plan.layer_b_topology.poses);
+  UPLOAD_SELECTION(point_meta, plan.layer_b_topology.points);
+  UPLOAD_SELECTION(edge_meta, plan.layer_b_topology.edges);
+  UPLOAD_SELECTION(pose_adjacency, plan.layer_b_topology.pose_adjacency);
+  UPLOAD_SELECTION(point_adjacency, plan.layer_b_topology.point_adjacency);
+  UPLOAD_SELECTION(edge_adjacency, plan.layer_b_topology.edge_adjacency);
+  UPLOAD_SELECTION(atomic_visual_bindings,
+                   plan.layer_b_topology.atomic_visual_bindings);
+  UPLOAD_SELECTION(atomic_lidar_bindings,
+                   plan.layer_b_topology.atomic_lidar_bindings);
+  UPLOAD_SELECTION(pose_segments, plan.layer_b_topology.pose_segments);
+  UPLOAD_SELECTION(point_segments, plan.layer_b_topology.point_segments);
+  UPLOAD_SELECTION(edge_segments, plan.layer_b_topology.edge_segments);
+  UPLOAD_SELECTION(pose_ranges, plan.layer_b_topology.pose_segment_ranges);
+  UPLOAD_SELECTION(point_ranges, plan.layer_b_topology.point_segment_ranges);
+  UPLOAD_SELECTION(edge_ranges, plan.layer_b_topology.edge_segment_ranges);
+  UPLOAD_SELECTION(point_direct_indices,
+                   plan.layer_b_topology.point_direct_indices);
+  UPLOAD_SELECTION(solve_pose_meta, plan.layer_c_topology.poses);
+  UPLOAD_SELECTION(solve_point_meta, plan.layer_c_topology.points);
+  UPLOAD_SELECTION(pair_meta, plan.layer_c_topology.pairs);
+  UPLOAD_SELECTION(pair_contributions,
+                   plan.layer_c_topology.pair_contributions);
+  UPLOAD_SELECTION(segment_direct_pair_indices,
+                   plan.layer_c_topology.segment_direct_pair_indices);
+  UPLOAD_SELECTION(schur_segments, plan.layer_c_topology.segments);
+  UPLOAD_SELECTION(schur_pair_ranges,
+                   plan.layer_c_topology.segment_pair_ranges);
+  UPLOAD_SELECTION(pose_edges, plan.layer_c_topology.pose_edges);
+  UPLOAD_SELECTION(point_edges, plan.layer_c_topology.point_edges);
+  UPLOAD_SELECTION(image_update_meta, plan.image_update_meta);
+  UPLOAD_SELECTION(point_update_meta, plan.point_update_meta);
+  UPLOAD_SELECTION(pose_image_entity_indices,
+                   plan.pose_image_entity_indices);
+  UPLOAD_SELECTION(point_entity_indices, plan.point_entity_indices);
+#undef UPLOAD_SELECTION
+  if (!ValidatePreparedSelectionContext(
+          *pending, pooled->key.context,
+          &store.context_query_count_for_testing, error)) {
+    pending->Quarantine();
+    ++runtime.device_selection_context_invalidations;
+    ++runtime.device_selection_poison_events;
+    g_cuda_resource_health = CudaResourceHealth::kTainted;
+    g_cuda_taint_cleanup_complete = false;
+    pooled->externally_cleared = true;
+    return false;
+  }
+  runtime.device_selection_upload_calls = 1;
+  runtime.device_selection_static_h2d_calls = pending->static_h2d_calls;
+  runtime.device_selection_static_h2d_bytes = pending->resident_bytes;
+  *pinned = std::move(pending);
+  return true;
+}
+
+bool PublishPendingDevicePreparedSelection(
+    NativeIndexedKernelInput* native,
+    const std::shared_ptr<DevicePreparedSelectionAllocation>& pending,
+    std::string* error) {
+  if (native == nullptr || native->device_store_state == nullptr ||
+      pending == nullptr || error == nullptr) {
+    if (error != nullptr) *error = "prepared selection publish is invalid";
+    return false;
+  }
+  if (pending->published) return true;
+  auto& store = *native->device_store_state;
+  std::lock_guard<std::mutex> lock(store.mutex);
+  const uint64_t publication_id = pending->publication_id;
+  std::shared_ptr<void> old_plan;
+  uint64_t old_lru = 0;
+  uint64_t old_bytes = 0;
+  const auto old = store.device_selection_plans.find(publication_id);
+  if (old != store.device_selection_plans.end()) {
+    old_plan = old->second;
+    old_lru = store.device_selection_lru[publication_id];
+    old_bytes = store.device_selection_bytes[publication_id];
+  }
+  uint64_t retained_bytes = store.device_selection_resident_bytes - old_bytes;
+  size_t retained_entries =
+      store.device_selection_plans.size() - (old_plan != nullptr ? 1 : 0);
+  for (size_t i = 0; i < pending->pending_victim_count; ++i) {
+    const uint64_t victim_id = pending->pending_victim_ids[i];
+    if (victim_id == publication_id) {
+      if (old_plan != nullptr && old_plan.use_count() != 2) {
+        *error = "prepared selection replacement became pinned before publish";
+        return false;
+      }
+      continue;
+    }
+    const auto victim = store.device_selection_plans.find(victim_id);
+    if (victim == store.device_selection_plans.end() ||
+        victim->second.use_count() != 1) {
+      *error = "prepared selection victim changed before publish";
+      return false;
+    }
+    retained_bytes -= store.device_selection_bytes[victim_id];
+    --retained_entries;
+  }
+  if (retained_entries >= kDevicePreparedSelectionMaxEntries ||
+      retained_bytes + pending->resident_bytes > pending->selection_budget) {
+    *error = "prepared selection capacity changed before publish";
+    return false;
+  }
+  try {
+    store.device_selection_plans[publication_id] = pending;
+    store.device_selection_lru[publication_id] = ++store.device_selection_clock;
+    store.device_selection_bytes[publication_id] = pending->resident_bytes;
+  } catch (const std::bad_alloc&) {
+    if (old_plan != nullptr) {
+      store.device_selection_plans[publication_id] = old_plan;
+      store.device_selection_lru[publication_id] = old_lru;
+      store.device_selection_bytes[publication_id] = old_bytes;
+    } else {
+      store.device_selection_plans.erase(publication_id);
+      store.device_selection_lru.erase(publication_id);
+      store.device_selection_bytes.erase(publication_id);
+    }
+    *error = "prepared selection publication allocation failed";
+    return false;
+  }
+  for (size_t i = 0; i < pending->pending_victim_count; ++i) {
+    const uint64_t victim_id = pending->pending_victim_ids[i];
+    if (victim_id == publication_id) continue;
+    const auto victim = store.device_selection_plans.find(victim_id);
+    if (victim == store.device_selection_plans.end()) continue;
+    store.device_selection_resident_bytes -=
+        store.device_selection_bytes[victim_id];
+    store.device_selection_bytes.erase(victim_id);
+    store.device_selection_lru.erase(victim_id);
+    store.device_selection_plans.erase(victim);
+    ++native->runtime.device_selection_evictions;
+  }
+  store.device_selection_resident_bytes -= old_bytes;
+  store.device_selection_resident_bytes += pending->resident_bytes;
+  store.device_selection_peak_bytes =
+      std::max(store.device_selection_peak_bytes,
+               store.device_selection_resident_bytes);
+  pending->published = true;
+  native->runtime.device_selection_resident_bytes =
+      store.device_selection_resident_bytes;
+  native->runtime.device_selection_peak_bytes =
+      store.device_selection_peak_bytes;
   return true;
 }
 
@@ -11770,7 +12804,7 @@ class GpuBaSolveContext {
   bool InitializeNative(
       const NativeHostSolveView& view,
       const ActiveStateBuffer& state,
-      const NativeIndexedKernelInput& native,
+      NativeIndexedKernelInput& native,
       const CudaLayerBOptions& options,
       const uint64_t solve_generation,
       const HotKernelImplementation hot_kernel_implementation,
@@ -11798,7 +12832,7 @@ class GpuBaSolveContext {
     topology_generation_ = NextMathematicalGeneration();
     packed_state_.topology_generation = topology_generation_;
     packed_state_.config_generation = 0;
-    packed_state_.layout_id = native.cost_layout.layout_id;
+    packed_state_.layout_id = native.Cost().layout_id;
     device_context_.reset(new GpuBaDeviceContext());
     if (!device_context_->InitializeNative(
             view, state, native, options, solve_generation_,
@@ -12458,17 +13492,17 @@ class GpuBaSolveContext {
         ? image_indices_ : borrowed_prepared_host_->image_indices;
   }
   const CostLayout& CostLayoutRef() const {
-    if (borrowed_native_ != nullptr) return borrowed_native_->cost_layout;
+    if (borrowed_native_ != nullptr) return borrowed_native_->Cost();
     return borrowed_prepared_host_ == nullptr
                ? cost_layout_ : borrowed_prepared_host_->cost_layout;
   }
   const LayerBTopology& LayerBTopologyRef() const {
-    if (borrowed_native_ != nullptr) return borrowed_native_->layer_b_topology;
+    if (borrowed_native_ != nullptr) return borrowed_native_->LayerB();
     return borrowed_prepared_host_ == nullptr
                ? layer_b_topology_ : borrowed_prepared_host_->layer_b_topology;
   }
   const LayerCTopology& LayerCTopologyRef() const {
-    if (borrowed_native_ != nullptr) return borrowed_native_->layer_c_topology;
+    if (borrowed_native_ != nullptr) return borrowed_native_->LayerC();
     return borrowed_prepared_host_ == nullptr
                ? layer_c_topology_ : *borrowed_prepared_host_->layer_c_topology;
   }
@@ -12958,7 +13992,7 @@ bool CompareNativePreparationToLegacyForTesting(
   result->edge_adjacency_count = candidate.layer_b_topology.edge_adjacency.size();
   result->pair_contribution_count =
       candidate.layer_c_topology.pair_contributions.size();
-  std::vector<uint8_t> sources(native_view.residual_ordinals.size(), 0);
+  std::vector<uint8_t> sources(native_view.ResidualOrdinals().size(), 0);
   result->source_indices_dense = true;
   for (const CudaVisualInput& value : candidate.packed.visual) {
     if (value.source_index >= sources.size() || sources[value.source_index]++)
@@ -13248,7 +14282,7 @@ bool GpuBaDeviceContext::Initialize(
 bool GpuBaDeviceContext::InitializeNative(
     const NativeHostSolveView& view,
     const ActiveStateBuffer& initial_state,
-    const NativeIndexedKernelInput& native,
+    NativeIndexedKernelInput& native,
     const CudaLayerBOptions& options,
     const uint64_t solve_generation,
     const uint64_t topology_generation,
@@ -13261,7 +14295,7 @@ bool GpuBaDeviceContext::InitializeNative(
     std::string* error) {
   return InitializeImpl(
       nullptr, &view, &initial_state, &native, PackedLayerAState(),
-      native.cost_layout, native.layer_b_topology, native.layer_c_topology,
+      native.Cost(), native.LayerB(), native.LayerC(),
       options, solve_generation, topology_generation, true, true,
       hot_kernel_implementation, hessian_assembly_backend,
       schur_contribution_backend, arithmetic_precision, execution_profile,
@@ -13272,7 +14306,7 @@ bool GpuBaDeviceContext::InitializeImpl(
     const Snapshot* legacy_initial_snapshot,
     const NativeHostSolveView* native_view,
     const ActiveStateBuffer* native_initial_state,
-    const NativeIndexedKernelInput* native,
+    NativeIndexedKernelInput* native,
     const PackedLayerAState& initial,
     const CostLayout& cost_layout,
     const LayerBTopology& layer_b,
@@ -13411,9 +14445,9 @@ bool GpuBaDeviceContext::InitializeImpl(
   solve_generation_ = solve_generation;
   topology_generation_ = topology_generation;
   layout_id_ = cost_layout.layout_id;
-  visual_count_ = native_initialization ? native->visual_bindings.size()
+  visual_count_ = native_initialization ? native->VisualBindings().size()
                                         : initial.visual.size();
-  lidar_count_ = native_initialization ? native->lidar_static.size()
+  lidar_count_ = native_initialization ? native->LidarStatic().size()
                                        : initial.lidar.size();
   pose_count_ = layer_b.poses.size();
   point_count_ = layer_b.points.size();
@@ -13525,11 +14559,11 @@ bool GpuBaDeviceContext::InitializeImpl(
   }
   cost_count_ = cost_layout.entries.size();
   image_entity_count_ = native_initialization
-      ? native->image_slots.size() : legacy_initial_snapshot->images.size();
+      ? native->ImageSlots().size() : legacy_initial_snapshot->images.size();
   point_entity_count_ = native_initialization
-      ? native->point_slots.size() : legacy_initial_snapshot->points.size();
+      ? native->PointSlots().size() : legacy_initial_snapshot->points.size();
   camera_entity_count_ = native_initialization
-      ? native->camera_slots.size() : legacy_initial_snapshot->cameras.size();
+      ? native->CameraSlots().size() : legacy_initial_snapshot->cameras.size();
   gradient_slots_ = pose_count_ + point_count_;
   pose_dimension_ = layer_c.pose_dimension;
   schur_elements_ = pose_dimension_ * pose_dimension_;
@@ -13609,6 +14643,25 @@ bool GpuBaDeviceContext::InitializeImpl(
       initializing_ = false;
       Close(nullptr);
       return false;
+    }
+    if (native_initialization &&
+        native_view->config.prepared_selection_cache ==
+            CudaPreparedSelectionCacheMode::kEnabled &&
+        native_view->prepared_plan != nullptr &&
+        native_view->prepared_plan->publication_id != 0 &&
+        native->prepared_static != nullptr &&
+        !EnsureDevicePreparedSelection(
+            &pooled, native, *native_view, arithmetic_precision_,
+            options.memory_budget_override_bytes,
+            native_device_catalog_resident_bytes_,
+            &native_device_selection_generation_, error)) {
+      initializing_ = false;
+      Close(nullptr);
+      return false;
+    }
+    if (native_device_selection_generation_ != nullptr) {
+      native_device_selection_resident_bytes_ =
+          native_device_selection_generation_->resident_bytes;
     }
     if (!runtime_pool_lease_.hot) {
       runtime_->persistent_device.init_stream_create_count = 1;
@@ -13716,93 +14769,126 @@ bool GpuBaDeviceContext::InitializeImpl(
   runtime_->persistent_device.transform_workspace_bytes = transformed_bytes;
 
   const auto allocate_main = [&]() {
+    const auto selection_count = [&](const size_t count) {
+      return native_device_selection_generation_ == nullptr ? count : 0;
+    };
     return
       AllocatePersistent(&d_visual_static_,
                          native_initialization ? 0 : visual_count_, error) &&
       AllocatePersistent(&d_indexed_visual_bindings_,
-                         native_initialization ? visual_count_ : 0, error) &&
+                         native_initialization &&
+                                 native_device_selection_generation_ == nullptr
+                             ? visual_count_ : 0,
+                         error) &&
       AllocatePersistent(&d_visual_dynamic_,
                          device_state_enabled_ ? 0 : visual_count_, error) &&
-      AllocatePersistent(&d_lidar_static_, lidar_count_, error) &&
+      AllocatePersistent(&d_lidar_static_,
+                         native_device_selection_generation_ == nullptr
+                             ? lidar_count_ : 0,
+                         error) &&
       AllocatePersistent(&d_lidar_dynamic_,
                          device_state_enabled_ ? 0 : lidar_count_, error) &&
       AllocatePersistent(&d_pose_state_, pose_count_, error) &&
       AllocatePersistent(&d_camera_entities_, camera_entity_count_, error) &&
-      AllocatePersistent(&d_image_update_meta_, image_entity_count_, error) &&
-      AllocatePersistent(&d_point_update_meta_, point_entity_count_, error) &&
-      AllocatePersistent(&d_pose_image_entity_indices_, pose_count_, error) &&
-      AllocatePersistent(&d_point_entity_indices_, point_count_, error) &&
+      AllocatePersistent(&d_image_update_meta_,
+                         selection_count(image_entity_count_), error) &&
+      AllocatePersistent(&d_point_update_meta_,
+                         selection_count(point_entity_count_), error) &&
+      AllocatePersistent(&d_pose_image_entity_indices_,
+                         selection_count(pose_count_), error) &&
+      AllocatePersistent(&d_point_entity_indices_,
+                         selection_count(point_count_), error) &&
       AllocatePersistent(&d_variable_image_download_,
                          native_initialization ? pose_count_ : 0, error) &&
       AllocatePersistent(&d_variable_point_download_,
                          native_initialization ? point_count_ : 0, error) &&
       AllocatePersistent(&d_state_update_status_, 1, error) &&
-      AllocatePersistent(&d_cost_order_, cost_count_, error) &&
-      AllocatePersistent(&d_pose_meta_, pose_count_, error) &&
-      AllocatePersistent(&d_point_meta_, point_count_, error) &&
-      AllocatePersistent(&d_edge_meta_, edge_count_, error) &&
-      AllocatePersistent(&d_pose_adjacency_, layer_b.pose_adjacency.size(), error) &&
-      AllocatePersistent(&d_point_adjacency_, layer_b.point_adjacency.size(), error) &&
-      AllocatePersistent(&d_edge_adjacency_, layer_b.edge_adjacency.size(), error) &&
+      AllocatePersistent(&d_cost_order_,
+                         native_device_selection_generation_ == nullptr
+                             ? cost_count_ : 0, error) &&
+      AllocatePersistent(&d_pose_meta_,
+                         native_device_selection_generation_ == nullptr
+                             ? pose_count_ : 0, error) &&
+      AllocatePersistent(&d_point_meta_,
+                         native_device_selection_generation_ == nullptr
+                             ? point_count_ : 0, error) &&
+      AllocatePersistent(&d_edge_meta_,
+                         native_device_selection_generation_ == nullptr
+                             ? edge_count_ : 0, error) &&
+      AllocatePersistent(&d_pose_adjacency_,
+                         native_device_selection_generation_ == nullptr
+                             ? layer_b.pose_adjacency.size() : 0, error) &&
+      AllocatePersistent(&d_point_adjacency_,
+                         native_device_selection_generation_ == nullptr
+                             ? layer_b.point_adjacency.size() : 0, error) &&
+      AllocatePersistent(&d_edge_adjacency_,
+                         native_device_selection_generation_ == nullptr
+                             ? layer_b.edge_adjacency.size() : 0, error) &&
       AllocatePersistent(&d_atomic_visual_bindings_,
-                         hessian_assembly_backend_ ==
+                         selection_count(hessian_assembly_backend_ ==
                                  CudaHessianAssemblyBackend::kObservationAtomic
-                             ? layer_b.atomic_visual_bindings.size() : 0,
+                             ? layer_b.atomic_visual_bindings.size() : 0),
                          error) &&
       AllocatePersistent(&d_atomic_lidar_bindings_,
-                         hessian_assembly_backend_ ==
+                         selection_count(hessian_assembly_backend_ ==
                                  CudaHessianAssemblyBackend::kObservationAtomic
-                             ? layer_b.atomic_lidar_bindings.size() : 0,
+                             ? layer_b.atomic_lidar_bindings.size() : 0),
                          error) &&
       AllocatePersistent(&d_pose_assembly_segments_,
-                         hessian_assembly_backend_ ==
+                         selection_count(hessian_assembly_backend_ ==
                                  CudaHessianAssemblyBackend::kObservationSegmented
-                             ? layer_b.pose_segments.size() : 0, error) &&
+                             ? layer_b.pose_segments.size() : 0), error) &&
       AllocatePersistent(&d_point_assembly_segments_,
-                         hessian_assembly_backend_ ==
+                         selection_count(hessian_assembly_backend_ ==
                                  CudaHessianAssemblyBackend::kObservationSegmented
-                             ? layer_b.point_segments.size() : 0, error) &&
+                             ? layer_b.point_segments.size() : 0), error) &&
       AllocatePersistent(&d_edge_assembly_segments_,
-                         hessian_assembly_backend_ ==
+                         selection_count(hessian_assembly_backend_ ==
                                  CudaHessianAssemblyBackend::kObservationSegmented
-                             ? layer_b.edge_segments.size() : 0, error) &&
+                             ? layer_b.edge_segments.size() : 0), error) &&
       AllocatePersistent(&d_pose_assembly_ranges_,
-                         hessian_assembly_backend_ ==
+                         selection_count(hessian_assembly_backend_ ==
                                  CudaHessianAssemblyBackend::kObservationSegmented
-                             ? layer_b.pose_segment_ranges.size() : 0, error) &&
+                             ? layer_b.pose_segment_ranges.size() : 0), error) &&
       AllocatePersistent(&d_point_assembly_ranges_,
-                         hessian_assembly_backend_ ==
+                         selection_count(hessian_assembly_backend_ ==
                                  CudaHessianAssemblyBackend::kObservationSegmented
-                             ? layer_b.point_segment_ranges.size() : 0, error) &&
+                             ? layer_b.point_segment_ranges.size() : 0), error) &&
       AllocatePersistent(&d_edge_assembly_ranges_,
-                         hessian_assembly_backend_ ==
+                         selection_count(hessian_assembly_backend_ ==
                                  CudaHessianAssemblyBackend::kObservationSegmented
-                             ? layer_b.edge_segment_ranges.size() : 0, error) &&
+                             ? layer_b.edge_segment_ranges.size() : 0), error) &&
       AllocatePersistent(&d_point_assembly_direct_indices_,
-                         hessian_assembly_backend_ ==
+                         selection_count(hessian_assembly_backend_ ==
                                  CudaHessianAssemblyBackend::kObservationSegmented
-                             ? layer_b.point_direct_indices.size() : 0,
+                             ? layer_b.point_direct_indices.size() : 0),
                          error) &&
-      AllocatePersistent(&d_solve_pose_meta_, layer_c.poses.size(), error) &&
-      AllocatePersistent(&d_solve_point_meta_, layer_c.points.size(), error) &&
-      AllocatePersistent(&d_pair_meta_, layer_c.pairs.size(), error) &&
+      AllocatePersistent(&d_solve_pose_meta_,
+                         selection_count(layer_c.poses.size()), error) &&
+      AllocatePersistent(&d_solve_point_meta_,
+                         selection_count(layer_c.points.size()), error) &&
+      AllocatePersistent(&d_pair_meta_,
+                         selection_count(layer_c.pairs.size()), error) &&
       AllocatePersistent(&d_pair_contributions_,
-                         layer_c.pair_contributions.size(), error) &&
+                         selection_count(layer_c.pair_contributions.size()),
+                         error) &&
       AllocatePersistent(&d_segment_direct_pair_indices_,
-                         schur_contribution_backend_ ==
+                         selection_count(schur_contribution_backend_ ==
                                  CudaSchurContributionBackend::kSegmentedTransformed
-                             ? layer_c.segment_direct_pair_indices.size() : 0,
+                             ? layer_c.segment_direct_pair_indices.size() : 0),
                          error) &&
       AllocatePersistent(&d_schur_segments_,
-                         schur_contribution_backend_ ==
+                         selection_count(schur_contribution_backend_ ==
                                  CudaSchurContributionBackend::kSegmentedTransformed
-                             ? layer_c.segments.size() : 0, error) &&
+                             ? layer_c.segments.size() : 0), error) &&
       AllocatePersistent(&d_schur_pair_segment_ranges_,
-                         schur_contribution_backend_ ==
+                         selection_count(schur_contribution_backend_ ==
                                  CudaSchurContributionBackend::kSegmentedTransformed
-                             ? layer_c.segment_pair_ranges.size() : 0, error) &&
-      AllocatePersistent(&d_pose_edges_, layer_c.pose_edges.size(), error) &&
-      AllocatePersistent(&d_point_edges_, layer_c.point_edges.size(), error) &&
+                             ? layer_c.segment_pair_ranges.size() : 0), error) &&
+      AllocatePersistent(&d_pose_edges_,
+                         selection_count(layer_c.pose_edges.size()), error) &&
+      AllocatePersistent(&d_point_edges_,
+                         selection_count(layer_c.point_edges.size()), error) &&
       AllocatePersistent(&layer_a_slots_[0].visual,
                          compact_layer_a_enabled_ ? 0 : visual_count_, error) &&
       AllocatePersistent(&layer_a_slots_[0].compact_visual,
@@ -13940,7 +15026,9 @@ bool GpuBaDeviceContext::InitializeImpl(
     if (runtime_pool_lease_.entry == nullptr ||
         !EnsureRuntimePoolArena(&runtime_pool_lease_,
                                 initial_arena_requirement,
-                                native_device_catalog_resident_bytes_,
+                                SaturatingAdd(
+                                    native_device_catalog_resident_bytes_,
+                                    native_device_selection_resident_bytes_),
                                 options.memory_budget_override_bytes,
                                 &runtime_->persistent_device, error)) {
       initializing_ = false;
@@ -13965,14 +15053,17 @@ bool GpuBaDeviceContext::InitializeImpl(
     allocated = allocate_main() && allocate_transformed() &&
         AllocatePersistent(&d_workspace_, workspace_count_, error);
     const uint64_t required_arena_bytes = arena_offset_;
+    const uint64_t native_static_resident_bytes = SaturatingAdd(
+        native_device_catalog_resident_bytes_,
+        native_device_selection_resident_bytes_);
     arena_planning_ = false;
     if (!allocated ||
         (options.memory_budget_override_bytes != 0 &&
          (required_arena_bytes > options.memory_budget_override_bytes ||
-          native_device_catalog_resident_bytes_ >
+          native_static_resident_bytes >
               options.memory_budget_override_bytes - required_arena_bytes)) ||
         !EnsureRuntimePoolArena(&runtime_pool_lease_, required_arena_bytes,
-                                native_device_catalog_resident_bytes_,
+                                native_static_resident_bytes,
                                 options.memory_budget_override_bytes,
                                 &runtime_->persistent_device, error)) {
       if (error->empty())
@@ -14036,6 +15127,40 @@ bool GpuBaDeviceContext::InitializeImpl(
     Close(nullptr);
     return false;
   }
+  if (native_device_selection_generation_ != nullptr) {
+    const auto& selection = *native_device_selection_generation_;
+    d_indexed_visual_bindings_ = selection.visual_bindings;
+    d_lidar_static_ = selection.lidar_static;
+    d_cost_order_ = selection.cost_order;
+    d_pose_meta_ = selection.pose_meta;
+    d_point_meta_ = selection.point_meta;
+    d_edge_meta_ = selection.edge_meta;
+    d_pose_adjacency_ = selection.pose_adjacency;
+    d_point_adjacency_ = selection.point_adjacency;
+    d_edge_adjacency_ = selection.edge_adjacency;
+    d_atomic_visual_bindings_ = selection.atomic_visual_bindings;
+    d_atomic_lidar_bindings_ = selection.atomic_lidar_bindings;
+    d_pose_assembly_segments_ = selection.pose_segments;
+    d_point_assembly_segments_ = selection.point_segments;
+    d_edge_assembly_segments_ = selection.edge_segments;
+    d_pose_assembly_ranges_ = selection.pose_ranges;
+    d_point_assembly_ranges_ = selection.point_ranges;
+    d_edge_assembly_ranges_ = selection.edge_ranges;
+    d_point_assembly_direct_indices_ = selection.point_direct_indices;
+    d_solve_pose_meta_ = selection.solve_pose_meta;
+    d_solve_point_meta_ = selection.solve_point_meta;
+    d_pair_meta_ = selection.pair_meta;
+    d_pair_contributions_ = selection.pair_contributions;
+    d_segment_direct_pair_indices_ = selection.segment_direct_pair_indices;
+    d_schur_segments_ = selection.schur_segments;
+    d_schur_pair_segment_ranges_ = selection.schur_pair_ranges;
+    d_pose_edges_ = selection.pose_edges;
+    d_point_edges_ = selection.point_edges;
+    d_image_update_meta_ = selection.image_update_meta;
+    d_point_update_meta_ = selection.point_update_meta;
+    d_pose_image_entity_indices_ = selection.pose_image_entity_indices;
+    d_point_entity_indices_ = selection.point_entity_indices;
+  }
   if (indexed_catalog_bound_ &&
       !BindRuntimePoolIndexedCatalog(
           &runtime_pool_lease_, *indexed_catalog, indexed_catalog_layout_,
@@ -14055,8 +15180,10 @@ bool GpuBaDeviceContext::InitializeImpl(
         runtime_pool_lease_.entry->arena_capacity;
     runtime_->persistent_device.peak_resident_bytes = std::max(
         runtime_->persistent_device.peak_resident_bytes,
-        SaturatingAdd(runtime_pool_lease_.entry->arena_capacity,
-                      native_device_catalog_resident_bytes_));
+        SaturatingAdd(
+            runtime_pool_lease_.entry->arena_capacity,
+            SaturatingAdd(native_device_catalog_resident_bytes_,
+                          native_device_selection_resident_bytes_)));
     if (indexed_catalog_bound_) {
       runtime_->persistent_device.arena_slice_count = SaturatingAdd(
           runtime_->persistent_device.arena_slice_count, 6);
@@ -14136,11 +15263,12 @@ bool GpuBaDeviceContext::InitializeImpl(
       runtime_->persistent_device.transform_workspace_bytes +
       runtime_->persistent_device.hessian_partial_workspace_bytes;
 
-  std::vector<DeviceVisualStaticInput> visual_static(visual_count_);
+  std::vector<DeviceVisualStaticInput> visual_static;
   std::unordered_map<uint32_t, uint32_t> image_indices;
   std::unordered_map<uint64_t, uint32_t> point_indices;
   std::unordered_map<uint32_t, uint32_t> camera_indices;
   if (!native_initialization) {
+    visual_static.resize(visual_count_);
     for (size_t i = 0; i < image_entity_count_; ++i) {
       const ImageSnapshot& image = legacy_initial_snapshot->images[i];
       if (!image_indices.emplace(image.image_id, static_cast<uint32_t>(i)).second) {
@@ -14183,12 +15311,12 @@ bool GpuBaDeviceContext::InitializeImpl(
     const auto graph_cameras = native_view->catalog.cameras();
     const auto graph_images = native_view->catalog.images();
     const auto graph_points = native_view->catalog.points();
-    native_camera_slots_ = native->camera_slots;
-    native_image_slots_ = native->image_slots;
-    native_point_slots_ = native->point_slots;
-    if (native->cameras.size() != native_camera_slots_.size() ||
-        native->images.size() != native_image_slots_.size() ||
-        native->points.size() != native_point_slots_.size()) {
+    native_camera_slots_ = &native->CameraSlots();
+    native_image_slots_ = &native->ImageSlots();
+    native_point_slots_ = &native->PointSlots();
+    if (native->cameras.size() != native_camera_slots_->size() ||
+        native->images.size() != native_image_slots_->size() ||
+        native->points.size() != native_point_slots_->size()) {
       *error = "native indexed entity storage count mismatch";
       initializing_ = false;
       Close(nullptr);
@@ -14197,34 +15325,37 @@ bool GpuBaDeviceContext::InitializeImpl(
     host_camera_entities_ = native->cameras;
     host_image_entities_ = native->images;
     host_point_entities_ = native->points;
-    for (size_t i = 0; i < native_image_slots_.size(); ++i) {
-      const uint32_t slot = native_image_slots_[i];
+    for (size_t i = 0; i < native_image_slots_->size(); ++i) {
+      const uint32_t slot = (*native_image_slots_)[i];
       if (slot >= graph_images.size ||
-          !image_indices.emplace(graph_images[slot].image_id,
-                                 static_cast<uint32_t>(i)).second) {
+          (native_device_selection_generation_ == nullptr &&
+           !image_indices.emplace(graph_images[slot].image_id,
+                                  static_cast<uint32_t>(i)).second)) {
         *error = "native device image entity layout is invalid";
         initializing_ = false;
         Close(nullptr);
         return false;
       }
     }
-    for (size_t i = 0; i < native_point_slots_.size(); ++i) {
-      const uint32_t slot = native_point_slots_[i];
+    for (size_t i = 0; i < native_point_slots_->size(); ++i) {
+      const uint32_t slot = (*native_point_slots_)[i];
       if (slot >= graph_points.size ||
-          !point_indices.emplace(graph_points[slot].point3D_id,
-                                 static_cast<uint32_t>(i)).second) {
+          (native_device_selection_generation_ == nullptr &&
+           !point_indices.emplace(graph_points[slot].point3D_id,
+                                  static_cast<uint32_t>(i)).second)) {
         *error = "native device point entity layout is invalid";
         initializing_ = false;
         Close(nullptr);
         return false;
       }
     }
-    for (size_t i = 0; i < native_camera_slots_.size(); ++i) {
-      const uint32_t slot = native_camera_slots_[i];
+    for (size_t i = 0; i < native_camera_slots_->size(); ++i) {
+      const uint32_t slot = (*native_camera_slots_)[i];
       if (slot >= graph_cameras.size ||
           graph_cameras[slot].model_id != kOpenCvcCameraModelId ||
-          !camera_indices.emplace(graph_cameras[slot].camera_id,
-                                  static_cast<uint32_t>(i)).second) {
+          (native_device_selection_generation_ == nullptr &&
+           !camera_indices.emplace(graph_cameras[slot].camera_id,
+                                   static_cast<uint32_t>(i)).second)) {
         *error = "native device camera entity layout is invalid";
         initializing_ = false;
         Close(nullptr);
@@ -14259,9 +15390,8 @@ bool GpuBaDeviceContext::InitializeImpl(
     visual_static[i].observation[0] = initial.visual[i].observation[0];
     visual_static[i].observation[1] = initial.visual[i].observation[1];
   }
-  std::vector<DeviceLidarStaticInput> lidar_static =
-      native_initialization ? native->lidar_static
-                            : std::vector<DeviceLidarStaticInput>(lidar_count_);
+  std::vector<DeviceLidarStaticInput> lidar_static;
+  if (!native_initialization) lidar_static.resize(lidar_count_);
   for (size_t i = 0; !native_initialization && i < lidar_count_; ++i) {
     lidar_static[i].source_index = initial.lidar[i].source_index;
     lidar_static[i].point3D_id = initial.lidar[i].point3D_id;
@@ -14279,19 +15409,58 @@ bool GpuBaDeviceContext::InitializeImpl(
     lidar_static[i].mode = initial.lidar[i].mode;
     lidar_static[i].near_zero_threshold = initial.lidar[i].near_zero_threshold;
   }
-  std::vector<DeviceImageUpdateMeta> image_update(image_entity_count_);
-  for (DeviceImageUpdateMeta& meta : image_update) {
-    meta.variable_pose_index = -1;
-    meta.delta_offset = 0;
-    meta.dimension = 0;
-    for (int32_t& value : meta.free_translation_indices) value = -1;
+  std::vector<DeviceImageUpdateMeta> legacy_image_update;
+  std::vector<uint32_t> legacy_pose_image_indices;
+  if (!native_initialization) {
+    legacy_image_update.resize(image_entity_count_);
+    legacy_pose_image_indices.resize(pose_count_);
+    for (DeviceImageUpdateMeta& meta : legacy_image_update) {
+      meta.variable_pose_index = -1;
+      meta.delta_offset = 0;
+      meta.dimension = 0;
+      for (int32_t& value : meta.free_translation_indices) value = -1;
+    }
   }
-  std::vector<uint32_t> pose_image_indices(pose_count_);
+  const std::vector<DeviceImageUpdateMeta>& image_update =
+      native_initialization ? native->ImageUpdateMeta() : legacy_image_update;
+  const std::vector<uint32_t>& pose_image_indices =
+      native_initialization ? native->PoseImageEntityIndices()
+                            : legacy_pose_image_indices;
   if (native_initialization) {
     variable_image_slots_.resize(pose_count_);
     variable_image_translation_masks_.resize(pose_count_);
   }
+  if (native_initialization) {
+    if (image_update.size() != image_entity_count_ ||
+        pose_image_indices.size() != pose_count_) {
+      *error = "cached native pose update metadata is incomplete";
+      initializing_ = false;
+      Close(nullptr);
+      return false;
+    }
+  }
   for (size_t i = 0; i < pose_count_; ++i) {
+    if (native_initialization) {
+      const uint32_t entity = pose_image_indices[i];
+      if (entity >= native_image_slots_->size()) {
+        *error = "cached native pose entity index is invalid";
+        initializing_ = false;
+        Close(nullptr);
+        return false;
+      }
+      variable_image_slots_[i] = (*native_image_slots_)[entity];
+      uint8_t variable_mask = 0;
+      for (uint32_t component = 3; component < layer_b.poses[i].dimension;
+           ++component) {
+        const int32_t translation =
+            layer_b.poses[i].free_translation_indices[component - 3];
+        if (translation >= 0 && translation < 3)
+          variable_mask |= static_cast<uint8_t>(1u << translation);
+      }
+      variable_image_translation_masks_[i] =
+          static_cast<uint8_t>((~variable_mask) & 0x7u);
+      continue;
+    }
     const auto image_it = image_indices.find(layer_b.poses[i].image_id);
     if (image_it == image_indices.end() || i >= layer_c.poses.size() ||
         layer_c.poses[i].dimension != layer_b.poses[i].dimension ||
@@ -14303,21 +15472,8 @@ bool GpuBaDeviceContext::InitializeImpl(
       Close(nullptr);
       return false;
     }
-    pose_image_indices[i] = image_it->second;
-    if (native_initialization) {
-      variable_image_slots_[i] = native_image_slots_[image_it->second];
-      uint8_t variable_mask = 0;
-      for (uint32_t component = 3; component < layer_b.poses[i].dimension;
-           ++component) {
-        const int32_t translation =
-            layer_b.poses[i].free_translation_indices[component - 3];
-        if (translation >= 0 && translation < 3)
-          variable_mask |= static_cast<uint8_t>(1u << translation);
-      }
-      variable_image_translation_masks_[i] =
-          static_cast<uint8_t>((~variable_mask) & 0x7u);
-    }
-    DeviceImageUpdateMeta& meta = image_update[image_it->second];
+    legacy_pose_image_indices[i] = image_it->second;
+    DeviceImageUpdateMeta& meta = legacy_image_update[image_it->second];
     meta.variable_pose_index = static_cast<int32_t>(i);
     meta.delta_offset = layer_c.poses[i].offset;
     meta.dimension = layer_b.poses[i].dimension;
@@ -14325,12 +15481,41 @@ bool GpuBaDeviceContext::InitializeImpl(
       meta.free_translation_indices[j] =
           layer_b.poses[i].free_translation_indices[j];
   }
-  std::vector<DevicePointUpdateMeta> point_update(point_entity_count_);
-  std::vector<uint32_t> point_entity_indices(point_count_);
+  std::vector<DevicePointUpdateMeta> legacy_point_update;
+  std::vector<uint32_t> legacy_point_entity_indices;
+  if (!native_initialization) {
+    legacy_point_update.resize(point_entity_count_);
+    legacy_point_entity_indices.resize(point_count_);
+    for (DevicePointUpdateMeta& meta : legacy_point_update)
+      meta.variable_point_index = -1;
+  }
+  const std::vector<DevicePointUpdateMeta>& point_update =
+      native_initialization ? native->PointUpdateMeta() : legacy_point_update;
+  const std::vector<uint32_t>& point_entity_indices =
+      native_initialization ? native->PointEntityIndices()
+                            : legacy_point_entity_indices;
   if (native_initialization) variable_point_slots_.resize(point_count_);
-  for (DevicePointUpdateMeta& meta : point_update)
-    meta.variable_point_index = -1;
+  if (native_initialization) {
+    if (point_update.size() != point_entity_count_ ||
+        point_entity_indices.size() != point_count_) {
+      *error = "cached native point update metadata is incomplete";
+      initializing_ = false;
+      Close(nullptr);
+      return false;
+    }
+  }
   for (size_t i = 0; i < point_count_; ++i) {
+    if (native_initialization) {
+      if (point_entity_indices[i] >= native_point_slots_->size()) {
+        *error = "cached native point entity index is invalid";
+        initializing_ = false;
+        Close(nullptr);
+        return false;
+      }
+      variable_point_slots_[i] =
+          (*native_point_slots_)[point_entity_indices[i]];
+      continue;
+    }
     const auto point_it = point_indices.find(layer_b.points[i].point3D_id);
     if (point_it == point_indices.end()) {
       *error = "device-state point update mapping is incomplete";
@@ -14338,23 +15523,37 @@ bool GpuBaDeviceContext::InitializeImpl(
       Close(nullptr);
       return false;
     }
-    point_update[point_it->second].variable_point_index =
+    legacy_point_update[point_it->second].variable_point_index =
         static_cast<int32_t>(i);
-    point_entity_indices[i] = point_it->second;
-    if (native_initialization)
-      variable_point_slots_[i] = native_point_slots_[point_it->second];
+    legacy_point_entity_indices[i] = point_it->second;
   }
+  const bool selection_static_uploaded =
+      native_device_selection_generation_ != nullptr;
   const bool uploaded =
-      (native_initialization
+      (selection_static_uploaded
+           ? true
+           : native_initialization
            ? UploadStatic(d_indexed_visual_bindings_,
-                          native->visual_bindings, error)
+                          native->VisualBindings(), error)
            : UploadStatic(d_visual_static_, visual_static, error)) &&
-      UploadStatic(d_lidar_static_, lidar_static, error) &&
+      (selection_static_uploaded
+           ? true
+           : UploadStatic(d_lidar_static_,
+                          native_initialization ? native->LidarStatic()
+                                                : lidar_static,
+                          error)) &&
       UploadStatic(d_camera_entities_, host_camera_entities_, error) &&
-      UploadStatic(d_image_update_meta_, image_update, error) &&
-      UploadStatic(d_point_update_meta_, point_update, error) &&
-      UploadStatic(d_pose_image_entity_indices_, pose_image_indices, error) &&
-      UploadStatic(d_point_entity_indices_, point_entity_indices, error) &&
+      (selection_static_uploaded
+           ? true : UploadStatic(d_image_update_meta_, image_update, error)) &&
+      (selection_static_uploaded
+           ? true : UploadStatic(d_point_update_meta_, point_update, error)) &&
+      (selection_static_uploaded
+           ? true : UploadStatic(d_pose_image_entity_indices_,
+                                 pose_image_indices, error)) &&
+      (selection_static_uploaded
+           ? true : UploadStatic(d_point_entity_indices_,
+                                 point_entity_indices, error)) &&
+      (selection_static_uploaded ? true :
       UploadStatic(d_cost_order_, cost_layout.entries, error) &&
       UploadStatic(d_pose_meta_, layer_b.poses, error) &&
       UploadStatic(d_point_meta_, layer_b.points, error) &&
@@ -14387,7 +15586,7 @@ bool GpuBaDeviceContext::InitializeImpl(
       UploadStatic(d_schur_pair_segment_ranges_,
                    layer_c.segment_pair_ranges, error) &&
       UploadStatic(d_pose_edges_, layer_c.pose_edges, error) &&
-      UploadStatic(d_point_edges_, layer_c.point_edges, error);
+      UploadStatic(d_point_edges_, layer_c.point_edges, error));
   if (!uploaded) {
     initializing_ = false;
     Close(nullptr);
@@ -14435,7 +15634,11 @@ bool GpuBaDeviceContext::InitializeImpl(
     current_state.identity.kind = PersistentSlotKind::kStateCurrent;
     current_state.identity.valid = true;
   }
-  if (!Synchronize(CudaSyncSite::kResourceRelease, error)) {
+  if (!Synchronize(CudaSyncSite::kResourceRelease, error) ||
+      (native_device_selection_generation_ != nullptr &&
+       !native_device_selection_generation_->published &&
+       !PublishPendingDevicePreparedSelection(
+           native, native_device_selection_generation_, error))) {
     initializing_ = false;
     Close(nullptr);
     return false;
@@ -15391,9 +16594,11 @@ bool GpuBaDeviceContext::RunLayerBFromNativeDeviceState(
     CudaDeviceLinearizationToken* token,
     std::string* error) {
   if (!device_state_enabled_ || result == nullptr || token == nullptr ||
-      error == nullptr || native_image_slots_.size() != image_entity_count_ ||
-      native_point_slots_.size() != point_entity_count_ ||
-      native_camera_slots_.size() != camera_entity_count_) {
+      error == nullptr || native_image_slots_ == nullptr ||
+      native_point_slots_ == nullptr || native_camera_slots_ == nullptr ||
+      native_image_slots_->size() != image_entity_count_ ||
+      native_point_slots_->size() != point_entity_count_ ||
+      native_camera_slots_->size() != camera_entity_count_) {
     if (error != nullptr) *error = "native device-state Layer B is invalid";
     return false;
   }
@@ -18917,6 +20122,8 @@ bool ResolveNativeCudaConfiguration(
   value.hot_kernel = resolved_options->hot_kernel_mode;
   value.execution_profile = resolved_options->execution_profile;
   value.residual_order = layer_c.layer_b.layer_a.residual_order;
+  value.prepared_selection_cache =
+      resolved_options->prepared_selection_cache_mode;
   value.loss_mode = loss_mode;
   value.lidar_residual_mode = lidar_mode;
   value.lidar_near_zero_threshold = 1e-12;
@@ -23400,6 +24607,8 @@ bool RunCustomCudaSolveCore(const CudaSolveProblem* problem,
         options.current_linearization_cache_mode !=
             config.linearization_cache ||
         options.audit_profile != config.audit_profile ||
+        options.prepared_selection_cache_mode !=
+            config.prepared_selection_cache ||
         (options.max_num_iterations >= 0 &&
          options.max_num_iterations != config.max_num_iterations) ||
         (options.max_num_consecutive_invalid_steps >= 0 &&
@@ -24764,6 +25973,7 @@ bool MakeCudaFullLmOptionsFromNativeConfig(
   result.hot_kernel_mode = config.hot_kernel;
   result.execution_profile = config.execution_profile;
   result.audit_profile = config.audit_profile;
+  result.prepared_selection_cache_mode = config.prepared_selection_cache;
   result.performance_mode = config.performance_mode;
   result.current_linearization_cache_mode = config.linearization_cache;
   result.pair_chunk_limit_bytes_for_testing = config.pair_chunk_limit_bytes;
@@ -24816,15 +26026,16 @@ bool RunCustomCudaSolve(const NativeCudaSolveRequest& request,
     result->error = *error;
     return false;
   }
+  const auto device_store_state =
+      std::static_pointer_cast<DeviceBaProblemStoreState>(
+          request.device_store->state_);
   NativeIndexedKernelInput indexed;
-  if (!BuildNativeIndexedKernelInput(*request.view, *request.initial_state,
-                                     &indexed, error)) {
+  if (!PrepareNativeIndexedKernelInput(*request.view, *request.initial_state,
+                                       device_store_state, &indexed, error)) {
     result->error = *error;
     return false;
   }
-  indexed.device_store_state =
-      std::static_pointer_cast<DeviceBaProblemStoreState>(
-          request.device_store->state_);
+  indexed.device_store_state = device_store_state;
   CudaFullLmResult controller_result;
   const bool success = RunCustomCudaSolveCore(
       nullptr, nullptr, &request, &indexed, result,

@@ -255,6 +255,7 @@ struct HostBaGraphPublication {
   uint64_t owner_epoch = 0;
   uint64_t topology_revision = 0;
   uint64_t generation = 0;
+  uint64_t slot_namespace_epoch = 0;
   std::vector<HostBaCameraSlot> cameras;
   std::vector<HostBaImageSlot> images;
   std::vector<HostBaPointSlot> points;
@@ -292,7 +293,7 @@ uint64_t EstimateResidentBytes(const HostBaGraphPublication& graph) noexcept {
 bool ValidateGraphReferences(const HostBaGraphPublication& graph,
                              std::string* error) {
   if (graph.owner_epoch == 0 || graph.topology_revision == 0 ||
-      graph.generation == 0) {
+      graph.generation == 0 || graph.slot_namespace_epoch == 0) {
     return SetError("host BA graph has invalid publication identity", error);
   }
   for (const HostBaImageSlot& image : graph.images) {
@@ -402,12 +403,14 @@ bool AppendIncidence(std::vector<HostBaIncidenceNode>* nodes,
 
 bool BuildColdPublication(const HostBaGraphColdInput& input,
                           const uint64_t generation,
+                          const uint64_t slot_namespace_epoch,
                           HostBaGraphUpdateResult* result,
                           HostBaGraphPublication* graph,
                           std::string* error) {
   graph->owner_epoch = input.owner_epoch;
   graph->topology_revision = input.topology_revision;
   graph->generation = generation;
+  graph->slot_namespace_epoch = slot_namespace_epoch;
   if (!FitsUint32(input.cameras.size()) || !FitsUint32(input.images.size()) ||
       !FitsUint32(input.points.size()) ||
       !FitsUint32(input.observations.size()) ||
@@ -642,6 +645,9 @@ uint64_t CatalogReadLease::topology_revision() const noexcept {
 uint64_t CatalogReadLease::generation() const noexcept {
   return publication_ == nullptr ? 0 : publication_->generation;
 }
+uint64_t CatalogReadLease::slot_namespace_epoch() const noexcept {
+  return publication_ == nullptr ? 0 : publication_->slot_namespace_epoch;
+}
 uint64_t CatalogReadLease::resident_bytes() const noexcept {
   return publication_ == nullptr ? 0 : publication_->resident_bytes;
 }
@@ -756,7 +762,8 @@ bool HostBaGraphStore::ColdBuild(const HostBaGraphColdInput& input,
     return SetError("host BA graph full rebuild revision did not advance",
                     error);
   }
-  if (next_generation_ == std::numeric_limits<uint64_t>::max()) {
+  if (next_generation_ == std::numeric_limits<uint64_t>::max() ||
+      next_slot_namespace_epoch_ == std::numeric_limits<uint64_t>::max()) {
     return SetError("host BA graph generation exhausted", error);
   }
 
@@ -770,7 +777,8 @@ bool HostBaGraphStore::ColdBuild(const HostBaGraphColdInput& input,
     valid_ = false;
     std::shared_ptr<HostBaGraphPublication> pending =
         std::make_shared<HostBaGraphPublication>();
-    if (!BuildColdPublication(input, next_generation_ + 1, result,
+    if (!BuildColdPublication(input, next_generation_ + 1,
+                              next_slot_namespace_epoch_ + 1, result,
                               pending.get(), error)) {
       return false;
     }
@@ -779,6 +787,7 @@ bool HostBaGraphStore::ColdBuild(const HostBaGraphColdInput& input,
     result->published = true;
     publication_ = std::move(pending);
     next_generation_ = publication_->generation;
+    next_slot_namespace_epoch_ = publication_->slot_namespace_epoch;
     valid_ = true;
     return true;
   } catch (const std::bad_alloc&) {
@@ -1536,6 +1545,66 @@ bool AddParameterIfFirst(
 
 }  // namespace
 
+const std::vector<uint32_t>& NativeHostSolveView::ActiveCameraSlots()
+    const noexcept {
+  return prepared_plan == nullptr ? active_camera_slots
+                                  : prepared_plan->active_camera_slots;
+}
+const std::vector<uint32_t>& NativeHostSolveView::ActiveImageSlots()
+    const noexcept {
+  return prepared_plan == nullptr ? active_image_slots
+                                  : prepared_plan->active_image_slots;
+}
+const std::vector<uint32_t>& NativeHostSolveView::BoundaryImageSlots()
+    const noexcept {
+  return prepared_plan == nullptr ? boundary_image_slots
+                                  : prepared_plan->boundary_image_slots;
+}
+const std::vector<uint32_t>& NativeHostSolveView::ActivePointSlots()
+    const noexcept {
+  return prepared_plan == nullptr ? active_point_slots
+                                  : prepared_plan->active_point_slots;
+}
+const std::vector<uint32_t>& NativeHostSolveView::VisualObservationSlots()
+    const noexcept {
+  return prepared_plan == nullptr ? visual_observation_slots
+                                  : prepared_plan->visual_observation_slots;
+}
+const FixedPolicyResult& NativeHostSolveView::Fixed() const noexcept {
+  return prepared_plan == nullptr ? fixed : prepared_plan->fixed;
+}
+const std::vector<LidarConstraintRecord>&
+NativeHostSolveView::LidarConstraints() const noexcept {
+  return prepared_plan == nullptr ? lidar.constraints
+                                  : prepared_plan->lidar_constraints;
+}
+const std::vector<ResidualOrdinal>& NativeHostSolveView::ResidualOrdinals()
+    const noexcept {
+  return prepared_plan == nullptr ? residual_ordinals
+                                  : prepared_plan->residual_ordinals;
+}
+const std::vector<ParameterOrdinal>& NativeHostSolveView::ParameterOrdinals()
+    const noexcept {
+  return prepared_plan == nullptr ? parameter_ordinals
+                                  : prepared_plan->parameter_ordinals;
+}
+uint64_t NativeHostSolveView::ResidualBlockCount() const noexcept {
+  return prepared_plan == nullptr ? residual_block_count
+                                  : prepared_plan->residual_block_count;
+}
+uint64_t NativeHostSolveView::ScalarResidualCount() const noexcept {
+  return prepared_plan == nullptr ? scalar_residual_count
+                                  : prepared_plan->scalar_residual_count;
+}
+uint64_t NativeHostSolveView::AmbientParameterCount() const noexcept {
+  return prepared_plan == nullptr ? ambient_parameter_count
+                                  : prepared_plan->ambient_parameter_count;
+}
+uint64_t NativeHostSolveView::EffectiveParameterCount() const noexcept {
+  return prepared_plan == nullptr ? effective_parameter_count
+                                  : prepared_plan->effective_parameter_count;
+}
+
 bool NativeHostSolveMaterializer::Materialize(
     const CatalogReadLease& catalog,
     const BaSolveIntent& intent,
@@ -1554,6 +1623,8 @@ bool NativeHostSolveMaterializer::Materialize(
   error->clear();
   const auto start = std::chrono::steady_clock::now();
   ++runtime->calls;
+  ++runtime->static_materialize_calls;
+  ++runtime->dynamic_state_gather_calls;
   const uint8_t loss_mode = static_cast<uint8_t>(intent.config.loss_mode);
 
   if (!catalog.valid() || catalog.abi_version() != kHostBaGraphAbiVersion ||
@@ -1757,6 +1828,7 @@ bool NativeHostSolveMaterializer::Materialize(
         return SetError("native incidence chain is corrupt", error);
       }
       ++runtime->catalog_observation_visits;
+      ++runtime->incidence_traversal_visits;
       const HostBaIncidenceNode& node = nodes[node_index];
       if (node.observation_slot >= observations.size) {
         return SetError("native incidence references an invalid observation",
@@ -1789,7 +1861,8 @@ bool NativeHostSolveMaterializer::Materialize(
                       error);
     }
     if (!activate_image(image_slot, false)) return false;
-    if (!intent.active_visual_observation_slots_explicit) {
+    if (!intent.active_visual_observation_slots_explicit &&
+        !intent.visual_observation_slots_fully_resolved) {
       const HostBaImageSlot& image = images[image_slot];
       if (!visit_incidence(
               image.adjacency_head, image.adjacency_count, image_slot, true,
@@ -1816,8 +1889,36 @@ bool NativeHostSolveMaterializer::Materialize(
       if (!select_observation(observation_slot, false)) return false;
     }
   }
+  if (intent.visual_observation_slots_fully_resolved) {
+    if (intent.active_visual_observation_slots_explicit) {
+      return SetError("native visual selection has conflicting resolutions",
+                      error);
+    }
+    for (const uint32_t observation_slot :
+         intent.resolved_visual_observation_slots) {
+      if (observation_slot >= observations.size ||
+          !observations[observation_slot].header.alive ||
+          observation_stamps_[observation_slot] == stamp) {
+        return SetError("native resolved visual selection is invalid", error);
+      }
+      const HostBaObservationSlot& observation = observations[observation_slot];
+      const bool active_image =
+          image_active_stamps_[observation.image_slot] == stamp &&
+          boundary_image_slots.count(observation.image_slot) == 0;
+      if (!active_image &&
+          explicit_variable_point_slots.count(observation.point_slot) == 0 &&
+          explicit_constant_point_slots.count(observation.point_slot) == 0) {
+        return SetError(
+            "native resolved boundary visual is not owned by an explicit point",
+            error);
+      }
+      ++runtime->catalog_observation_visits;
+      if (!select_observation(observation_slot, !active_image)) return false;
+    }
+  }
   for (const uint32_t point_slot : intent.explicit_variable_point_slots) {
     if (!activate_point(point_slot)) return false;
+    if (intent.visual_observation_slots_fully_resolved) continue;
     const HostBaPointSlot& point = points[point_slot];
     if (!visit_incidence(
             point.adjacency_head, point.adjacency_count, point_slot, false,
@@ -1834,6 +1935,7 @@ bool NativeHostSolveMaterializer::Materialize(
   }
   for (const uint32_t point_slot : intent.explicit_constant_point_slots) {
     if (!activate_point(point_slot)) return false;
+    if (intent.visual_observation_slots_fully_resolved) continue;
     const HostBaPointSlot& point = points[point_slot];
     if (!visit_incidence(
             point.adjacency_head, point.adjacency_count, point_slot, false,
@@ -2295,32 +2397,33 @@ bool ValidateNativeHostSolveView(const NativeHostSolveView& view,
       view.identity.catalog_revision != view.catalog.topology_revision() ||
       view.identity.catalog_generation != view.catalog.generation() ||
       view.identity.config_generation != view.config.config_generation ||
-      view.identity.lidar_map_generation !=
-          view.lidar.lidar_map_generation ||
+      view.identity.lidar_map_generation != view.lidar.lidar_map_generation ||
       view.identity.lidar_match_config_generation !=
           view.lidar.match_config_generation ||
       state.owner_epoch != view.identity.owner_epoch ||
       state.catalog_generation != view.identity.catalog_generation ||
-      view.residual_block_count != view.residual_ordinals.size() ||
-      view.scalar_residual_count !=
-          view.visual_observation_slots.size() * 2 +
-              view.lidar.constraints.size()) {
+      view.ResidualBlockCount() != view.ResidualOrdinals().size() ||
+      view.ScalarResidualCount() !=
+          view.VisualObservationSlots().size() * 2 +
+              view.LidarConstraints().size()) {
     return SetError("native solve view identity or count is inconsistent",
                     error);
   }
-  std::vector<uint8_t> source_indices_seen(view.residual_ordinals.size(), 0);
-  for (size_t i = 0; i < view.residual_ordinals.size(); ++i) {
-    if (view.residual_ordinals[i].execution_ordinal != i ||
-        view.residual_ordinals[i].source_insertion_index >=
-            view.residual_ordinals.size() ||
-        source_indices_seen[view.residual_ordinals[i]
+  const auto& residual_ordinals = view.ResidualOrdinals();
+  std::vector<uint8_t> source_indices_seen(residual_ordinals.size(), 0);
+  for (size_t i = 0; i < residual_ordinals.size(); ++i) {
+    if (residual_ordinals[i].execution_ordinal != i ||
+        residual_ordinals[i].source_insertion_index >=
+            residual_ordinals.size() ||
+        source_indices_seen[residual_ordinals[i]
                                 .source_insertion_index] != 0) {
       return SetError("native residual ordinal sequence is invalid", error);
     }
-    source_indices_seen[view.residual_ordinals[i].source_insertion_index] = 1;
+    source_indices_seen[residual_ordinals[i].source_insertion_index] = 1;
   }
-  for (size_t i = 0; i < view.parameter_ordinals.size(); ++i) {
-    if (view.parameter_ordinals[i].ordinal != i) {
+  const auto& parameter_ordinals = view.ParameterOrdinals();
+  for (size_t i = 0; i < parameter_ordinals.size(); ++i) {
+    if (parameter_ordinals[i].ordinal != i) {
       return SetError("native parameter ordinal sequence is invalid", error);
     }
   }

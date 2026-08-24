@@ -196,6 +196,7 @@ class CatalogReadLease {
   uint64_t owner_epoch() const noexcept;
   uint64_t topology_revision() const noexcept;
   uint64_t generation() const noexcept;
+  uint64_t slot_namespace_epoch() const noexcept;
   uint64_t resident_bytes() const noexcept;
 
   BaArrayView<HostBaCameraSlot> cameras() const noexcept;
@@ -249,9 +250,15 @@ class HostBaGraphStore {
  private:
   uint64_t owner_epoch_ = 0;
   uint64_t next_generation_ = 0;
+  uint64_t next_slot_namespace_epoch_ = 0;
   bool valid_ = false;
   std::shared_ptr<HostBaGraphLeaseGateState> gate_;
   std::shared_ptr<HostBaGraphPublication> publication_;
+};
+
+enum class CudaPreparedSelectionCacheMode : uint8_t {
+  kDisabled = 0,
+  kEnabled = 1,
 };
 
 struct NativeCudaResolvedConfig {
@@ -275,6 +282,8 @@ struct NativeCudaResolvedConfig {
   CudaExecutionProfile execution_profile =
       static_cast<CudaExecutionProfile>(0);
   CudaResidualOrder residual_order = static_cast<CudaResidualOrder>(0);
+  CudaPreparedSelectionCacheMode prepared_selection_cache =
+      CudaPreparedSelectionCacheMode::kDisabled;
   CudaLossMode loss_mode = static_cast<CudaLossMode>(0);
   LidarResidualMode lidar_residual_mode = LidarResidualMode::kLegacyExact;
   double lidar_near_zero_threshold = 1e-12;
@@ -412,6 +421,11 @@ struct BaSolveIntent {
   // When true, an empty vector means that no visual observations are active;
   // it must not fall back to scanning every active-image incidence.
   bool active_visual_observation_slots_explicit = false;
+  // Direct ID-based preparation may resolve the complete visual residual set
+  // once, including boundary observations. The materializer validates and
+  // classifies these slots without traversing catalog incidence again.
+  std::vector<uint32_t> resolved_visual_observation_slots;
+  bool visual_observation_slots_fully_resolved = false;
   // Optional source-insertion sequence produced by the shared residual
   // enumerator. When present it must cover every selected visual and LiDAR
   // residual exactly once. It is distinct from catalog physical identity and
@@ -572,6 +586,25 @@ struct NativeHostSolveViewIdentity {
   uint64_t lidar_match_config_generation = 0;
 };
 
+struct PreparedSelectionPlan {
+  uint64_t publication_id = 0;
+  uint64_t slot_namespace_epoch = 0;
+  uint64_t host_resident_bytes = 0;
+  std::vector<uint32_t> active_camera_slots;
+  std::vector<uint32_t> active_image_slots;
+  std::vector<uint32_t> boundary_image_slots;
+  std::vector<uint32_t> active_point_slots;
+  std::vector<uint32_t> visual_observation_slots;
+  FixedPolicyResult fixed;
+  std::vector<LidarConstraintRecord> lidar_constraints;
+  std::vector<ResidualOrdinal> residual_ordinals;
+  std::vector<ParameterOrdinal> parameter_ordinals;
+  uint64_t residual_block_count = 0;
+  uint64_t scalar_residual_count = 0;
+  uint64_t ambient_parameter_count = 0;
+  uint64_t effective_parameter_count = 0;
+};
+
 struct NativeHostSolveView {
   NativeHostSolveViewIdentity identity;
   BaKind kind = BaKind::kLocal;
@@ -590,16 +623,34 @@ struct NativeHostSolveView {
   uint64_t scalar_residual_count = 0;
   uint64_t ambient_parameter_count = 0;
   uint64_t effective_parameter_count = 0;
+  std::shared_ptr<const PreparedSelectionPlan> prepared_plan;
+
+  const std::vector<uint32_t>& ActiveCameraSlots() const noexcept;
+  const std::vector<uint32_t>& ActiveImageSlots() const noexcept;
+  const std::vector<uint32_t>& BoundaryImageSlots() const noexcept;
+  const std::vector<uint32_t>& ActivePointSlots() const noexcept;
+  const std::vector<uint32_t>& VisualObservationSlots() const noexcept;
+  const FixedPolicyResult& Fixed() const noexcept;
+  const std::vector<LidarConstraintRecord>& LidarConstraints() const noexcept;
+  const std::vector<ResidualOrdinal>& ResidualOrdinals() const noexcept;
+  const std::vector<ParameterOrdinal>& ParameterOrdinals() const noexcept;
+  uint64_t ResidualBlockCount() const noexcept;
+  uint64_t ScalarResidualCount() const noexcept;
+  uint64_t AmbientParameterCount() const noexcept;
+  uint64_t EffectiveParameterCount() const noexcept;
 };
 
 struct NativeHostSolvePreparationRuntime {
   uint64_t calls = 0;
   uint64_t catalog_observation_visits = 0;
+  uint64_t incidence_traversal_visits = 0;
   uint64_t active_observation_visits = 0;
   uint64_t boundary_observation_visits = 0;
   uint64_t state_values_copied = 0;
   uint64_t quaternion_normalizations = 0;
   uint64_t descriptor_bytes = 0;
+  uint64_t static_materialize_calls = 0;
+  uint64_t dynamic_state_gather_calls = 0;
   double wall_milliseconds = 0.0;
 };
 
@@ -663,6 +714,21 @@ struct BaSolveResult {
     uint64_t device_store_generation = 0;
     uint64_t indexed_plan_build_calls = 0;
     uint64_t indexed_plan_upload_bytes = 0;
+    uint64_t device_selection_lookup_calls = 0;
+    uint64_t device_selection_hit_calls = 0;
+    uint64_t device_selection_miss_calls = 0;
+    uint64_t device_selection_upload_calls = 0;
+    uint64_t device_selection_evictions = 0;
+    uint64_t device_selection_bypasses = 0;
+    uint64_t device_selection_context_invalidations = 0;
+    uint64_t device_selection_poison_events = 0;
+    uint64_t device_selection_static_h2d_calls = 0;
+    uint64_t device_selection_static_h2d_bytes = 0;
+    uint64_t device_selection_static_h2d_saved_calls = 0;
+    uint64_t device_selection_static_h2d_saved_bytes = 0;
+    uint64_t device_selection_resident_bytes = 0;
+    uint64_t device_selection_peak_bytes = 0;
+    uint64_t device_selection_cached_workspace_bytes = 0;
     double indexed_packing_milliseconds = 0.0;
     double variable_state_download_milliseconds = 0.0;
     bool temporary_legacy_kernel_abi = false;

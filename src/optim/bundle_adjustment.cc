@@ -1260,6 +1260,66 @@ void WriteExecutionTelemetry(const std::string& path,
        << value.native_legacy_kernel_input_bundle_calls
        << ",\"native_repeated_residual_state_packing_bytes\":"
        << value.native_repeated_residual_state_packing_bytes
+       << ",\"native_indexed_plan_build_calls\":"
+       << value.native_indexed_plan_build_calls
+       << ",\"native_plan_prepare_requests\":"
+       << value.native_plan_prepare_requests
+       << ",\"native_host_plan_hits\":" << value.native_host_plan_hits
+       << ",\"native_host_plan_misses\":" << value.native_host_plan_misses
+       << ",\"native_host_plan_bypasses\":"
+       << value.native_host_plan_bypasses
+       << ",\"native_host_plan_dependency_misses\":"
+       << value.native_host_plan_dependency_misses
+       << ",\"native_host_plan_hash_collisions\":"
+       << value.native_host_plan_hash_collisions
+       << ",\"native_host_plan_build_calls\":"
+       << value.native_host_plan_build_calls
+       << ",\"native_host_plan_evictions\":"
+       << value.native_host_plan_evictions
+       << ",\"native_host_plan_resident_bytes\":"
+       << value.native_host_plan_resident_bytes
+       << ",\"native_host_plan_peak_bytes\":"
+       << value.native_host_plan_peak_bytes
+       << ",\"native_static_materialize_calls\":"
+       << value.native_static_materialize_calls
+       << ",\"native_dynamic_state_gather_calls\":"
+       << value.native_dynamic_state_gather_calls
+       << ",\"native_plan_vector_copy_bytes_on_hit\":"
+       << value.native_plan_vector_copy_bytes_on_hit
+       << ",\"native_intent_incidence_traversal_visits\":"
+       << value.native_intent_incidence_traversal_visits
+       << ",\"native_materializer_incidence_traversal_visits\":"
+       << value.native_materializer_incidence_traversal_visits
+       << ",\"native_device_selection_hits\":"
+       << value.native_device_selection_hits
+       << ",\"native_device_selection_misses\":"
+       << value.native_device_selection_misses
+       << ",\"native_device_selection_bypasses\":"
+       << value.native_device_selection_bypasses
+       << ",\"native_device_selection_lookup_calls\":"
+       << value.native_device_selection_lookup_calls
+       << ",\"native_device_selection_upload_calls\":"
+       << value.native_device_selection_upload_calls
+       << ",\"native_device_selection_evictions\":"
+       << value.native_device_selection_evictions
+       << ",\"native_device_selection_context_invalidations\":"
+       << value.native_device_selection_context_invalidations
+       << ",\"native_device_selection_poison_events\":"
+       << value.native_device_selection_poison_events
+       << ",\"native_device_selection_static_h2d_calls\":"
+       << value.native_device_selection_static_h2d_calls
+       << ",\"native_device_selection_static_h2d_bytes\":"
+       << value.native_device_selection_static_h2d_bytes
+       << ",\"native_device_selection_static_h2d_saved_calls\":"
+       << value.native_device_selection_static_h2d_saved_calls
+       << ",\"native_device_selection_static_h2d_saved_bytes\":"
+       << value.native_device_selection_static_h2d_saved_bytes
+       << ",\"native_device_selection_resident_bytes\":"
+       << value.native_device_selection_resident_bytes
+       << ",\"native_device_selection_peak_bytes\":"
+       << value.native_device_selection_peak_bytes
+       << ",\"native_device_selection_cached_workspace_bytes\":"
+       << value.native_device_selection_cached_workspace_bytes
        << ",\"host_store_host_resident_bytes\":"
        << value.host_store_host_resident_bytes
        << ",\"host_store_host_peak_bytes\":"
@@ -1309,6 +1369,18 @@ void WriteExecutionTelemetry(const std::string& path,
   WriteJsonNumber(file, value.fast_cpu_preparation_milliseconds);
   file << ",\"native_indexed_packing_milliseconds\":";
   WriteJsonNumber(file, value.native_indexed_packing_milliseconds);
+  file << ",\"native_intent_resolution_milliseconds\":";
+  WriteJsonNumber(file, value.native_intent_resolution_milliseconds);
+  file << ",\"native_plan_lookup_milliseconds\":";
+  WriteJsonNumber(file, value.native_plan_lookup_milliseconds);
+  file << ",\"native_plan_build_milliseconds\":";
+  WriteJsonNumber(file, value.native_plan_build_milliseconds);
+  file << ",\"native_plan_bind_milliseconds\":";
+  WriteJsonNumber(file, value.native_plan_bind_milliseconds);
+  file << ",\"native_static_materialize_milliseconds\":";
+  WriteJsonNumber(file, value.native_static_materialize_milliseconds);
+  file << ",\"native_dynamic_state_gather_milliseconds\":";
+  WriteJsonNumber(file, value.native_dynamic_state_gather_milliseconds);
   file << ",\"native_variable_state_download_milliseconds\":";
   WriteJsonNumber(file, value.native_variable_state_download_milliseconds);
   file << ",\"native_intent_build_milliseconds\":";
@@ -1506,6 +1578,8 @@ gpu_ba::CudaFullLmOptions CreateProductionCudaOptions(
     const BundleAdjustmentOptions& options,
     const ceres::Solver::Options& effective_options) {
   gpu_ba::CudaFullLmOptions cuda;
+  cuda.prepared_selection_cache_mode =
+      options.ba_cuda_prepared_selection_cache;
   cuda.device_context_mode = gpu_ba::CudaDeviceContextMode::kDeviceControl;
   if (options.ba_cuda_audit_profile == "production") {
     cuda.audit_profile = gpu_ba::CudaAuditProfile::kProduction;
@@ -1974,11 +2048,12 @@ void ProjectNativeCudaSummary(const gpu_ba::NativeHostSolveView& view,
                               ceres::Solver::Summary* summary) {
   *summary = ceres::Solver::Summary();
   summary->num_parameter_blocks =
-      static_cast<int>(view.parameter_ordinals.size());
-  summary->num_parameters = static_cast<int>(view.ambient_parameter_count);
-  summary->num_residual_blocks = static_cast<int>(view.residual_block_count);
-  summary->num_residuals = static_cast<int>(view.scalar_residual_count);
-  for (const gpu_ba::ParameterOrdinal& parameter : view.parameter_ordinals) {
+      static_cast<int>(view.ParameterOrdinals().size());
+  summary->num_parameters = static_cast<int>(view.AmbientParameterCount());
+  summary->num_residual_blocks = static_cast<int>(view.ResidualBlockCount());
+  summary->num_residuals = static_cast<int>(view.ScalarResidualCount());
+  for (const gpu_ba::ParameterOrdinal& parameter :
+       view.ParameterOrdinals()) {
     if (parameter.constant) continue;
     ++summary->num_parameter_blocks_reduced;
     summary->num_parameters_reduced += parameter.ambient_size;
@@ -2428,13 +2503,55 @@ bool BundleAdjuster::SolveNative(
       std::chrono::duration<double, std::milli>(
           std::chrono::steady_clock::now() - prepare_start)
           .count();
+  const gpu_ba::NativeGraphPrepareRuntime& prepare_runtime =
+      prepared.runtime();
+  execution_result_.native_plan_prepare_requests =
+      prepare_runtime.prepare_requests;
+  execution_result_.native_host_plan_hits = prepare_runtime.host_plan_hits;
+  execution_result_.native_host_plan_misses = prepare_runtime.host_plan_misses;
+  execution_result_.native_host_plan_bypasses =
+      prepare_runtime.host_plan_bypasses;
+  execution_result_.native_host_plan_dependency_misses =
+      prepare_runtime.host_plan_dependency_misses;
+  execution_result_.native_host_plan_hash_collisions =
+      prepare_runtime.host_plan_hash_collisions;
+  execution_result_.native_host_plan_build_calls =
+      prepare_runtime.host_plan_build_calls;
+  execution_result_.native_host_plan_evictions =
+      prepare_runtime.host_plan_evictions;
+  execution_result_.native_host_plan_resident_bytes =
+      prepare_runtime.host_plan_resident_bytes;
+  execution_result_.native_host_plan_peak_bytes =
+      prepare_runtime.host_plan_peak_bytes;
+  execution_result_.native_static_materialize_calls =
+      prepare_runtime.adjacency_static_materialize_calls;
+  execution_result_.native_dynamic_state_gather_calls =
+      prepare_runtime.dynamic_state_gather_calls;
+  execution_result_.native_plan_vector_copy_bytes_on_hit =
+      prepare_runtime.native_view_vector_copy_bytes_on_hit;
+  execution_result_.native_intent_incidence_traversal_visits =
+      prepare_runtime.intent_incidence_traversal_visits;
+  execution_result_.native_materializer_incidence_traversal_visits =
+      prepare_runtime.materializer_incidence_traversal_visits;
+  execution_result_.native_intent_resolution_milliseconds =
+      prepare_runtime.intent_id_resolution_milliseconds;
+  execution_result_.native_plan_lookup_milliseconds =
+      prepare_runtime.host_plan_lookup_milliseconds;
+  execution_result_.native_plan_build_milliseconds =
+      prepare_runtime.host_plan_build_milliseconds;
+  execution_result_.native_plan_bind_milliseconds =
+      prepare_runtime.plan_bind_milliseconds;
+  execution_result_.native_static_materialize_milliseconds =
+      prepare_runtime.materialize_wall_milliseconds;
+  execution_result_.native_dynamic_state_gather_milliseconds =
+      prepare_runtime.dynamic_state_gather_milliseconds;
   const gpu_ba::NativeHostSolveView* view = prepared.view();
   CHECK_NOTNULL(view);
-  execution_result_.residuals = view->scalar_residual_count;
-  execution_result_.residual_blocks = view->residual_block_count;
-  execution_result_.parameter_blocks = view->parameter_ordinals.size();
-  execution_result_.parameters = view->ambient_parameter_count;
-  execution_result_.effective_parameters = view->effective_parameter_count;
+  execution_result_.residuals = view->ScalarResidualCount();
+  execution_result_.residual_blocks = view->ResidualBlockCount();
+  execution_result_.parameter_blocks = view->ParameterOrdinals().size();
+  execution_result_.parameters = view->AmbientParameterCount();
+  execution_result_.effective_parameters = view->EffectiveParameterCount();
   const auto cuda_start = std::chrono::steady_clock::now();
   gpu_ba::BaSolveResult native;
   const bool cuda_ok = gpu_ba::RunCustomCudaSolve(
@@ -2482,6 +2599,38 @@ bool BundleAdjuster::SolveNative(
       native.runtime.repeated_residual_state_packing_bytes;
   execution_result_.native_indexed_packing_milliseconds =
       native.runtime.indexed_packing_milliseconds;
+  execution_result_.native_indexed_plan_build_calls =
+      native.runtime.indexed_plan_build_calls;
+  execution_result_.native_device_selection_hits =
+      native.runtime.device_selection_hit_calls;
+  execution_result_.native_device_selection_misses =
+      native.runtime.device_selection_miss_calls;
+  execution_result_.native_device_selection_bypasses =
+      native.runtime.device_selection_bypasses;
+  execution_result_.native_device_selection_lookup_calls =
+      native.runtime.device_selection_lookup_calls;
+  execution_result_.native_device_selection_upload_calls =
+      native.runtime.device_selection_upload_calls;
+  execution_result_.native_device_selection_evictions =
+      native.runtime.device_selection_evictions;
+  execution_result_.native_device_selection_context_invalidations =
+      native.runtime.device_selection_context_invalidations;
+  execution_result_.native_device_selection_poison_events =
+      native.runtime.device_selection_poison_events;
+  execution_result_.native_device_selection_static_h2d_calls =
+      native.runtime.device_selection_static_h2d_calls;
+  execution_result_.native_device_selection_static_h2d_bytes =
+      native.runtime.device_selection_static_h2d_bytes;
+  execution_result_.native_device_selection_static_h2d_saved_calls =
+      native.runtime.device_selection_static_h2d_saved_calls;
+  execution_result_.native_device_selection_static_h2d_saved_bytes =
+      native.runtime.device_selection_static_h2d_saved_bytes;
+  execution_result_.native_device_selection_resident_bytes =
+      native.runtime.device_selection_resident_bytes;
+  execution_result_.native_device_selection_peak_bytes =
+      native.runtime.device_selection_peak_bytes;
+  execution_result_.native_device_selection_cached_workspace_bytes =
+      native.runtime.device_selection_cached_workspace_bytes;
   execution_result_.native_variable_state_download_milliseconds =
       native.runtime.variable_state_download_milliseconds;
   const double cost_tolerance =
@@ -3371,6 +3520,38 @@ bool BundleAdjuster::Solve(Reconstruction* reconstruction) {
           native_result.runtime.repeated_residual_state_packing_bytes;
       execution_result_.native_indexed_packing_milliseconds =
           native_result.runtime.indexed_packing_milliseconds;
+      execution_result_.native_indexed_plan_build_calls =
+          native_result.runtime.indexed_plan_build_calls;
+      execution_result_.native_device_selection_lookup_calls =
+          native_result.runtime.device_selection_lookup_calls;
+      execution_result_.native_device_selection_hits =
+          native_result.runtime.device_selection_hit_calls;
+      execution_result_.native_device_selection_misses =
+          native_result.runtime.device_selection_miss_calls;
+      execution_result_.native_device_selection_upload_calls =
+          native_result.runtime.device_selection_upload_calls;
+      execution_result_.native_device_selection_evictions =
+          native_result.runtime.device_selection_evictions;
+      execution_result_.native_device_selection_bypasses =
+          native_result.runtime.device_selection_bypasses;
+      execution_result_.native_device_selection_context_invalidations =
+          native_result.runtime.device_selection_context_invalidations;
+      execution_result_.native_device_selection_poison_events =
+          native_result.runtime.device_selection_poison_events;
+      execution_result_.native_device_selection_static_h2d_calls =
+          native_result.runtime.device_selection_static_h2d_calls;
+      execution_result_.native_device_selection_static_h2d_bytes =
+          native_result.runtime.device_selection_static_h2d_bytes;
+      execution_result_.native_device_selection_static_h2d_saved_calls =
+          native_result.runtime.device_selection_static_h2d_saved_calls;
+      execution_result_.native_device_selection_static_h2d_saved_bytes =
+          native_result.runtime.device_selection_static_h2d_saved_bytes;
+      execution_result_.native_device_selection_resident_bytes =
+          native_result.runtime.device_selection_resident_bytes;
+      execution_result_.native_device_selection_peak_bytes =
+          native_result.runtime.device_selection_peak_bytes;
+      execution_result_.native_device_selection_cached_workspace_bytes =
+          native_result.runtime.device_selection_cached_workspace_bytes;
       execution_result_.native_variable_state_download_milliseconds =
           native_result.runtime.variable_state_download_milliseconds;
     }

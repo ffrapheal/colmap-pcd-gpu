@@ -1,13 +1,17 @@
 #include "gpu_ba/native_graph_problem_store.h"
 
 #include <algorithm>
+#include <cassert>
 #include <chrono>
 #include <cmath>
+#include <cstring>
+#include <functional>
 #include <limits>
 #include <mutex>
 #include <new>
 #include <set>
 #include <tuple>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -16,6 +20,7 @@
 
 #include "base/reconstruction.h"
 #include "gpu_ba/host_problem_store_internal.h"
+#include "gpu_ba/linearization.h"
 
 namespace colmap {
 namespace gpu_ba {
@@ -280,6 +285,305 @@ const SnapshotType* FindById(const std::vector<SnapshotType>& values,
   return found == values.end() ? nullptr : &*found;
 }
 
+constexpr size_t kPreparedSelectionHostMaxEntries = 8;
+constexpr uint64_t kPreparedSelectionHostBudgetBytes = 256ull << 20;
+
+template <typename T>
+void AppendPlanKeyValue(const T& value, std::vector<uint8_t>* bytes) {
+  static_assert(std::is_trivially_copyable<T>::value,
+                "plan key values must be trivially copyable");
+  const uint8_t* first = reinterpret_cast<const uint8_t*>(&value);
+  bytes->insert(bytes->end(), first, first + sizeof(value));
+}
+
+template <typename T>
+void AppendPlanKeyVector(const std::vector<T>& values,
+                         std::vector<uint8_t>* bytes) {
+  const uint64_t size = values.size();
+  AppendPlanKeyValue(size, bytes);
+  for (const T& value : values) AppendPlanKeyValue(value, bytes);
+}
+
+void AppendPlanStaticConfig(const NativeCudaResolvedConfig& config,
+                            std::vector<uint8_t>* bytes) {
+  AppendPlanKeyValue(config.hessian_backend, bytes);
+  AppendPlanKeyValue(config.schur_backend, bytes);
+  AppendPlanKeyValue(config.hot_kernel, bytes);
+  AppendPlanKeyValue(config.execution_profile, bytes);
+  AppendPlanKeyValue(config.residual_order, bytes);
+  AppendPlanKeyValue(config.lidar_residual_mode, bytes);
+  AppendPlanKeyValue(config.lidar_near_zero_threshold, bytes);
+  AppendPlanKeyValue(config.pair_chunk_limit_bytes, bytes);
+  AppendPlanKeyValue(config.hessian_segment_size, bytes);
+  AppendPlanKeyValue(config.schur_segment_size, bytes);
+}
+
+bool BuildPlanLookupKey(const NativeBaSolveIntent& intent,
+                        const uint64_t slot_namespace_epoch,
+                        std::vector<uint8_t>* bytes,
+                        uint64_t* hash,
+                        std::string* error) {
+  if (bytes == nullptr || hash == nullptr || error == nullptr ||
+      intent.owner_epoch == 0 || slot_namespace_epoch == 0) {
+    return false;
+  }
+  try {
+    bytes->clear();
+    bytes->reserve(256 + intent.active_image_ids.size() * sizeof(uint32_t) +
+                   (intent.explicit_variable_point_ids.size() +
+                    intent.explicit_constant_point_ids.size()) *
+                       sizeof(uint64_t));
+    AppendPlanKeyValue(intent.owner_epoch, bytes);
+    AppendPlanKeyValue(slot_namespace_epoch, bytes);
+    AppendPlanKeyValue(intent.kind, bytes);
+    AppendPlanStaticConfig(intent.config, bytes);
+    AppendPlanKeyVector(intent.active_image_ids, bytes);
+    AppendPlanKeyVector(intent.explicit_variable_point_ids, bytes);
+    AppendPlanKeyVector(intent.explicit_constant_point_ids, bytes);
+    AppendPlanKeyVector(intent.fixed_pose_ids, bytes);
+    const uint64_t translation_count = intent.translation_policies.size();
+    AppendPlanKeyValue(translation_count, bytes);
+    for (const NativeBaTranslationPolicy& value :
+         intent.translation_policies) {
+      AppendPlanKeyValue(value.image_id, bytes);
+      AppendPlanKeyValue(value.constant_mask, bytes);
+    }
+    const uint64_t camera_count = intent.camera_policies.size();
+    AppendPlanKeyValue(camera_count, bytes);
+    for (const NativeBaCameraPolicy& value : intent.camera_policies) {
+      AppendPlanKeyValue(value.camera_id, bytes);
+      AppendPlanKeyValue(value.constant, bytes);
+      AppendPlanKeyVector(value.fixed_parameter_indices, bytes);
+    }
+    const uint64_t point_count = intent.point_policies.size();
+    AppendPlanKeyValue(point_count, bytes);
+    for (const NativeBaPointPolicy& value : intent.point_policies) {
+      AppendPlanKeyValue(value.point3D_id, bytes);
+      AppendPlanKeyValue(value.constant, bytes);
+      AppendPlanKeyValue(value.config_role, bytes);
+      AppendPlanKeyValue(value.has_search_range, bytes);
+      AppendPlanKeyValue(value.search_range, bytes);
+    }
+    const uint64_t lidar_count = intent.lidar_constraints.size();
+    AppendPlanKeyValue(lidar_count, bytes);
+    for (const NativeBaLidarConstraint& value : intent.lidar_constraints) {
+      AppendPlanKeyValue(value.point3D_id, bytes);
+      AppendPlanKeyValue(value.constraint_slot, bytes);
+      AppendPlanKeyValue(value.physical_identity, bytes);
+      AppendPlanKeyValue(value.lidar_type, bytes);
+      AppendPlanKeyValue(value.plane, bytes);
+      AppendPlanKeyValue(value.lidar_xyz, bytes);
+      AppendPlanKeyValue(value.weight, bytes);
+      AppendPlanKeyValue(value.search_range, bytes);
+    }
+  } catch (const std::bad_alloc&) {
+    *error = "native prepared selection key allocation failed";
+    return false;
+  } catch (const std::length_error&) {
+    *error = "native prepared selection key size overflow";
+    return false;
+  }
+  uint64_t value = 1469598103934665603ull;
+  for (const uint8_t byte : *bytes) {
+    value ^= byte;
+    value *= 1099511628211ull;
+  }
+  *hash = value;
+  return true;
+}
+
+struct PreparedSelectionDependencyStamp {
+  std::vector<HostBaCameraSlot> cameras;
+  std::vector<HostBaImageSlot> images;
+  std::vector<HostBaPointSlot> points;
+  std::vector<HostBaObservationSlot> observations;
+};
+
+bool SameCameraDependency(const HostBaCameraSlot& a,
+                          const HostBaCameraSlot& b) noexcept {
+  return a.header.slot == b.header.slot &&
+         a.header.generation == b.header.generation &&
+         a.header.alive == b.header.alive && a.camera_id == b.camera_id &&
+         a.model_id == b.model_id && a.width == b.width &&
+         a.height == b.height && a.parameter_count == b.parameter_count;
+}
+
+bool SameImageDependency(const HostBaImageSlot& a,
+                         const HostBaImageSlot& b) noexcept {
+  return a.header.slot == b.header.slot &&
+         a.header.generation == b.header.generation &&
+         a.header.alive == b.header.alive && a.image_id == b.image_id &&
+         a.camera_slot == b.camera_slot && a.registered == b.registered &&
+         a.adjacency_count == b.adjacency_count &&
+         a.lifetime_incidence_count == b.lifetime_incidence_count;
+}
+
+bool SamePointDependency(const HostBaPointSlot& a,
+                         const HostBaPointSlot& b) noexcept {
+  return a.header.slot == b.header.slot &&
+         a.header.generation == b.header.generation &&
+         a.header.alive == b.header.alive && a.point3D_id == b.point3D_id &&
+         a.adjacency_count == b.adjacency_count &&
+         a.lifetime_incidence_count == b.lifetime_incidence_count &&
+         a.track_length == b.track_length;
+}
+
+bool SameObservationDependency(const HostBaObservationSlot& a,
+                               const HostBaObservationSlot& b) noexcept {
+  return a.header.slot == b.header.slot &&
+         a.header.generation == b.header.generation &&
+         a.header.alive == b.header.alive && a.image_slot == b.image_slot &&
+         a.point_slot == b.point_slot && a.point2D_idx == b.point2D_idx &&
+         a.source_identity == b.source_identity &&
+         a.association_generation == b.association_generation &&
+         std::memcmp(a.xy.data(), b.xy.data(), sizeof(double) * 2) == 0;
+}
+
+bool BuildDependencyStamp(const CatalogReadLease& lease,
+                          const PreparedSelectionPlan& plan,
+                          PreparedSelectionDependencyStamp* stamp,
+                          std::string* error) {
+  if (stamp == nullptr || error == nullptr || !lease.valid()) return false;
+  const auto cameras = lease.cameras();
+  const auto images = lease.images();
+  const auto points = lease.points();
+  const auto observations = lease.observations();
+  try {
+    stamp->cameras.reserve(plan.active_camera_slots.size());
+    stamp->images.reserve(plan.active_image_slots.size() +
+                          plan.boundary_image_slots.size());
+    stamp->points.reserve(plan.active_point_slots.size());
+    stamp->observations.reserve(plan.visual_observation_slots.size());
+    for (const uint32_t slot : plan.active_camera_slots) {
+      if (slot >= cameras.size) {
+        *error = "prepared plan camera dependency is invalid";
+        return false;
+      }
+      stamp->cameras.push_back(cameras[slot]);
+    }
+    for (const uint32_t slot : plan.active_image_slots) {
+      if (slot >= images.size) {
+        *error = "prepared plan image dependency is invalid";
+        return false;
+      }
+      stamp->images.push_back(images[slot]);
+    }
+    for (const uint32_t slot : plan.boundary_image_slots) {
+      if (slot >= images.size) {
+        *error = "prepared plan boundary dependency is invalid";
+        return false;
+      }
+      stamp->images.push_back(images[slot]);
+    }
+    for (const uint32_t slot : plan.active_point_slots) {
+      if (slot >= points.size) {
+        *error = "prepared plan point dependency is invalid";
+        return false;
+      }
+      stamp->points.push_back(points[slot]);
+    }
+    for (const uint32_t slot : plan.visual_observation_slots) {
+      if (slot >= observations.size) {
+        *error = "prepared plan observation dependency is invalid";
+        return false;
+      }
+      stamp->observations.push_back(observations[slot]);
+    }
+  } catch (const std::bad_alloc&) {
+    *error = "native prepared dependency allocation failed";
+    return false;
+  }
+  return true;
+}
+
+bool ValidateDependencyStamp(const CatalogReadLease& lease,
+                             const PreparedSelectionDependencyStamp& stamp) {
+  const auto cameras = lease.cameras();
+  const auto images = lease.images();
+  const auto points = lease.points();
+  const auto observations = lease.observations();
+  for (const HostBaCameraSlot& value : stamp.cameras) {
+    if (value.header.slot >= cameras.size ||
+        !SameCameraDependency(value, cameras[value.header.slot])) return false;
+  }
+  for (const HostBaImageSlot& value : stamp.images) {
+    if (value.header.slot >= images.size ||
+        !SameImageDependency(value, images[value.header.slot])) return false;
+  }
+  for (const HostBaPointSlot& value : stamp.points) {
+    if (value.header.slot >= points.size ||
+        !SamePointDependency(value, points[value.header.slot])) return false;
+  }
+  for (const HostBaObservationSlot& value : stamp.observations) {
+    if (value.header.slot >= observations.size ||
+        !SameObservationDependency(value, observations[value.header.slot]))
+      return false;
+  }
+  return true;
+}
+
+uint64_t EstimatePreparedSelectionPlanBytes(
+    const PreparedSelectionPlan& plan) noexcept {
+  uint64_t bytes = sizeof(plan);
+  bytes += plan.active_camera_slots.capacity() * sizeof(uint32_t);
+  bytes += plan.active_image_slots.capacity() * sizeof(uint32_t);
+  bytes += plan.boundary_image_slots.capacity() * sizeof(uint32_t);
+  bytes += plan.active_point_slots.capacity() * sizeof(uint32_t);
+  bytes += plan.visual_observation_slots.capacity() * sizeof(uint32_t);
+  bytes += plan.fixed.images.capacity() * sizeof(ImageFixedPolicyResult);
+  bytes += plan.fixed.cameras.capacity() * sizeof(CameraFixedPolicyResult);
+  bytes += plan.fixed.points.capacity() * sizeof(PointFixedPolicyResult);
+  for (const CameraFixedPolicyResult& value : plan.fixed.cameras)
+    bytes += value.fixed_parameter_indices.capacity() * sizeof(uint32_t);
+  bytes += plan.lidar_constraints.capacity() * sizeof(LidarConstraintRecord);
+  bytes += plan.residual_ordinals.capacity() * sizeof(ResidualOrdinal);
+  bytes += plan.parameter_ordinals.capacity() * sizeof(ParameterOrdinal);
+  return bytes;
+}
+
+std::shared_ptr<PreparedSelectionPlan> ExtractPreparedSelectionPlan(
+    NativeHostSolveView* view,
+    const uint64_t publication_id) {
+  std::shared_ptr<PreparedSelectionPlan> plan =
+      std::make_shared<PreparedSelectionPlan>();
+  plan->publication_id = publication_id;
+  plan->slot_namespace_epoch = view->catalog.slot_namespace_epoch();
+  plan->active_camera_slots = std::move(view->active_camera_slots);
+  plan->active_image_slots = std::move(view->active_image_slots);
+  plan->boundary_image_slots = std::move(view->boundary_image_slots);
+  plan->active_point_slots = std::move(view->active_point_slots);
+  plan->visual_observation_slots = std::move(view->visual_observation_slots);
+  plan->fixed = std::move(view->fixed);
+  plan->lidar_constraints = std::move(view->lidar.constraints);
+  for (LidarConstraintRecord& value : plan->lidar_constraints)
+    value.point_state_generation = 0;
+  plan->residual_ordinals = std::move(view->residual_ordinals);
+  plan->parameter_ordinals = std::move(view->parameter_ordinals);
+  plan->residual_block_count = view->residual_block_count;
+  plan->scalar_residual_count = view->scalar_residual_count;
+  plan->ambient_parameter_count = view->ambient_parameter_count;
+  plan->effective_parameter_count = view->effective_parameter_count;
+  plan->host_resident_bytes = EstimatePreparedSelectionPlanBytes(*plan);
+  view->prepared_plan = plan;
+  return plan;
+}
+
+struct PreparedSelectionCacheEntry {
+  uint64_t hash = 0;
+  uint64_t last_use = 0;
+  uint64_t resident_bytes = 0;
+  std::vector<uint8_t> canonical_key;
+  PreparedSelectionDependencyStamp dependencies;
+  std::shared_ptr<const PreparedSelectionPlan> plan;
+};
+
+static_assert(
+    std::is_nothrow_move_constructible<PreparedSelectionCacheEntry>::value,
+    "prepared selection cache publication must be noexcept movable");
+static_assert(
+    std::is_nothrow_move_assignable<PreparedSelectionCacheEntry>::value,
+    "prepared selection cache replacement must be noexcept movable");
+
 }  // namespace
 
 struct NativeGraphStoreState {
@@ -288,7 +592,9 @@ struct NativeGraphStoreState {
       : reconstruction(reconstruction_in),
         owner_epoch(owner_epoch_in),
         graph(owner_epoch_in),
-        device_store(CreateDeviceBaProblemStore(owner_epoch_in)) {}
+        device_store(CreateDeviceBaProblemStore(owner_epoch_in)) {
+    prepared_plans.reserve(kPreparedSelectionHostMaxEntries);
+  }
 
   const Reconstruction* reconstruction = nullptr;
   uint64_t owner_epoch = 0;
@@ -301,6 +607,11 @@ struct NativeGraphStoreState {
   std::mutex mutex;
   HostBaGraphStore graph;
   NativeHostSolveMaterializer materializer;
+  uint64_t next_plan_publication_id = 0;
+  uint64_t plan_lru_clock = 0;
+  uint64_t host_plan_resident_bytes = 0;
+  uint64_t host_plan_peak_bytes = 0;
+  std::vector<PreparedSelectionCacheEntry> prepared_plans;
   std::shared_ptr<DeviceBaProblemStoreHandle> device_store;
 };
 
@@ -374,6 +685,227 @@ bool SynchronizeNativeGraphStateLocked(
       std::chrono::duration<double, std::milli>(
           std::chrono::steady_clock::now() - sync_start)
           .count();
+  return true;
+}
+
+uint64_t EstimateDependencyBytes(
+    const PreparedSelectionDependencyStamp& stamp) noexcept {
+  return sizeof(stamp) +
+         stamp.cameras.capacity() * sizeof(HostBaCameraSlot) +
+         stamp.images.capacity() * sizeof(HostBaImageSlot) +
+         stamp.points.capacity() * sizeof(HostBaPointSlot) +
+         stamp.observations.capacity() * sizeof(HostBaObservationSlot);
+}
+
+std::shared_ptr<const PreparedSelectionPlan> LookupPreparedSelectionPlan(
+    NativeGraphStoreState* state,
+    const CatalogReadLease& lease,
+    const std::vector<uint8_t>& canonical_key,
+    const uint64_t hash,
+    NativeGraphPrepareRuntime* runtime) {
+  for (PreparedSelectionCacheEntry& entry : state->prepared_plans) {
+    if (entry.hash != hash) continue;
+    if (entry.canonical_key != canonical_key) {
+      ++runtime->host_plan_hash_collisions;
+      continue;
+    }
+    if (!ValidateDependencyStamp(lease, entry.dependencies)) {
+      ++runtime->host_plan_dependency_misses;
+      continue;
+    }
+    entry.last_use = ++state->plan_lru_clock;
+    ++runtime->host_plan_hits;
+    return entry.plan;
+  }
+  ++runtime->host_plan_misses;
+  return nullptr;
+}
+
+bool PublishPreparedSelectionPlan(
+    NativeGraphStoreState* state,
+    const CatalogReadLease& lease,
+    std::vector<uint8_t> canonical_key,
+    const uint64_t hash,
+    const std::shared_ptr<const PreparedSelectionPlan>& plan,
+    NativeGraphPrepareRuntime* runtime,
+    std::string* error) {
+  PreparedSelectionDependencyStamp dependencies;
+  if (!BuildDependencyStamp(lease, *plan, &dependencies, error)) return false;
+  const uint64_t resident_bytes =
+      plan->host_resident_bytes + canonical_key.capacity() +
+      EstimateDependencyBytes(dependencies);
+  if (resident_bytes > kPreparedSelectionHostBudgetBytes) {
+    --runtime->host_plan_misses;
+    ++runtime->host_plan_bypasses;
+    runtime->host_plan_resident_bytes = state->host_plan_resident_bytes;
+    runtime->host_plan_peak_bytes = state->host_plan_peak_bytes;
+    return false;
+  }
+  PreparedSelectionCacheEntry entry;
+  entry.hash = hash;
+  entry.last_use = ++state->plan_lru_clock;
+  entry.resident_bytes = resident_bytes;
+  entry.canonical_key = std::move(canonical_key);
+  entry.dependencies = std::move(dependencies);
+  entry.plan = plan;
+  std::array<size_t, kPreparedSelectionHostMaxEntries> victims{};
+  size_t victim_count = 0;
+  const auto is_victim = [&](const size_t candidate) {
+    return std::find(victims.begin(), victims.begin() + victim_count,
+                     candidate) != victims.begin() + victim_count;
+  };
+  uint64_t retained_bytes = state->host_plan_resident_bytes;
+  size_t retained_entries = state->prepared_plans.size();
+  while (retained_entries >= kPreparedSelectionHostMaxEntries ||
+         retained_bytes + resident_bytes > kPreparedSelectionHostBudgetBytes) {
+    size_t victim = state->prepared_plans.size();
+    for (size_t i = 0; i < state->prepared_plans.size(); ++i) {
+      if (state->prepared_plans[i].plan.use_count() != 1 ||
+          is_victim(i)) {
+        continue;
+      }
+      if (victim == state->prepared_plans.size() ||
+          state->prepared_plans[i].last_use <
+              state->prepared_plans[victim].last_use) {
+        victim = i;
+      }
+    }
+    if (victim == state->prepared_plans.size()) {
+      --runtime->host_plan_misses;
+      ++runtime->host_plan_bypasses;
+      runtime->host_plan_resident_bytes = state->host_plan_resident_bytes;
+      runtime->host_plan_peak_bytes = state->host_plan_peak_bytes;
+      return false;
+    }
+    assert(victim_count < victims.size());
+    victims[victim_count++] = victim;
+    retained_bytes -= state->prepared_plans[victim].resident_bytes;
+    --retained_entries;
+  }
+  std::sort(victims.begin(), victims.begin() + victim_count,
+            std::greater<size_t>());
+  for (size_t i = 0; i < victim_count; ++i) {
+    const size_t victim = victims[i];
+    state->host_plan_resident_bytes -=
+        state->prepared_plans[victim].resident_bytes;
+    state->prepared_plans.erase(state->prepared_plans.begin() + victim);
+    ++runtime->host_plan_evictions;
+  }
+  assert(state->prepared_plans.size() < state->prepared_plans.capacity());
+  state->prepared_plans.push_back(std::move(entry));
+  state->host_plan_resident_bytes += resident_bytes;
+  state->host_plan_peak_bytes =
+      std::max(state->host_plan_peak_bytes, state->host_plan_resident_bytes);
+  runtime->host_plan_resident_bytes = state->host_plan_resident_bytes;
+  runtime->host_plan_peak_bytes = state->host_plan_peak_bytes;
+  return true;
+}
+
+bool GatherDynamicStateFromPreparedPlan(
+    const Reconstruction& reconstruction,
+    const CatalogReadLease& lease,
+    const PreparedSelectionPlan& plan,
+    const uint64_t state_generation,
+    ActiveStateBuffer* output,
+    NativeGraphPrepareRuntime* runtime,
+    std::string* error) {
+  if (output == nullptr || runtime == nullptr || error == nullptr ||
+      !lease.valid() || state_generation == 0) return false;
+  const auto start = std::chrono::steady_clock::now();
+  ActiveStateBuffer state;
+  state.owner_epoch = lease.owner_epoch();
+  state.catalog_generation = lease.generation();
+  state.state_generation = state_generation;
+  const auto cameras = lease.cameras();
+  const auto images = lease.images();
+  const auto points = lease.points();
+  std::unordered_set<uint32_t> fixed_images;
+  fixed_images.reserve(plan.fixed.images.size());
+  for (const ImageFixedPolicyResult& policy : plan.fixed.images) {
+    if (policy.pose_constant || policy.boundary_pose)
+      fixed_images.insert(policy.image_slot);
+  }
+  try {
+    state.cameras.reserve(plan.active_camera_slots.size());
+    state.images.reserve(plan.active_image_slots.size() +
+                         plan.boundary_image_slots.size());
+    state.points.reserve(plan.active_point_slots.size());
+    for (const uint32_t slot : plan.active_camera_slots) {
+      if (slot >= cameras.size || !cameras[slot].header.alive ||
+          !reconstruction.ExistsCamera(cameras[slot].camera_id)) {
+        *error = "prepared plan camera state is unavailable";
+        return false;
+      }
+      DenseCameraState value;
+      value.camera_slot = slot;
+      value.state_generation = state_generation;
+      value.parameters = reconstruction.Camera(cameras[slot].camera_id).Params();
+      if (value.parameters.size() != cameras[slot].parameter_count ||
+          !std::all_of(value.parameters.begin(), value.parameters.end(),
+                       [](double x) { return std::isfinite(x); })) {
+        *error = "prepared plan camera state is invalid";
+        return false;
+      }
+      state.cameras.push_back(std::move(value));
+    }
+    const auto gather_image = [&](const uint32_t slot) -> bool {
+      if (slot >= images.size || !images[slot].header.alive ||
+          !reconstruction.ExistsImage(images[slot].image_id)) {
+        *error = "prepared plan image state is unavailable";
+        return false;
+      }
+      const Image& image = reconstruction.Image(images[slot].image_id);
+      DenseImageState value;
+      value.image_slot = slot;
+      value.state_generation = state_generation;
+      std::copy(image.Qvec().data(), image.Qvec().data() + 4,
+                value.quaternion.begin());
+      std::copy(image.Tvec().data(), image.Tvec().data() + 3,
+                value.translation.begin());
+      double norm2 = 0.0;
+      for (double q : value.quaternion) norm2 += q * q;
+      if (!Finite(value.quaternion) || !Finite(value.translation) ||
+          (fixed_images.count(slot) != 0 &&
+           (!std::isfinite(norm2) ||
+            std::abs(std::sqrt(norm2) - 1.0) > 1e-12)) ||
+          !NormalizeQuaternion(value.quaternion, &value.quaternion)) {
+        *error = "prepared plan image state normalization failed";
+        return false;
+      }
+      state.images.push_back(value);
+      return true;
+    };
+    for (const uint32_t slot : plan.active_image_slots)
+      if (!gather_image(slot)) return false;
+    for (const uint32_t slot : plan.boundary_image_slots)
+      if (!gather_image(slot)) return false;
+    for (const uint32_t slot : plan.active_point_slots) {
+      if (slot >= points.size || !points[slot].header.alive ||
+          !reconstruction.ExistsPoint3D(points[slot].point3D_id)) {
+        *error = "prepared plan point state is unavailable";
+        return false;
+      }
+      DensePointState value;
+      value.point_slot = slot;
+      value.state_generation = state_generation;
+      const Eigen::Vector3d& xyz =
+          reconstruction.Point3D(points[slot].point3D_id).XYZ();
+      std::copy(xyz.data(), xyz.data() + 3, value.xyz.begin());
+      if (!Finite(value.xyz)) {
+        *error = "prepared plan point state is invalid";
+        return false;
+      }
+      state.points.push_back(value);
+    }
+  } catch (const std::bad_alloc&) {
+    *error = "prepared plan dynamic state allocation failed";
+    return false;
+  }
+  *output = std::move(state);
+  ++runtime->dynamic_state_gather_calls;
+  runtime->dynamic_state_gather_milliseconds +=
+      std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - start).count();
   return true;
 }
 
@@ -843,15 +1375,15 @@ bool PrepareCudaNativeActiveSolve(
   data->runtime.materialize_wall_milliseconds =
       std::chrono::duration<double, std::milli>(
           std::chrono::steady_clock::now() - materialize_start).count();
-  if (data->view.residual_block_count != inputs.residual_block_count ||
-      data->view.scalar_residual_count != inputs.scalar_residual_count ||
-      data->view.ambient_parameter_count != inputs.ambient_parameter_count ||
-      data->view.effective_parameter_count !=
+  if (data->view.ResidualBlockCount() != inputs.residual_block_count ||
+      data->view.ScalarResidualCount() != inputs.scalar_residual_count ||
+      data->view.AmbientParameterCount() != inputs.ambient_parameter_count ||
+      data->view.EffectiveParameterCount() !=
           inputs.effective_parameter_count ||
-      data->view.visual_observation_slots.size() !=
+      data->view.VisualObservationSlots().size() !=
           problem.observations.size() ||
-      data->view.lidar.constraints.size() != problem.lidar.size() ||
-      data->view.parameter_ordinals.size() != inputs.parameter_blocks.size) {
+      data->view.LidarConstraints().size() != problem.lidar.size() ||
+      data->view.ParameterOrdinals().size() != inputs.parameter_blocks.size) {
     *error = "native materialized view count contract mismatch";
     return false;
   }
@@ -860,7 +1392,7 @@ bool PrepareCudaNativeActiveSolve(
   const auto graph_points = data->view.catalog.points();
   for (size_t i = 0; i < inputs.parameter_blocks.size; ++i) {
     const ActiveBaParameterBlockSpec& expected = inputs.parameter_blocks[i];
-    const ParameterOrdinal& actual = data->view.parameter_ordinals[i];
+    const ParameterOrdinal& actual = data->view.ParameterOrdinals()[i];
     uint64_t entity_id = 0;
     if (actual.kind == ParameterKind::kQuaternion ||
         actual.kind == ParameterKind::kTranslation) {
@@ -954,6 +1486,69 @@ bool PrepareCudaNativeBaSolve(
   }
   if (++state->next_state_generation == 0) ++state->next_state_generation;
 
+  const bool cache_enabled =
+      id_intent.config.prepared_selection_cache ==
+          CudaPreparedSelectionCacheMode::kEnabled &&
+      options.prepared_selection_cache_mode ==
+          CudaPreparedSelectionCacheMode::kEnabled;
+  std::vector<uint8_t> plan_key;
+  uint64_t plan_hash = 0;
+  if (cache_enabled) {
+    ++data->runtime.prepare_requests;
+    const auto lookup_start = std::chrono::steady_clock::now();
+    if (!BuildPlanLookupKey(id_intent, lease.slot_namespace_epoch(),
+                            &plan_key, &plan_hash, error)) {
+      return false;
+    }
+    std::shared_ptr<const PreparedSelectionPlan> plan =
+        LookupPreparedSelectionPlan(state.get(), lease, plan_key, plan_hash,
+                                    &data->runtime);
+    data->runtime.host_plan_lookup_milliseconds =
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - lookup_start).count();
+    if (plan != nullptr) {
+      data->view.identity.owner_epoch = lease.owner_epoch();
+      data->view.identity.catalog_revision = lease.topology_revision();
+      data->view.identity.catalog_generation = lease.generation();
+      data->view.identity.selection_revision = id_intent.selection_revision;
+      data->view.identity.config_generation =
+          id_intent.config.config_generation;
+      data->view.identity.lidar_map_generation =
+          id_intent.lidar_map_generation;
+      data->view.identity.lidar_match_config_generation =
+          id_intent.lidar_match_config_generation;
+      data->view.kind = id_intent.kind;
+      data->view.config = id_intent.config;
+      data->view.catalog = lease;
+      data->view.lidar.lidar_map_generation =
+          id_intent.lidar_map_generation;
+      data->view.lidar.match_config_generation =
+          id_intent.lidar_match_config_generation;
+      data->view.prepared_plan = std::move(plan);
+      const auto bind_start = std::chrono::steady_clock::now();
+      if (!GatherDynamicStateFromPreparedPlan(
+              *reconstruction, lease, *data->view.prepared_plan,
+              state->next_state_generation, &data->initial_state,
+              &data->runtime, error) ||
+          !ValidateNativeHostSolveView(data->view, data->initial_state,
+                                       error)) {
+        return false;
+      }
+      data->runtime.plan_bind_milliseconds =
+          std::chrono::duration<double, std::milli>(
+              std::chrono::steady_clock::now() - bind_start).count();
+      data->runtime.host_plan_resident_bytes =
+          state->host_plan_resident_bytes;
+      data->runtime.host_plan_peak_bytes = state->host_plan_peak_bytes;
+      ++state->active_prepares;
+      ++data->runtime.prepared_views;
+      data->active = true;
+      prepared->data_ = std::move(data);
+      return true;
+    }
+  }
+  const auto id_resolution_start = std::chrono::steady_clock::now();
+
   BaSolveIntent slot_intent;
   slot_intent.owner_epoch = id_intent.owner_epoch;
   slot_intent.catalog_revision = lease.topology_revision();
@@ -961,6 +1556,7 @@ bool PrepareCudaNativeBaSolve(
   slot_intent.selection_revision = id_intent.selection_revision;
   slot_intent.kind = id_intent.kind;
   slot_intent.config = id_intent.config;
+  slot_intent.visual_observation_slots_fully_resolved = true;
   const auto cameras = lease.cameras();
   const auto images = lease.images();
   const auto points = lease.points();
@@ -1006,6 +1602,7 @@ bool PrepareCudaNativeBaSolve(
           !visitor(incidence.observation_slot)) {
         return false;
       }
+      ++data->runtime.intent_incidence_traversal_visits;
       node = incidence.next_node;
     }
     return true;
@@ -1017,6 +1614,7 @@ bool PrepareCudaNativeBaSolve(
     relevant_points.insert(observation.point_slot);
     slot_intent.source_insertion_order.push_back(
         {ResidualKind::kVisual, observation_slot});
+    slot_intent.resolved_visual_observation_slots.push_back(observation_slot);
     return true;
   };
   for (const uint32_t image_id : id_intent.active_image_ids) {
@@ -1143,6 +1741,9 @@ bool PrepareCudaNativeBaSolve(
          value.has_search_range, value.search_range});
   }
 
+  data->runtime.intent_id_resolution_milliseconds =
+      std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - id_resolution_start).count();
   DenseActiveState dense;
   dense.owner_epoch = id_intent.owner_epoch;
   dense.state_generation = state->next_state_generation;
@@ -1182,6 +1783,7 @@ bool PrepareCudaNativeBaSolve(
     }
     relevant_cameras.insert(images[image_slot].camera_slot);
   }
+  const auto dynamic_gather_start = std::chrono::steady_clock::now();
   for (const uint32_t slot : relevant_cameras) {
     if (slot >= cameras.size || !cameras[slot].header.alive ||
         !reconstruction->ExistsCamera(cameras[slot].camera_id)) {
@@ -1224,6 +1826,9 @@ bool PrepareCudaNativeBaSolve(
     std::copy(xyz.data(), xyz.data() + 3, value.xyz.begin());
     dense.points.push_back(value);
   }
+  data->runtime.dynamic_state_gather_milliseconds =
+      std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - dynamic_gather_start).count();
   const auto materialize_start = std::chrono::steady_clock::now();
   NativeHostSolvePreparationRuntime materialize_runtime;
   if (!state->materializer.Materialize(
@@ -1231,10 +1836,39 @@ bool PrepareCudaNativeBaSolve(
           &materialize_runtime, error)) {
     return false;
   }
+  data->runtime.materializer_incidence_traversal_visits =
+      materialize_runtime.incidence_traversal_visits;
   data->runtime.materialize_wall_milliseconds =
       std::chrono::duration<double, std::milli>(
           std::chrono::steady_clock::now() - materialize_start)
           .count();
+  ++data->runtime.adjacency_static_materialize_calls;
+  ++data->runtime.dynamic_state_gather_calls;
+  if (cache_enabled) {
+    const auto build_start = std::chrono::steady_clock::now();
+    if (state->next_plan_publication_id ==
+        std::numeric_limits<uint64_t>::max()) {
+      *error = "native prepared plan publication identity exhausted";
+      return false;
+    }
+    std::shared_ptr<PreparedSelectionPlan> plan;
+    try {
+      plan = ExtractPreparedSelectionPlan(
+          &data->view, ++state->next_plan_publication_id);
+    } catch (const std::bad_alloc&) {
+      *error = "native prepared plan allocation failed";
+      return false;
+    }
+    ++data->runtime.host_plan_build_calls;
+    const bool published = PublishPreparedSelectionPlan(
+        state.get(), lease, std::move(plan_key), plan_hash, plan,
+        &data->runtime, error);
+    if (!error->empty()) return false;
+    if (!published) plan->publication_id = 0;
+    data->runtime.host_plan_build_milliseconds =
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - build_start).count();
+  }
   ++state->active_prepares;
   ++data->runtime.prepared_views;
   data->active = true;
@@ -1308,11 +1942,11 @@ bool ValidateAndCommitNativeBaDelta(
   std::unordered_set<uint32_t> point_slots;
   std::unordered_map<uint32_t, const ImageFixedPolicyResult*> image_policy;
   std::unordered_map<uint32_t, const PointFixedPolicyResult*> point_policy;
-  image_policy.reserve(view.fixed.images.size());
-  point_policy.reserve(view.fixed.points.size());
-  for (const ImageFixedPolicyResult& value : view.fixed.images)
+  image_policy.reserve(view.Fixed().images.size());
+  point_policy.reserve(view.Fixed().points.size());
+  for (const ImageFixedPolicyResult& value : view.Fixed().images)
     image_policy.emplace(value.image_slot, &value);
-  for (const PointFixedPolicyResult& value : view.fixed.points)
+  for (const PointFixedPolicyResult& value : view.Fixed().points)
     point_policy.emplace(value.point_slot, &value);
   if (!candidate.cameras.empty() || !candidate.expected_camera_slots.empty()) {
     *error = "native variable camera delta is unsupported";
@@ -1367,9 +2001,9 @@ bool ValidateAndCommitNativeBaDelta(
   std::vector<uint32_t> expected_points = candidate.expected_point_slots;
   std::vector<uint32_t> view_expected_images;
   std::vector<uint32_t> view_expected_points;
-  for (const ImageFixedPolicyResult& value : view.fixed.images)
+  for (const ImageFixedPolicyResult& value : view.Fixed().images)
     if (!value.pose_constant) view_expected_images.push_back(value.image_slot);
-  for (const PointFixedPolicyResult& value : view.fixed.points)
+  for (const PointFixedPolicyResult& value : view.Fixed().points)
     if (!value.constant) view_expected_points.push_back(value.point_slot);
   std::sort(actual_images.begin(), actual_images.end());
   std::sort(actual_points.begin(), actual_points.end());

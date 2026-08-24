@@ -37,7 +37,27 @@ struct NativeGraphPrepareRuntime {
   uint64_t catalog_full_rebuilds = 0;
   uint64_t reader_busy = 0;
   uint64_t prepared_views = 0;
+  uint64_t prepare_requests = 0;
+  uint64_t host_plan_hits = 0;
+  uint64_t host_plan_misses = 0;
+  uint64_t host_plan_bypasses = 0;
+  uint64_t host_plan_dependency_misses = 0;
+  uint64_t host_plan_hash_collisions = 0;
+  uint64_t host_plan_build_calls = 0;
+  uint64_t host_plan_evictions = 0;
+  uint64_t host_plan_resident_bytes = 0;
+  uint64_t host_plan_peak_bytes = 0;
+  uint64_t adjacency_static_materialize_calls = 0;
+  uint64_t dynamic_state_gather_calls = 0;
+  uint64_t native_view_vector_copy_bytes_on_hit = 0;
+  uint64_t intent_incidence_traversal_visits = 0;
+  uint64_t materializer_incidence_traversal_visits = 0;
   double catalog_sync_wall_milliseconds = 0.0;
+  double intent_id_resolution_milliseconds = 0.0;
+  double host_plan_lookup_milliseconds = 0.0;
+  double host_plan_build_milliseconds = 0.0;
+  double dynamic_state_gather_milliseconds = 0.0;
+  double plan_bind_milliseconds = 0.0;
   double materialize_wall_milliseconds = 0.0;
 };
 

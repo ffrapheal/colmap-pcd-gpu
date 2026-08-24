@@ -1875,6 +1875,9 @@ BOOST_AUTO_TEST_CASE(DirectNativeIntentMatchesSelectionAndRunsWithoutLegacy) {
   BOOST_CHECK_EQUAL(direct_execution.snapshot_materialization_calls, 0);
   BOOST_CHECK_EQUAL(direct_execution.bundle_adjuster_setup_milliseconds, 0.0);
   BOOST_CHECK_EQUAL(direct_execution.native_legacy_kernel_input_bundle_calls, 0);
+  BOOST_CHECK_EQUAL(direct_execution.native_plan_prepare_requests, 0);
+  BOOST_CHECK_EQUAL(direct_execution.native_device_selection_hits, 0);
+  BOOST_CHECK_EQUAL(direct_execution.native_device_selection_misses, 0);
   BOOST_CHECK_GT(direct_execution.native_variable_state_d2h_calls, 0);
   BOOST_CHECK_EQUAL(direct_execution.fallback_used, false);
   BOOST_CHECK_EQUAL(direct_execution.trial_steps,
@@ -2024,6 +2027,134 @@ BOOST_AUTO_TEST_CASE(DirectNativeAcceptedCommitWritesReconstructionState) {
   BOOST_REQUIRE(direct_store.Shutdown(&shutdown_error));
   reference.reconstruction.EndStructureJournal();
   direct.reconstruction.EndStructureJournal();
+}
+
+BOOST_AUTO_TEST_CASE(DirectNativePreparedSelectionHostAndDeviceHit) {
+  FailureModeReset reset;
+  SyntheticProblem problem = MakeSyntheticProblem();
+  constexpr uint64_t kOwnerEpoch = 12006;
+  problem.reconstruction.BeginStructureJournal(kOwnerEpoch, 64);
+  gpu_ba::GpuBaHostProblemStore store(&problem.reconstruction, kOwnerEpoch);
+  gpu_ba::CudaHostStoreBinding binding;
+  binding.store = &store;
+  binding.owner_epoch = kOwnerEpoch;
+  binding.mode = gpu_ba::CudaHostProblemStoreMode::kHostPreparedStore;
+
+  BundleAdjustmentOptions options = CudaOptions(false);
+  options.ba_cuda_host_problem_store = "host_prepared_store";
+  options.ba_cuda_problem_source = gpu_ba::CudaProblemSource::kNativeGraph;
+  options.ba_cuda_execution_profile =
+      BundleAdjustmentOptions::CudaExecutionProfile::COMPACT_CONTROL;
+  options.ba_cuda_audit_profile = "production";
+  options.ba_cuda_arithmetic_precision = "fp32_mixed";
+  options.ba_cuda_hessian_assembly_backend = "observation_segmented";
+  options.ba_cuda_hot_kernel_mode = "transformed";
+  options.ba_cuda_schur_contribution_backend = "segmented";
+  options.ba_cuda_prepared_selection_cache =
+      gpu_ba::CudaPreparedSelectionCacheMode::kEnabled;
+
+  const auto run = [&](const uint64_t selection_revision) {
+    gpu_ba::NativeBaSolveIntent intent;
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(
+        BuildNativeBaSolveIntent(
+            options, problem.config, problem.reconstruction, kOwnerEpoch,
+            problem.reconstruction.StructureRevision(), selection_revision,
+            gpu_ba::BaKind::kLocal, &intent, &error),
+        error);
+    BundleAdjuster adjuster(options, problem.config);
+    adjuster.SetOptimazePhrase(BundleAdjuster::OptimazePhrase::Local);
+    adjuster.SetCudaHostStoreBinding(binding);
+    BOOST_REQUIRE_MESSAGE(adjuster.SolveNative(&problem.reconstruction, intent),
+                          adjuster.ExecutionResult().diagnostic_message);
+    return adjuster.ExecutionResult();
+  };
+
+  const BundleAdjustmentExecutionResult cold = run(1);
+  BOOST_CHECK_EQUAL(cold.native_plan_prepare_requests, 1);
+  BOOST_CHECK_EQUAL(cold.native_host_plan_hits, 0);
+  BOOST_CHECK_EQUAL(cold.native_host_plan_misses, 1);
+  BOOST_CHECK_EQUAL(cold.native_host_plan_build_calls, 1);
+  BOOST_CHECK_EQUAL(cold.native_static_materialize_calls, 1);
+  BOOST_CHECK_EQUAL(cold.native_dynamic_state_gather_calls, 1);
+  BOOST_CHECK_GT(cold.native_intent_incidence_traversal_visits, 0);
+  BOOST_CHECK_EQUAL(cold.native_materializer_incidence_traversal_visits, 0);
+  BOOST_CHECK_EQUAL(cold.native_indexed_plan_build_calls, 1);
+  BOOST_CHECK_EQUAL(cold.native_device_selection_hits, 0);
+  BOOST_CHECK_EQUAL(cold.native_device_selection_misses, 1);
+  BOOST_CHECK_EQUAL(cold.native_device_selection_lookup_calls, 1);
+  BOOST_CHECK_EQUAL(cold.native_device_selection_upload_calls, 1);
+  BOOST_CHECK_EQUAL(cold.native_device_selection_cached_workspace_bytes, 0);
+  BOOST_CHECK_GT(cold.native_device_selection_static_h2d_calls, 0);
+  BOOST_CHECK_GT(cold.native_device_selection_static_h2d_bytes, 0);
+
+  std::string pool_error;
+  BOOST_REQUIRE_MESSAGE(gpu_ba::ResetCudaRuntimePoolForTesting(&pool_error),
+                        pool_error);
+  problem.reconstruction.Image(1).Tvec(2) += 1e-6;
+  const double dynamic_translation = problem.reconstruction.Image(1).Tvec(2);
+  const BundleAdjustmentExecutionResult hot = run(2);
+  BOOST_CHECK_EQUAL(hot.native_plan_prepare_requests, 1);
+  BOOST_CHECK_EQUAL(hot.native_host_plan_hits, 1);
+  BOOST_CHECK_EQUAL(hot.native_host_plan_misses, 0);
+  BOOST_CHECK_EQUAL(hot.native_host_plan_bypasses, 0);
+  BOOST_CHECK_EQUAL(hot.native_host_plan_build_calls, 0);
+  BOOST_CHECK_EQUAL(hot.native_static_materialize_calls, 0);
+  BOOST_CHECK_EQUAL(hot.native_dynamic_state_gather_calls, 1);
+  BOOST_CHECK_EQUAL(hot.native_plan_vector_copy_bytes_on_hit, 0);
+  BOOST_CHECK_EQUAL(hot.native_indexed_plan_build_calls, 0);
+  BOOST_CHECK_EQUAL(hot.native_device_selection_hits, 1);
+  BOOST_CHECK_EQUAL(hot.native_device_selection_misses, 0);
+  BOOST_CHECK_EQUAL(hot.native_device_selection_bypasses, 0);
+  BOOST_CHECK_EQUAL(hot.native_device_selection_lookup_calls, 1);
+  BOOST_CHECK_EQUAL(hot.native_device_selection_upload_calls, 0);
+  BOOST_CHECK_EQUAL(hot.native_device_selection_evictions, 0);
+  BOOST_CHECK_EQUAL(hot.native_device_selection_context_invalidations, 0);
+  BOOST_CHECK_EQUAL(hot.native_device_selection_poison_events, 0);
+  BOOST_CHECK_EQUAL(hot.native_device_selection_static_h2d_calls, 0);
+  BOOST_CHECK_EQUAL(hot.native_device_selection_static_h2d_bytes, 0);
+  BOOST_CHECK_GT(hot.native_device_selection_static_h2d_saved_calls, 0);
+  BOOST_CHECK_GT(hot.native_device_selection_static_h2d_saved_bytes, 0);
+  BOOST_CHECK_EQUAL(hot.native_device_selection_cached_workspace_bytes, 0);
+  BOOST_CHECK_EQUAL(hot.native_legacy_kernel_input_bundle_calls, 0);
+  BOOST_CHECK_EQUAL(hot.native_repeated_residual_state_packing_bytes, 0);
+  BOOST_CHECK(!hot.fallback_used);
+  BOOST_CHECK_EQUAL(problem.reconstruction.Image(1).Tvec(2),
+                    dynamic_translation);
+
+  problem.reconstruction.AddPoint3D(
+      Eigen::Vector3d(100.0, 100.0, 100.0), Track());
+  const BundleAdjustmentExecutionResult unrelated_append = run(3);
+  BOOST_CHECK_EQUAL(unrelated_append.native_host_plan_hits, 1);
+  BOOST_CHECK_EQUAL(unrelated_append.native_host_plan_misses, 0);
+  BOOST_CHECK_EQUAL(unrelated_append.native_host_plan_dependency_misses, 0);
+  BOOST_CHECK_EQUAL(unrelated_append.native_static_materialize_calls, 0);
+  BOOST_CHECK_EQUAL(unrelated_append.native_device_selection_hits, 1);
+  BOOST_CHECK_EQUAL(
+      unrelated_append.native_device_selection_static_h2d_calls, 0);
+  BOOST_CHECK_EQUAL(
+      unrelated_append.native_device_selection_static_h2d_bytes, 0);
+
+  AddThirdTrackObservationImage(&problem);
+  const BundleAdjustmentExecutionResult selected_adjacency_change = run(4);
+  BOOST_CHECK_EQUAL(selected_adjacency_change.native_host_plan_hits, 0);
+  BOOST_CHECK_EQUAL(selected_adjacency_change.native_host_plan_misses, 1);
+  BOOST_CHECK_EQUAL(
+      selected_adjacency_change.native_host_plan_dependency_misses, 1);
+  BOOST_CHECK_EQUAL(selected_adjacency_change.native_host_plan_build_calls, 1);
+  BOOST_CHECK_EQUAL(selected_adjacency_change.native_static_materialize_calls,
+                    1);
+  BOOST_CHECK_EQUAL(selected_adjacency_change.native_device_selection_hits, 0);
+  BOOST_CHECK_EQUAL(selected_adjacency_change.native_device_selection_misses,
+                    1);
+  BOOST_CHECK_EQUAL(selected_adjacency_change.native_device_selection_upload_calls,
+                    1);
+  BOOST_CHECK_GT(
+      selected_adjacency_change.native_device_selection_static_h2d_calls, 0);
+
+  std::string shutdown_error;
+  BOOST_REQUIRE(store.Shutdown(&shutdown_error));
+  problem.reconstruction.EndStructureJournal();
 }
 #endif
 

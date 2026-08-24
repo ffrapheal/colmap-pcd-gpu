@@ -994,6 +994,8 @@ struct CudaFullLmOptions {
       CudaArithmeticPrecision::kCompatibilityDefault;
   CudaExecutionProfile execution_profile = CudaExecutionProfile::kBaseline;
   CudaAuditProfile audit_profile = CudaAuditProfile::kCompatibilityDefault;
+  CudaPreparedSelectionCacheMode prepared_selection_cache_mode =
+      CudaPreparedSelectionCacheMode::kDisabled;
   int32_t max_num_iterations = -1;  // negative: use snapshot value
   int32_t max_num_consecutive_invalid_steps = -1;
   double max_solver_time_in_seconds = 1e9;

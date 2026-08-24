@@ -134,6 +134,7 @@ BOOST_AUTO_TEST_CASE(ColdBuildLeaseAndNativeView) {
   BOOST_CHECK_EQUAL(store.generation(), 1);
   const CatalogReadLease lease = store.AcquireReadLease();
   BOOST_REQUIRE(lease.valid());
+  BOOST_CHECK_EQUAL(lease.slot_namespace_epoch(), 1);
   BOOST_CHECK(store.IsCurrent(lease));
   BOOST_CHECK_EQUAL(lease.images().size, 2);
   BOOST_CHECK_EQUAL(lease.points()[0].track_length, 2);
@@ -211,6 +212,7 @@ BOOST_AUTO_TEST_CASE(TransactionNoopReassignAndFailureDoNotPartiallyPublish) {
   BOOST_CHECK(update.semantic_noop);
   BOOST_CHECK_EQUAL(store.generation(), 1);
   BOOST_CHECK_EQUAL(store.topology_revision(), 2);
+  BOOST_CHECK_EQUAL(store.AcquireReadLease().slot_namespace_epoch(), 1);
   BOOST_CHECK(!store.IsCurrent(generation1));
 
   CoalescedBaGraphMutation wrong_owner;
@@ -250,6 +252,7 @@ BOOST_AUTO_TEST_CASE(TransactionNoopReassignAndFailureDoNotPartiallyPublish) {
   accepted_failure_rebuild.topology_revision = 3;
   BOOST_REQUIRE_MESSAGE(
       store.ColdBuild(accepted_failure_rebuild, &update, &error), error);
+  BOOST_CHECK_EQUAL(store.AcquireReadLease().slot_namespace_epoch(), 2);
   {
     const CatalogReadLease lease = store.AcquireReadLease();
     BOOST_REQUIRE(lease.valid());
