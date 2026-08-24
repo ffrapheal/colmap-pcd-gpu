@@ -1,7 +1,9 @@
 set(FOLDER_NAME "gpu_ba")
 
 COLMAP_ADD_SOURCES(
+    ba_types.h
     active_solve_view.h active_solve_view.cc
+    host_ba_graph.h host_ba_graph.cc
     active_ba_solve_spec.h active_ba_solve_spec.cc
     ceres_envelope.h ceres_envelope.cc
     ceres_fidelity.h ceres_fidelity.cc
@@ -47,6 +49,13 @@ if(GPU_BA_TESTS_ENABLED)
                           ${Boost_UNIT_TEST_FRAMEWORK_LIBRARY})
     add_test("gpu_ba/gpu_ba_active_solve_view_test"
              gpu_ba_active_solve_view_test)
+
+    add_executable(gpu_ba_host_ba_graph_test host_ba_graph_test.cc)
+    set_target_properties(gpu_ba_host_ba_graph_test PROPERTIES FOLDER
+        ${COLMAP_TARGETS_ROOT_FOLDER}/${FOLDER_NAME})
+    target_link_libraries(gpu_ba_host_ba_graph_test colmap
+                          ${Boost_UNIT_TEST_FRAMEWORK_LIBRARY})
+    add_test("gpu_ba/gpu_ba_host_ba_graph_test" gpu_ba_host_ba_graph_test)
 
     add_executable(gpu_ba_ceres_envelope_test ceres_envelope_test.cc)
     set_target_properties(gpu_ba_ceres_envelope_test PROPERTIES FOLDER
@@ -103,6 +112,16 @@ if(GPU_BA_TESTS_ENABLED)
                               ${Boost_UNIT_TEST_FRAMEWORK_LIBRARY})
         add_test("gpu_ba/gpu_ba_custom_cuda_test"
                  gpu_ba_custom_cuda_test)
+
+        add_executable(gpu_ba_native_cuda_bridge_test
+                       native_cuda_bridge_test.cc)
+        set_target_properties(gpu_ba_native_cuda_bridge_test PROPERTIES FOLDER
+            ${COLMAP_TARGETS_ROOT_FOLDER}/${FOLDER_NAME})
+        target_link_libraries(gpu_ba_native_cuda_bridge_test
+                              gpu_ba_custom_cuda colmap
+                              ${Boost_UNIT_TEST_FRAMEWORK_LIBRARY})
+        add_test("gpu_ba/gpu_ba_native_cuda_bridge_test"
+                 gpu_ba_native_cuda_bridge_test)
 
         add_executable(gpu_ba_custom_cuda_cleanup_failure_helper
                        custom_cuda_cleanup_failure_helper.cc)

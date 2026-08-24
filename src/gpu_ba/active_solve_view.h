@@ -12,6 +12,9 @@
 namespace colmap {
 namespace gpu_ba {
 
+// Phase 11 indexed prototype retained for reference/replay compatibility.
+// New Mapper-native ownership must use HostBaGraphStore; this interface is
+// not the VS1 long-lived structure contract.
 struct HostIndexedCatalogData;
 
 constexpr uint32_t kMapperStaticCatalogAbiVersion = 2;

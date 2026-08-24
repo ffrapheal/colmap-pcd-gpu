@@ -9170,6 +9170,19 @@ class GpuBaDeviceContext {
                   const MapperStaticCatalogStableTables* indexed_catalog,
                   CudaFullLmRuntimeInfo* runtime,
                   std::string* error);
+  bool InitializeNative(const NativeHostSolveView& view,
+                        const ActiveStateBuffer& initial_state,
+                        const LegacyKernelInputBundle::Impl& native,
+                        const CudaLayerBOptions& options,
+                        uint64_t solve_generation,
+                        uint64_t topology_generation,
+                        HotKernelImplementation hot_kernel_implementation,
+                        CudaHessianAssemblyBackend hessian_assembly_backend,
+                        CudaSchurContributionBackend schur_contribution_backend,
+                        CudaArithmeticPrecision arithmetic_precision,
+                        CudaExecutionProfile execution_profile,
+                        CudaFullLmRuntimeInfo* runtime,
+                        std::string* error);
   bool FinalizeConfig(uint64_t config_generation, std::string* error) noexcept;
   bool UploadFrozenScaling(const CudaLayerBOptions& options,
                            std::string* error);
@@ -9188,6 +9201,15 @@ class GpuBaDeviceContext {
                  std::string* error);
   bool RunLayerBFromDeviceState(
       const Snapshot& host_state,
+      const CudaLayerBOptions& options,
+      const CudaLinearizationIdentity& identity,
+      CudaFaultLogicalSite site,
+      CudaLossMode loss_mode,
+      double loss_scale,
+      CudaLayerBResult* result,
+      CudaDeviceLinearizationToken* token,
+      std::string* error);
+  bool RunLayerBFromNativeDeviceState(
       const CudaLayerBOptions& options,
       const CudaLinearizationIdentity& identity,
       CudaFaultLogicalSite site,
@@ -9218,6 +9240,10 @@ class GpuBaDeviceContext {
                              bool materialize_host_state,
                              Snapshot* trial,
                              std::string* error);
+  bool BuildNativeDeviceTrialState(
+      const CudaLinearizationIdentity& current_identity,
+      int block_size,
+      std::string* error);
   bool RunDeviceDiagnostics(const CudaLinearizationIdentity& current_identity,
                             const CudaDeviceLinearizationToken& token,
                             double lambda,
@@ -9234,6 +9260,11 @@ class GpuBaDeviceContext {
                                Snapshot* output,
                                bool final_materialization,
                                std::string* error);
+  bool DownloadCurrentNativeState(const NativeHostSolveView& view,
+                                  const ActiveStateBuffer& initial_state,
+                                  const CudaLinearizationIdentity& expected,
+                                  DenseActiveState* output,
+                                  std::string* error);
   bool StaleHandleSelfTest(const PackedLayerAState& packed,
                            const CudaLayerAOptions& options,
                            std::string* error);
@@ -9275,6 +9306,35 @@ class GpuBaDeviceContext {
   uint64_t context_identity() const noexcept { return context_identity_; }
 
  private:
+  bool InitializeImpl(const Snapshot* legacy_initial_snapshot,
+                      const NativeHostSolveView* native_view,
+                      const ActiveStateBuffer* native_initial_state,
+                      const LegacyKernelInputBundle::Impl* native,
+                      const PackedLayerAState& initial,
+                      const CostLayout& cost_layout,
+                      const LayerBTopology& layer_b,
+                      const LayerCTopology& layer_c,
+                      const CudaLayerBOptions& options,
+                      uint64_t solve_generation,
+                      uint64_t topology_generation,
+                      bool device_state_enabled,
+                      bool device_control_enabled,
+                      HotKernelImplementation hot_kernel_implementation,
+                      CudaHessianAssemblyBackend hessian_assembly_backend,
+                      CudaSchurContributionBackend schur_contribution_backend,
+                      CudaArithmeticPrecision arithmetic_precision,
+                      CudaExecutionProfile execution_profile,
+                      bool audit_mirror_enabled,
+                      const MapperStaticCatalogStableTables* indexed_catalog,
+                      CudaFullLmRuntimeInfo* runtime,
+                      std::string* error);
+  bool BuildDeviceTrialStateImpl(
+      const CudaLinearizationIdentity& current_identity,
+      int block_size,
+      bool materialize_host_state,
+      Snapshot* trial,
+      const Snapshot* host_current,
+      std::string* error);
   struct AllocationRecord {
     void* pointer = nullptr;
     uint64_t bytes = 0;
@@ -9549,6 +9609,9 @@ class GpuBaDeviceContext {
   std::vector<DeviceImageEntityState> host_image_entities_;
   std::vector<DevicePointEntityState> host_point_entities_;
   std::vector<DeviceCameraEntityState> host_camera_entities_;
+  std::vector<uint32_t> native_camera_slots_;
+  std::vector<uint32_t> native_image_slots_;
+  std::vector<uint32_t> native_point_slots_;
 };
 
 static_assert(!std::is_copy_constructible<GpuBaDeviceContext>::value,
@@ -9657,6 +9720,541 @@ struct PreparedHostSolveViewData {
   std::shared_ptr<const LayerCTopology> layer_c_topology;
 };
 
+// VS1 temporary kernel-ABI owner. Unlike the removed native bridge lookalikes,
+// these are the exact layouts uploaded and consumed by GpuBaDeviceContext.
+struct LegacyKernelInputBundle::Impl {
+  PackedLayerAState packed;
+  CostLayout cost_layout;
+  LayerBTopology layer_b_topology;
+  LayerCTopology layer_c_topology;
+  std::vector<uint32_t> camera_slots;
+  std::vector<uint32_t> image_slots;
+  std::vector<uint32_t> point_slots;
+  std::vector<uint32_t> image_camera_slots;
+  std::vector<uint32_t> visual_output_by_execution_ordinal;
+  std::vector<uint32_t> lidar_output_by_execution_ordinal;
+  BaSolveResult::Runtime runtime;
+  NativeHostSolveViewIdentity identity;
+  bool identity_valid = false;
+  bool layer_a_ready = false;
+  bool static_layout_ready = false;
+  bool cost_layout_ready = false;
+  bool layer_b_ready = false;
+  bool layer_c_ready = false;
+};
+
+LegacyKernelInputBundle::LegacyKernelInputBundle() : impl_(new Impl()) {}
+LegacyKernelInputBundle::~LegacyKernelInputBundle() = default;
+LegacyKernelInputBundle::LegacyKernelInputBundle(
+    LegacyKernelInputBundle&& other) noexcept = default;
+LegacyKernelInputBundle& LegacyKernelInputBundle::operator=(
+    LegacyKernelInputBundle&& other) noexcept = default;
+const std::vector<CudaVisualInput>& LegacyKernelInputBundle::visual()
+    const noexcept {
+  static const std::vector<CudaVisualInput> empty;
+  return impl_ == nullptr ? empty : impl_->packed.visual;
+}
+const std::vector<CudaLidarInput>& LegacyKernelInputBundle::lidar()
+    const noexcept {
+  static const std::vector<CudaLidarInput> empty;
+  return impl_ == nullptr ? empty : impl_->packed.lidar;
+}
+const BaSolveResult::Runtime& LegacyKernelInputBundle::runtime()
+    const noexcept {
+  static const BaSolveResult::Runtime empty;
+  return impl_ == nullptr ? empty : impl_->runtime;
+}
+
+namespace {
+
+bool SameNativeIdentity(const NativeHostSolveViewIdentity& lhs,
+                        const NativeHostSolveViewIdentity& rhs) noexcept {
+  return lhs.abi_version == rhs.abi_version &&
+         lhs.catalog_abi_version == rhs.catalog_abi_version &&
+         lhs.owner_epoch == rhs.owner_epoch &&
+         lhs.catalog_revision == rhs.catalog_revision &&
+         lhs.catalog_generation == rhs.catalog_generation &&
+         lhs.selection_revision == rhs.selection_revision &&
+         lhs.config_generation == rhs.config_generation &&
+         lhs.lidar_map_generation == rhs.lidar_map_generation &&
+         lhs.lidar_match_config_generation ==
+             rhs.lidar_match_config_generation;
+}
+
+template <typename State>
+uint32_t NativeStateSlot(const State& state);
+template <>
+uint32_t NativeStateSlot(const DenseCameraState& state) {
+  return state.camera_slot;
+}
+template <>
+uint32_t NativeStateSlot(const DenseImageState& state) {
+  return state.image_slot;
+}
+template <>
+uint32_t NativeStateSlot(const DensePointState& state) {
+  return state.point_slot;
+}
+
+template <typename State>
+bool BuildNativeStateLookup(const std::vector<State>& states,
+                            const uint64_t generation,
+                            std::unordered_map<uint32_t, const State*>* lookup,
+                            std::string* error) {
+  lookup->clear();
+  lookup->reserve(states.size());
+  for (const State& state : states) {
+    if (state.state_generation != generation ||
+        !lookup->emplace(NativeStateSlot(state), &state).second) {
+      *error = "native state generation or slot identity is invalid";
+      return false;
+    }
+  }
+  return true;
+}
+
+template <typename T>
+bool NativeFinite(const T& values) {
+  for (const double value : values)
+    if (!std::isfinite(value)) return false;
+  return true;
+}
+
+const ImageFixedPolicyResult* NativeImagePolicy(
+    const NativeHostSolveView& view, const uint32_t slot) {
+  for (const ImageFixedPolicyResult& value : view.fixed.images)
+    if (value.image_slot == slot) return &value;
+  return nullptr;
+}
+const PointFixedPolicyResult* NativePointPolicy(
+    const NativeHostSolveView& view, const uint32_t slot) {
+  for (const PointFixedPolicyResult& value : view.fixed.points)
+    if (value.point_slot == slot) return &value;
+  return nullptr;
+}
+const LidarConstraintRecord* NativeLidarConstraint(
+    const NativeHostSolveView& view, const uint32_t slot) {
+  for (const LidarConstraintRecord& value : view.lidar.constraints)
+    if (value.constraint_slot == slot) return &value;
+  return nullptr;
+}
+
+bool NativeBundleIdentityReady(const NativeHostSolveView& view,
+                               const LegacyKernelInputBundle::Impl& bundle,
+                               std::string* error) {
+  if (!bundle.identity_valid || !SameNativeIdentity(bundle.identity,
+                                                     view.identity)) {
+    *error = "native kernel bundle identity mismatch";
+    return false;
+  }
+  return true;
+}
+
+}  // namespace
+
+bool BuildCudaLayerAInputs(const NativeHostSolveView& view,
+                           const ActiveStateBuffer& state,
+                           LegacyKernelInputBundle* output,
+                           std::string* error) {
+  if (output == nullptr || output->impl_ == nullptr || error == nullptr)
+    return false;
+  if (!ValidateNativeHostSolveView(view, state, error)) return false;
+  LegacyKernelInputBundle::Impl& bundle = *output->impl_;
+  bundle = LegacyKernelInputBundle::Impl();
+  std::unordered_map<uint32_t, const DenseCameraState*> cameras;
+  std::unordered_map<uint32_t, const DenseImageState*> images;
+  std::unordered_map<uint32_t, const DensePointState*> points;
+  if (!BuildNativeStateLookup(state.cameras, state.state_generation, &cameras,
+                              error) ||
+      !BuildNativeStateLookup(state.images, state.state_generation, &images,
+                              error) ||
+      !BuildNativeStateLookup(state.points, state.state_generation, &points,
+                              error)) {
+    return false;
+  }
+  const auto graph_cameras = view.catalog.cameras();
+  const auto graph_images = view.catalog.images();
+  const auto graph_points = view.catalog.points();
+  const auto graph_observations = view.catalog.observations();
+  const uint32_t invalid = std::numeric_limits<uint32_t>::max();
+  bundle.visual_output_by_execution_ordinal.assign(
+      view.residual_ordinals.size(), invalid);
+  bundle.lidar_output_by_execution_ordinal.assign(
+      view.residual_ordinals.size(), invalid);
+  bundle.packed.visual.reserve(view.visual_observation_slots.size());
+  bundle.packed.lidar.reserve(view.lidar.constraints.size());
+  for (const ResidualOrdinal& ordinal : view.residual_ordinals) {
+    if (ordinal.execution_ordinal >= view.residual_ordinals.size()) {
+      *error = "native residual execution ordinal is out of bounds";
+      return false;
+    }
+    if (ordinal.kind == ResidualKind::kVisual) {
+      if (ordinal.source_slot >= graph_observations.size) {
+        *error = "native visual observation slot is out of bounds";
+        return false;
+      }
+      const HostBaObservationSlot& observation =
+          graph_observations[ordinal.source_slot];
+      if (!observation.header.alive ||
+          ordinal.physical_identity != observation.source_identity ||
+          observation.image_slot >= graph_images.size ||
+          observation.point_slot >= graph_points.size ||
+          observation.camera_slot >= graph_cameras.size) {
+        *error = "native visual references a dead graph slot";
+        return false;
+      }
+      const auto image = images.find(observation.image_slot);
+      const auto point = points.find(observation.point_slot);
+      const auto camera = cameras.find(observation.camera_slot);
+      if (image == images.end() || point == points.end() ||
+          camera == cameras.end() ||
+          graph_cameras[observation.camera_slot].model_id !=
+              kOpenCvcCameraModelId ||
+          camera->second->parameters.size() != 8 ||
+          !NativeFinite(camera->second->parameters)) {
+        *error = "native visual state or OPENCV camera layout is invalid";
+        return false;
+      }
+      CudaVisualInput packed;
+      packed.source_index = ordinal.source_insertion_index;
+      packed.image_id = graph_images[observation.image_slot].image_id;
+      packed.point3D_id = graph_points[observation.point_slot].point3D_id;
+      std::copy(image->second->quaternion.begin(),
+                image->second->quaternion.end(), packed.quaternion);
+      std::copy(image->second->translation.begin(),
+                image->second->translation.end(), packed.translation);
+      std::copy(point->second->xyz.begin(), point->second->xyz.end(),
+                packed.point);
+      std::copy(camera->second->parameters.begin(),
+                camera->second->parameters.end(), packed.camera);
+      std::copy(observation.xy.begin(), observation.xy.end(),
+                packed.observation);
+      bundle.visual_output_by_execution_ordinal[ordinal.execution_ordinal] =
+          static_cast<uint32_t>(bundle.packed.visual.size());
+      bundle.packed.visual.push_back(packed);
+    } else {
+      const LidarConstraintRecord* constraint =
+          NativeLidarConstraint(view, ordinal.source_slot);
+      if (constraint == nullptr ||
+          ordinal.physical_identity != constraint->physical_identity) {
+        *error = "native LiDAR ordinal references a missing constraint";
+        return false;
+      }
+      const auto point = points.find(constraint->point_slot);
+      if (point == points.end() ||
+          constraint->point_slot >= graph_points.size) {
+        *error = "native LiDAR state is missing";
+        return false;
+      }
+      CudaLidarInput packed;
+      packed.source_index = ordinal.source_insertion_index;
+      packed.point3D_id = graph_points[constraint->point_slot].point3D_id;
+      std::copy(point->second->xyz.begin(), point->second->xyz.end(),
+                packed.point);
+      std::copy(constraint->plane.begin(), constraint->plane.end(),
+                packed.plane);
+      packed.weight = constraint->weight;
+      packed.mode = static_cast<uint8_t>(view.config.lidar_residual_mode);
+      packed.near_zero_threshold = view.config.lidar_near_zero_threshold;
+      bundle.lidar_output_by_execution_ordinal[ordinal.execution_ordinal] =
+          static_cast<uint32_t>(bundle.packed.lidar.size());
+      bundle.packed.lidar.push_back(packed);
+    }
+  }
+  ++bundle.runtime.build_cuda_layer_a_inputs_calls;
+  bundle.runtime.temporary_visual_input_bytes =
+      bundle.packed.visual.size() * sizeof(CudaVisualInput);
+  bundle.runtime.temporary_lidar_input_bytes =
+      bundle.packed.lidar.size() * sizeof(CudaLidarInput);
+  bundle.identity = view.identity;
+  bundle.identity_valid = true;
+  bundle.layer_a_ready = true;
+  return true;
+}
+
+bool BuildStaticLayout(const NativeHostSolveView& view,
+                       const ActiveStateBuffer& state,
+                       LegacyKernelInputBundle* output,
+                       std::string* error) {
+  if (output == nullptr || output->impl_ == nullptr || error == nullptr ||
+      !ValidateNativeHostSolveView(view, state, error)) {
+    return false;
+  }
+  LegacyKernelInputBundle::Impl& bundle = *output->impl_;
+  if (!bundle.layer_a_ready || !NativeBundleIdentityReady(view, bundle, error))
+    return false;
+  bundle.camera_slots = view.active_camera_slots;
+  bundle.image_slots = view.active_image_slots;
+  bundle.image_slots.insert(bundle.image_slots.end(),
+                            view.boundary_image_slots.begin(),
+                            view.boundary_image_slots.end());
+  bundle.point_slots = view.active_point_slots;
+  const auto images = view.catalog.images();
+  bundle.image_camera_slots.clear();
+  bundle.image_camera_slots.reserve(bundle.image_slots.size());
+  for (const uint32_t slot : bundle.image_slots) {
+    if (slot >= images.size) {
+      *error = "native image entity slot is out of bounds";
+      return false;
+    }
+    bundle.image_camera_slots.push_back(images[slot].camera_slot);
+  }
+  ++bundle.runtime.build_static_layout_calls;
+  bundle.static_layout_ready = true;
+  return true;
+}
+
+bool BuildCostLayout(const NativeHostSolveView& view,
+                     LegacyKernelInputBundle* output,
+                     std::string* error) {
+  if (output == nullptr || output->impl_ == nullptr || error == nullptr)
+    return false;
+  LegacyKernelInputBundle::Impl& bundle = *output->impl_;
+  if (!bundle.layer_a_ready || !NativeBundleIdentityReady(view, bundle, error))
+    return false;
+  CostLayout cost;
+  cost.residual_order = view.config.residual_order;
+  cost.visual_count = bundle.packed.visual.size();
+  cost.lidar_count = bundle.packed.lidar.size();
+  cost.entries.reserve(view.residual_ordinals.size());
+  uint64_t layout_id = 1469598103934665603ull;
+  HashTag(&layout_id, 0x4e4154495645434full);
+  HashWord(&layout_id, static_cast<uint64_t>(cost.residual_order));
+  for (const ResidualOrdinal& ordinal : view.residual_ordinals) {
+    DeviceCostEntry entry;
+    entry.residual_kind = ordinal.kind == ResidualKind::kVisual ? 0 : 1;
+    entry.output_index = ordinal.kind == ResidualKind::kVisual
+        ? bundle.visual_output_by_execution_ordinal[ordinal.execution_ordinal]
+        : bundle.lidar_output_by_execution_ordinal[ordinal.execution_ordinal];
+    const size_t bound = entry.residual_kind == 0
+        ? bundle.packed.visual.size() : bundle.packed.lidar.size();
+    if (entry.output_index >= bound) {
+      *error = "native CostLayout kind-local index is out of bounds";
+      return false;
+    }
+    cost.entries.push_back(entry);
+    HashWord(&layout_id, ordinal.source_insertion_index);
+    HashWord(&layout_id, ordinal.physical_identity);
+    HashWord(&layout_id, entry.residual_kind);
+    HashWord(&layout_id, entry.output_index);
+  }
+  cost.layout_id = layout_id == 0 ? 1 : layout_id;
+  bundle.cost_layout = std::move(cost);
+  bundle.runtime.real_cost_layout_entries = bundle.cost_layout.entries.size();
+  ++bundle.runtime.build_cost_layout_calls;
+  bundle.cost_layout_ready = true;
+  return true;
+}
+
+bool BuildLayerBTopology(const NativeHostSolveView& view,
+                         LegacyKernelInputBundle* output,
+                         std::string* error) {
+  if (output == nullptr || output->impl_ == nullptr || error == nullptr)
+    return false;
+  LegacyKernelInputBundle::Impl& bundle = *output->impl_;
+  if (!bundle.static_layout_ready || !bundle.cost_layout_ready ||
+      !NativeBundleIdentityReady(view, bundle, error)) {
+    return false;
+  }
+  const auto images = view.catalog.images();
+  const auto points = view.catalog.points();
+  std::vector<const ImageFixedPolicyResult*> variable_images;
+  std::vector<const PointFixedPolicyResult*> variable_points;
+  if (view.config.residual_order == CudaResidualOrder::kCanonical) {
+    for (const ImageFixedPolicyResult& policy : view.fixed.images)
+      if (!policy.pose_constant) variable_images.push_back(&policy);
+    for (const PointFixedPolicyResult& policy : view.fixed.points)
+      if (!policy.constant) variable_points.push_back(&policy);
+    std::sort(variable_images.begin(), variable_images.end(),
+              [&images](const auto* lhs, const auto* rhs) {
+                return images[lhs->image_slot].image_id <
+                       images[rhs->image_slot].image_id;
+              });
+    std::sort(variable_points.begin(), variable_points.end(),
+              [&points](const auto* lhs, const auto* rhs) {
+                return points[lhs->point_slot].point3D_id <
+                       points[rhs->point_slot].point3D_id;
+              });
+  } else {
+    std::unordered_set<uint32_t> seen_images;
+    std::unordered_set<uint32_t> seen_points;
+    for (const ParameterOrdinal& parameter : view.parameter_ordinals) {
+      if (parameter.kind == ParameterKind::kQuaternion && !parameter.constant &&
+          seen_images.insert(static_cast<uint32_t>(parameter.entity_slot)).second) {
+        const auto* policy = NativeImagePolicy(
+            view, static_cast<uint32_t>(parameter.entity_slot));
+        if (policy != nullptr) variable_images.push_back(policy);
+      } else if (parameter.kind == ParameterKind::kPoint3D &&
+                 !parameter.constant &&
+                 seen_points.insert(
+                     static_cast<uint32_t>(parameter.entity_slot)).second) {
+        const auto* policy = NativePointPolicy(
+            view, static_cast<uint32_t>(parameter.entity_slot));
+        if (policy != nullptr) variable_points.push_back(policy);
+      }
+    }
+  }
+  LayerBTopology topology;
+  std::vector<int32_t> pose_by_image_slot(images.size, -1);
+  std::vector<int32_t> point_by_point_slot(points.size, -1);
+  topology.poses.resize(variable_images.size());
+  std::vector<std::vector<uint32_t>> pose_entries(variable_images.size());
+  for (size_t i = 0; i < variable_images.size(); ++i) {
+    const auto& policy = *variable_images[i];
+    DevicePoseMeta& meta = topology.poses[i];
+    meta.image_id = images[policy.image_slot].image_id;
+    meta.dimension = 3;
+    for (int32_t& value : meta.free_translation_indices) value = -1;
+    for (int translation = 0; translation < 3; ++translation) {
+      if ((policy.translation_subset_mask & (1u << translation)) == 0) {
+        meta.free_translation_indices[meta.dimension - 3] = translation;
+        ++meta.dimension;
+      }
+    }
+    pose_by_image_slot[policy.image_slot] = static_cast<int32_t>(i);
+  }
+  topology.points.resize(variable_points.size());
+  std::vector<std::vector<DevicePointAdjacency>> point_entries(
+      variable_points.size());
+  for (size_t i = 0; i < variable_points.size(); ++i) {
+    topology.points[i].point3D_id =
+        points[variable_points[i]->point_slot].point3D_id;
+    point_by_point_slot[variable_points[i]->point_slot] =
+        static_cast<int32_t>(i);
+  }
+  const auto observations = view.catalog.observations();
+  std::map<std::pair<uint32_t, uint32_t>, std::vector<uint32_t>> edge_entries;
+  for (const ResidualOrdinal& ordinal : view.residual_ordinals) {
+    if (ordinal.kind != ResidualKind::kVisual) continue;
+    const HostBaObservationSlot& observation = observations[ordinal.source_slot];
+    const int32_t pose = pose_by_image_slot[observation.image_slot];
+    const int32_t point = point_by_point_slot[observation.point_slot];
+    const uint32_t visual_index =
+        bundle.visual_output_by_execution_ordinal[ordinal.execution_ordinal];
+    if (pose >= 0) pose_entries[pose].push_back(visual_index);
+    if (pose >= 0 && point >= 0) {
+      edge_entries[{static_cast<uint32_t>(pose),
+                    static_cast<uint32_t>(point)}].push_back(visual_index);
+    }
+  }
+  for (const DeviceCostEntry& entry : bundle.cost_layout.entries) {
+    uint64_t point_id = 0;
+    if (entry.residual_kind == 0) {
+      point_id = bundle.packed.visual[entry.output_index].point3D_id;
+    } else {
+      point_id = bundle.packed.lidar[entry.output_index].point3D_id;
+    }
+    const HostBaPointSlot* graph_point = view.catalog.FindPointById(point_id);
+    if (graph_point == nullptr || graph_point->header.slot >=
+                                      point_by_point_slot.size()) {
+      *error = "native point adjacency references a missing point";
+      return false;
+    }
+    const int32_t point = point_by_point_slot[graph_point->header.slot];
+    if (point >= 0) {
+      DevicePointAdjacency adjacency;
+      adjacency.residual_kind = entry.residual_kind;
+      adjacency.residual_index = entry.output_index;
+      point_entries[point].push_back(adjacency);
+    }
+  }
+  for (size_t i = 0; i < topology.poses.size(); ++i) {
+    topology.poses[i].adjacency_begin = topology.pose_adjacency.size();
+    topology.pose_adjacency.insert(topology.pose_adjacency.end(),
+                                   pose_entries[i].begin(), pose_entries[i].end());
+    topology.poses[i].adjacency_end = topology.pose_adjacency.size();
+  }
+  for (size_t i = 0; i < topology.points.size(); ++i) {
+    topology.points[i].adjacency_begin = topology.point_adjacency.size();
+    topology.point_adjacency.insert(topology.point_adjacency.end(),
+                                    point_entries[i].begin(), point_entries[i].end());
+    topology.points[i].adjacency_end = topology.point_adjacency.size();
+  }
+  for (const auto& item : edge_entries) {
+    DeviceEdgeMeta edge;
+    edge.pose_index = item.first.first;
+    edge.point_index = item.first.second;
+    edge.pose_dimension = topology.poses[edge.pose_index].dimension;
+    edge.adjacency_begin = topology.edge_adjacency.size();
+    topology.edge_adjacency.insert(topology.edge_adjacency.end(),
+                                   item.second.begin(), item.second.end());
+    edge.adjacency_end = topology.edge_adjacency.size();
+    topology.edges.push_back(edge);
+  }
+  if (!BuildLayerBObservationExecutionPlan(
+          bundle.packed.visual, bundle.packed.lidar,
+          view.config.hessian_backend, view.config.hessian_segment_size,
+          &topology, error)) {
+    return false;
+  }
+  bundle.layer_b_topology = std::move(topology);
+  bundle.runtime.real_pose_adjacency_entries =
+      bundle.layer_b_topology.pose_adjacency.size();
+  bundle.runtime.real_point_adjacency_entries =
+      bundle.layer_b_topology.point_adjacency.size();
+  bundle.runtime.real_edge_adjacency_entries =
+      bundle.layer_b_topology.edge_adjacency.size();
+  ++bundle.runtime.build_layer_b_topology_calls;
+  bundle.layer_b_ready = true;
+  return true;
+}
+
+bool BuildLayerCTopology(const NativeHostSolveView& view,
+                         LegacyKernelInputBundle* output,
+                         std::string* error) {
+  if (output == nullptr || output->impl_ == nullptr || error == nullptr)
+    return false;
+  LegacyKernelInputBundle::Impl& bundle = *output->impl_;
+  if (!bundle.layer_b_ready || !NativeBundleIdentityReady(view, bundle, error))
+    return false;
+  LayerCTopology topology;
+  if (!BuildLayerCTopology(bundle.layer_b_topology,
+                           view.config.pair_chunk_limit_bytes, &topology,
+                           error) ||
+      (view.config.schur_backend ==
+           CudaSchurContributionBackend::kSegmentedTransformed &&
+       !BuildLayerCSegmentPlan(view.config.schur_segment_size, &topology,
+                               error))) {
+    return false;
+  }
+  bundle.layer_c_topology = std::move(topology);
+  bundle.runtime.real_schur_pair_contributions =
+      bundle.layer_c_topology.pair_contributions.size();
+  ++bundle.runtime.build_layer_c_topology_calls;
+  bundle.layer_c_ready = true;
+  return true;
+}
+
+bool BuildLegacyKernelInputBundle(const NativeHostSolveView& view,
+                                  const ActiveStateBuffer& state,
+                                  LegacyKernelInputBundle* output,
+                                  std::string* error) {
+  if (output == nullptr || output->impl_ == nullptr || error == nullptr)
+    return false;
+  if (!BuildCudaLayerAInputs(view, state, output, error)) return false;
+  ++output->impl_->runtime.legacy_kernel_input_bundle_calls;
+  return BuildStaticLayout(view, state, output, error) &&
+         BuildCostLayout(view, output, error) &&
+         BuildLayerBTopology(view, output, error) &&
+         BuildLayerCTopology(view, output, error);
+}
+
+bool CopyActiveStateForTesting(const NativeHostSolveView& view,
+                               const ActiveStateBuffer& state,
+                               DenseActiveState* output,
+                               std::string* error) {
+  if (output == nullptr || error == nullptr ||
+      !ValidateNativeHostSolveView(view, state, error)) {
+    return false;
+  }
+  output->owner_epoch = state.owner_epoch;
+  output->state_generation = state.state_generation;
+  output->cameras = state.cameras;
+  output->images = state.images;
+  output->points = state.points;
+  return true;
+}
+
 namespace {
 
 class GpuBaSolveContext {
@@ -9670,6 +10268,58 @@ class GpuBaSolveContext {
   void SetArithmeticPrecisionForSolve(
       const CudaArithmeticPrecision precision) noexcept {
     arithmetic_precision_ = precision;
+  }
+
+  bool InitializeNative(
+      const NativeHostSolveView& view,
+      const ActiveStateBuffer& state,
+      const LegacyKernelInputBundle::Impl& native,
+      const CudaLayerBOptions& options,
+      const uint64_t solve_generation,
+      const HotKernelImplementation hot_kernel_implementation,
+      CudaFullLmRuntimeInfo* runtime,
+      std::string* error) {
+    if (initialized_ || error == nullptr || runtime == nullptr ||
+        !native.layer_a_ready || !native.static_layout_ready ||
+        !native.cost_layout_ready || !native.layer_b_ready ||
+        !native.layer_c_ready || !native.identity_valid ||
+        !SameNativeIdentity(native.identity, view.identity) ||
+        !ValidateNativeHostSolveView(view, state, error)) {
+      if (error != nullptr && error->empty())
+        *error = "native GpuBaSolveContext initialization is invalid";
+      return false;
+    }
+    solve_generation_ = solve_generation == 0 ? 1 : solve_generation;
+    backend_ = CudaDeviceContextBackend::kDeviceControl;
+    execution_profile_ = view.config.execution_profile;
+    audit_mirror_enabled_ = false;
+    audit_runtime_ = runtime;
+    residual_order_ = view.config.residual_order;
+    loss_mode_ = view.config.loss_mode;
+    loss_scale_ = loss_mode_ == CudaLossMode::kTrivial
+        ? 1.0 : view.config.loss_scale;
+    arithmetic_precision_ = view.config.arithmetic_precision;
+    native_hessian_backend_ = view.config.hessian_backend;
+    borrowed_native_ = &native;
+    topology_generation_ = NextMathematicalGeneration();
+    packed_state_.topology_generation = topology_generation_;
+    packed_state_.config_generation = 0;
+    packed_state_.layout_id = native.cost_layout.layout_id;
+    device_context_.reset(new GpuBaDeviceContext());
+    if (!device_context_->InitializeNative(
+            view, state, native, options, solve_generation_,
+            topology_generation_, hot_kernel_implementation,
+            view.config.hessian_backend, view.config.schur_backend,
+            view.config.arithmetic_precision, view.config.execution_profile,
+            runtime, error)) {
+      device_context_.reset();
+      borrowed_native_ = nullptr;
+      return false;
+    }
+    has_layer_c_topology_ = true;
+    prepared_initial_available_ = true;
+    initialized_ = true;
+    return true;
   }
 
   bool SetIndexedCatalogForSolve(
@@ -10191,6 +10841,20 @@ class GpuBaSolveContext {
     return true;
   }
 
+  bool ValidateNativeLayerBOptions(const CudaLayerBOptions& options,
+                                   std::string* error) const {
+    if (borrowed_native_ == nullptr ||
+        options.layer_a.residual_order != residual_order_ ||
+        options.loss_mode != loss_mode_ ||
+        (loss_mode_ != CudaLossMode::kTrivial &&
+         options.loss_scale != loss_scale_) ||
+        options.hessian_assembly_backend != native_hessian_backend_) {
+      if (error != nullptr) *error = "CURRENT_LINEARIZATION_IDENTITY_MISMATCH";
+      return false;
+    }
+    return true;
+  }
+
   bool ValidateDeviceStateHostMirror(const Snapshot& snapshot,
                                      std::string* error) const {
     if (!ValidateStaticState(snapshot, error)) return false;
@@ -10300,16 +10964,19 @@ class GpuBaSolveContext {
         ? image_indices_ : borrowed_prepared_host_->image_indices;
   }
   const CostLayout& CostLayoutRef() const {
+    if (borrowed_native_ != nullptr) return borrowed_native_->cost_layout;
     return borrowed_prepared_host_ == nullptr
-        ? cost_layout_ : borrowed_prepared_host_->cost_layout;
+               ? cost_layout_ : borrowed_prepared_host_->cost_layout;
   }
   const LayerBTopology& LayerBTopologyRef() const {
+    if (borrowed_native_ != nullptr) return borrowed_native_->layer_b_topology;
     return borrowed_prepared_host_ == nullptr
-        ? layer_b_topology_ : borrowed_prepared_host_->layer_b_topology;
+               ? layer_b_topology_ : borrowed_prepared_host_->layer_b_topology;
   }
   const LayerCTopology& LayerCTopologyRef() const {
+    if (borrowed_native_ != nullptr) return borrowed_native_->layer_c_topology;
     return borrowed_prepared_host_ == nullptr
-        ? layer_c_topology_ : *borrowed_prepared_host_->layer_c_topology;
+               ? layer_c_topology_ : *borrowed_prepared_host_->layer_c_topology;
   }
 
   bool BuildStaticLayout(const Snapshot& snapshot, std::string* error) {
@@ -10615,6 +11282,9 @@ class GpuBaSolveContext {
   // Non-owning immutable borrow. PreparedHostSolveView owns the shared data
   // for the complete synchronous RunCustomCudaSolve call.
   const PreparedHostSolveViewData* borrowed_prepared_host_ = nullptr;
+  const LegacyKernelInputBundle::Impl* borrowed_native_ = nullptr;
+  CudaHessianAssemblyBackend native_hessian_backend_ =
+      CudaHessianAssemblyBackend::kCompatibilityDefault;
   std::vector<CameraStaticLayoutEntry> camera_layout_;
   std::vector<std::vector<double>> camera_parameters_;
   std::vector<ImageStaticLayoutEntry> image_layout_;
@@ -10640,6 +11310,224 @@ static_assert(!std::is_copy_constructible<GpuBaSolveContext>::value,
               "GpuBaSolveContext must remain solve-owned and non-copyable");
 static_assert(!std::is_copy_assignable<GpuBaSolveContext>::value,
               "GpuBaSolveContext must remain solve-owned and non-copyable");
+
+namespace {
+
+bool SameNativeCostLayout(const CostLayout& lhs, const CostLayout& rhs) {
+  if (lhs.residual_order != rhs.residual_order ||
+      lhs.visual_count != rhs.visual_count ||
+      lhs.lidar_count != rhs.lidar_count ||
+      lhs.entries.size() != rhs.entries.size()) {
+    return false;
+  }
+  for (size_t i = 0; i < lhs.entries.size(); ++i) {
+    if (lhs.entries[i].residual_kind != rhs.entries[i].residual_kind ||
+        lhs.entries[i].output_index != rhs.entries[i].output_index) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool SameNativeLayerB(const LayerBTopology& lhs,
+                      const LayerBTopology& rhs) {
+  if (lhs.poses.size() != rhs.poses.size() ||
+      lhs.points.size() != rhs.points.size() ||
+      lhs.edges.size() != rhs.edges.size() ||
+      lhs.pose_adjacency != rhs.pose_adjacency ||
+      lhs.edge_adjacency != rhs.edge_adjacency ||
+      lhs.point_adjacency.size() != rhs.point_adjacency.size()) {
+    return false;
+  }
+  for (size_t i = 0; i < lhs.poses.size(); ++i) {
+    const DevicePoseMeta& a = lhs.poses[i];
+    const DevicePoseMeta& b = rhs.poses[i];
+    if (a.image_id != b.image_id || a.dimension != b.dimension ||
+        a.adjacency_begin != b.adjacency_begin ||
+        a.adjacency_end != b.adjacency_end ||
+        !std::equal(std::begin(a.free_translation_indices),
+                    std::end(a.free_translation_indices),
+                    std::begin(b.free_translation_indices))) {
+      return false;
+    }
+  }
+  for (size_t i = 0; i < lhs.points.size(); ++i) {
+    if (lhs.points[i].point3D_id != rhs.points[i].point3D_id ||
+        lhs.points[i].adjacency_begin != rhs.points[i].adjacency_begin ||
+        lhs.points[i].adjacency_end != rhs.points[i].adjacency_end) {
+      return false;
+    }
+  }
+  for (size_t i = 0; i < lhs.edges.size(); ++i) {
+    const DeviceEdgeMeta& a = lhs.edges[i];
+    const DeviceEdgeMeta& b = rhs.edges[i];
+    if (a.pose_index != b.pose_index || a.point_index != b.point_index ||
+        a.pose_dimension != b.pose_dimension ||
+        a.adjacency_begin != b.adjacency_begin ||
+        a.adjacency_end != b.adjacency_end) {
+      return false;
+    }
+  }
+  for (size_t i = 0; i < lhs.point_adjacency.size(); ++i) {
+    if (lhs.point_adjacency[i].residual_kind !=
+            rhs.point_adjacency[i].residual_kind ||
+        lhs.point_adjacency[i].residual_index !=
+            rhs.point_adjacency[i].residual_index) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool SameNativeLayerC(const LayerCTopology& lhs,
+                      const LayerCTopology& rhs) {
+  if (lhs.pose_dimension != rhs.pose_dimension ||
+      lhs.poses.size() != rhs.poses.size() ||
+      lhs.points.size() != rhs.points.size() ||
+      lhs.pose_edges != rhs.pose_edges || lhs.point_edges != rhs.point_edges ||
+      lhs.pairs.size() != rhs.pairs.size() ||
+      lhs.pair_contributions.size() != rhs.pair_contributions.size()) {
+    return false;
+  }
+  for (size_t i = 0; i < lhs.poses.size(); ++i) {
+    if (lhs.poses[i].offset != rhs.poses[i].offset ||
+        lhs.poses[i].dimension != rhs.poses[i].dimension ||
+        lhs.poses[i].edge_begin != rhs.poses[i].edge_begin ||
+        lhs.poses[i].edge_end != rhs.poses[i].edge_end) return false;
+  }
+  for (size_t i = 0; i < lhs.points.size(); ++i) {
+    if (lhs.points[i].edge_begin != rhs.points[i].edge_begin ||
+        lhs.points[i].edge_end != rhs.points[i].edge_end) return false;
+  }
+  for (size_t i = 0; i < lhs.pairs.size(); ++i) {
+    const DevicePairMeta& a = lhs.pairs[i];
+    const DevicePairMeta& b = rhs.pairs[i];
+    if (a.lhs_pose != b.lhs_pose || a.rhs_pose != b.rhs_pose ||
+        a.adjacency_begin != b.adjacency_begin ||
+        a.adjacency_end != b.adjacency_end) return false;
+  }
+  for (size_t i = 0; i < lhs.pair_contributions.size(); ++i) {
+    const DevicePairContribution& a = lhs.pair_contributions[i];
+    const DevicePairContribution& b = rhs.pair_contributions[i];
+    if (a.point_index != b.point_index || a.lhs_edge != b.lhs_edge ||
+        a.rhs_edge != b.rhs_edge) return false;
+  }
+  return true;
+}
+
+}  // namespace
+
+}  // namespace
+
+bool CompareNativePreparationToLegacyForTesting(
+    const Snapshot& legacy,
+    const NativeHostSolveView& native_view,
+    const ActiveStateBuffer& native_state,
+    const CudaLayerBOptions& options,
+    const uint64_t pair_chunk_limit_bytes,
+    const CudaHotKernelMode hot_kernel_mode,
+    const CudaSchurContributionBackend schur_backend,
+    const uint32_t schur_segment_size,
+    NativePreparationComparisonResult* result,
+    std::string* error) {
+  if (result == nullptr || error == nullptr) return false;
+  *result = NativePreparationComparisonResult();
+  LegacyKernelInputBundle native;
+  if (!BuildLegacyKernelInputBundle(native_view, native_state, &native,
+                                    error)) return false;
+  HotKernelImplementation hot = HotKernelImplementation::kReference;
+  if (!ResolveHotKernelImplementation(hot_kernel_mode, false, true, &hot,
+                                      error)) return false;
+  GpuBaSolveContext legacy_context;
+  legacy_context.SetArithmeticPrecisionForSolve(
+      native_view.config.arithmetic_precision);
+  if (!legacy_context.Initialize(
+          legacy, options, pair_chunk_limit_bytes, 1, true,
+          CudaDeviceContextBackend::kLegacy, hot, schur_backend,
+          schur_segment_size, native_view.config.execution_profile, false,
+          nullptr, error)) {
+    return false;
+  }
+  const PackedLayerAState* legacy_packed = nullptr;
+  if (!legacy_context.AcquirePackedState(legacy, true, &legacy_packed, error))
+    return false;
+  const CostLayout& legacy_cost = legacy_context.cost_layout();
+  const LayerBTopology& legacy_b = legacy_context.BorrowLayerBTopology();
+  const LayerCTopology& legacy_c = legacy_context.BorrowLayerCTopology();
+  const LegacyKernelInputBundle::Impl& candidate = *native.impl_;
+  result->visual_count = candidate.packed.visual.size();
+  result->lidar_count = candidate.packed.lidar.size();
+  result->cost_entry_count = candidate.cost_layout.entries.size();
+  result->pose_adjacency_count = candidate.layer_b_topology.pose_adjacency.size();
+  result->point_adjacency_count =
+      candidate.layer_b_topology.point_adjacency.size();
+  result->edge_adjacency_count = candidate.layer_b_topology.edge_adjacency.size();
+  result->pair_contribution_count =
+      candidate.layer_c_topology.pair_contributions.size();
+  std::vector<uint8_t> sources(native_view.residual_ordinals.size(), 0);
+  result->source_indices_dense = true;
+  for (const CudaVisualInput& value : candidate.packed.visual) {
+    if (value.source_index >= sources.size() || sources[value.source_index]++)
+      result->source_indices_dense = false;
+  }
+  for (const CudaLidarInput& value : candidate.packed.lidar) {
+    if (value.source_index >= sources.size() || sources[value.source_index]++)
+      result->source_indices_dense = false;
+  }
+  result->source_indices_dense = result->source_indices_dense &&
+      std::all_of(sources.begin(), sources.end(),
+                  [](const uint8_t value) { return value == 1; });
+  result->cost_entries_exact = SameNativeCostLayout(
+      legacy_cost, candidate.cost_layout);
+  result->layer_b_exact = SameNativeLayerB(legacy_b,
+                                           candidate.layer_b_topology);
+  result->layer_c_exact = SameNativeLayerC(legacy_c,
+                                           candidate.layer_c_topology);
+  if (legacy_packed->visual.size() != candidate.packed.visual.size() ||
+      legacy_packed->lidar.size() != candidate.packed.lidar.size() ||
+      !result->source_indices_dense || !result->cost_entries_exact ||
+      !result->layer_b_exact || !result->layer_c_exact) {
+    *error = "native and legacy production preparation differ";
+    return false;
+  }
+  for (size_t i = 0; i < legacy_packed->visual.size(); ++i) {
+    const CudaVisualInput& a = legacy_packed->visual[i];
+    const CudaVisualInput& b = candidate.packed.visual[i];
+    if (a.source_index != b.source_index || a.image_id != b.image_id ||
+        a.point3D_id != b.point3D_id ||
+        !std::equal(std::begin(a.quaternion), std::end(a.quaternion),
+                    std::begin(b.quaternion)) ||
+        !std::equal(std::begin(a.translation), std::end(a.translation),
+                    std::begin(b.translation)) ||
+        !std::equal(std::begin(a.point), std::end(a.point),
+                    std::begin(b.point)) ||
+        !std::equal(std::begin(a.camera), std::end(a.camera),
+                    std::begin(b.camera)) ||
+        !std::equal(std::begin(a.observation), std::end(a.observation),
+                    std::begin(b.observation))) {
+      *error = "native visual packed input differs from legacy";
+      return false;
+    }
+  }
+  for (size_t i = 0; i < legacy_packed->lidar.size(); ++i) {
+    const CudaLidarInput& a = legacy_packed->lidar[i];
+    const CudaLidarInput& b = candidate.packed.lidar[i];
+    if (a.source_index != b.source_index ||
+        a.point3D_id != b.point3D_id || a.weight != b.weight ||
+        a.mode != b.mode ||
+        a.near_zero_threshold != b.near_zero_threshold ||
+        !std::equal(std::begin(a.point), std::end(a.point),
+                    std::begin(b.point)) ||
+        !std::equal(std::begin(a.plane), std::end(a.plane),
+                    std::begin(b.plane))) {
+      *error = "native LiDAR packed input differs from legacy";
+      return false;
+    }
+  }
+  return true;
+}
+
+namespace {
 
 template <typename T>
 bool GpuBaDeviceContext::AllocatePersistent(T** pointer,
@@ -10854,6 +11742,68 @@ bool GpuBaDeviceContext::Initialize(
     const MapperStaticCatalogStableTables* indexed_catalog,
     CudaFullLmRuntimeInfo* runtime,
     std::string* error) {
+  return InitializeImpl(
+      &initial_snapshot, nullptr, nullptr, nullptr, initial, cost_layout,
+      layer_b, layer_c, options, solve_generation, topology_generation,
+      device_state_enabled, device_control_enabled, hot_kernel_implementation,
+      hessian_assembly_backend, schur_contribution_backend,
+      arithmetic_precision, execution_profile, audit_mirror_enabled,
+      indexed_catalog, runtime, error);
+}
+
+bool GpuBaDeviceContext::InitializeNative(
+    const NativeHostSolveView& view,
+    const ActiveStateBuffer& initial_state,
+    const LegacyKernelInputBundle::Impl& native,
+    const CudaLayerBOptions& options,
+    const uint64_t solve_generation,
+    const uint64_t topology_generation,
+    const HotKernelImplementation hot_kernel_implementation,
+    const CudaHessianAssemblyBackend hessian_assembly_backend,
+    const CudaSchurContributionBackend schur_contribution_backend,
+    const CudaArithmeticPrecision arithmetic_precision,
+    const CudaExecutionProfile execution_profile,
+    CudaFullLmRuntimeInfo* runtime,
+    std::string* error) {
+  return InitializeImpl(
+      nullptr, &view, &initial_state, &native, native.packed,
+      native.cost_layout, native.layer_b_topology, native.layer_c_topology,
+      options, solve_generation, topology_generation, true, true,
+      hot_kernel_implementation, hessian_assembly_backend,
+      schur_contribution_backend, arithmetic_precision, execution_profile,
+      false, nullptr, runtime, error);
+}
+
+bool GpuBaDeviceContext::InitializeImpl(
+    const Snapshot* legacy_initial_snapshot,
+    const NativeHostSolveView* native_view,
+    const ActiveStateBuffer* native_initial_state,
+    const LegacyKernelInputBundle::Impl* native,
+    const PackedLayerAState& initial,
+    const CostLayout& cost_layout,
+    const LayerBTopology& layer_b,
+    const LayerCTopology& layer_c,
+    const CudaLayerBOptions& options,
+    const uint64_t solve_generation,
+    const uint64_t topology_generation,
+    const bool device_state_enabled,
+    const bool device_control_enabled,
+    const HotKernelImplementation hot_kernel_implementation,
+    const CudaHessianAssemblyBackend hessian_assembly_backend,
+    const CudaSchurContributionBackend schur_contribution_backend,
+    const CudaArithmeticPrecision arithmetic_precision,
+    const CudaExecutionProfile execution_profile,
+    const bool audit_mirror_enabled,
+    const MapperStaticCatalogStableTables* indexed_catalog,
+    CudaFullLmRuntimeInfo* runtime,
+    std::string* error) {
+  const bool native_initialization = native != nullptr;
+  if (native_initialization != (native_view != nullptr) ||
+      native_initialization != (native_initial_state != nullptr) ||
+      native_initialization == (legacy_initial_snapshot != nullptr)) {
+    if (error != nullptr) *error = "persistent initial-state adapter is invalid";
+    return false;
+  }
   if (initialized_ || initializing_ || runtime == nullptr || error == nullptr) {
     if (error != nullptr) *error = "persistent device context init is invalid";
     return false;
@@ -11070,9 +12020,12 @@ bool GpuBaDeviceContext::Initialize(
             sizeof(DeviceAssemblyTargetRange);
   }
   cost_count_ = cost_layout.entries.size();
-  image_entity_count_ = initial_snapshot.images.size();
-  point_entity_count_ = initial_snapshot.points.size();
-  camera_entity_count_ = initial_snapshot.cameras.size();
+  image_entity_count_ = native_initialization
+      ? native->image_slots.size() : legacy_initial_snapshot->images.size();
+  point_entity_count_ = native_initialization
+      ? native->point_slots.size() : legacy_initial_snapshot->points.size();
+  camera_entity_count_ = native_initialization
+      ? native->camera_slots.size() : legacy_initial_snapshot->cameras.size();
   gradient_slots_ = pose_count_ + point_count_;
   pose_dimension_ = layer_c.pose_dimension;
   schur_elements_ = pose_dimension_ * pose_dimension_;
@@ -11657,41 +12610,117 @@ bool GpuBaDeviceContext::Initialize(
   std::unordered_map<uint32_t, uint32_t> image_indices;
   std::unordered_map<uint64_t, uint32_t> point_indices;
   std::unordered_map<uint32_t, uint32_t> camera_indices;
-  for (size_t i = 0; i < image_entity_count_; ++i) {
-    const ImageSnapshot& image = initial_snapshot.images[i];
-    if (!image_indices.emplace(image.image_id, static_cast<uint32_t>(i)).second) {
-      *error = "device-state layout contains a duplicate image id";
+  if (!native_initialization) {
+    for (size_t i = 0; i < image_entity_count_; ++i) {
+      const ImageSnapshot& image = legacy_initial_snapshot->images[i];
+      if (!image_indices.emplace(image.image_id, static_cast<uint32_t>(i)).second) {
+        *error = "device-state layout contains a duplicate image id";
+        initializing_ = false;
+        Close(nullptr);
+        return false;
+      }
+      for (size_t j = 0; j < 4; ++j)
+        host_image_entities_[i].quaternion[j] = image.qvec[j];
+      for (size_t j = 0; j < 3; ++j)
+        host_image_entities_[i].translation[j] = image.tvec[j];
+    }
+    for (size_t i = 0; i < point_entity_count_; ++i) {
+      const PointSnapshot& point = legacy_initial_snapshot->points[i];
+      if (!point_indices.emplace(point.point3D_id,
+                                 static_cast<uint32_t>(i)).second) {
+        *error = "device-state layout contains a duplicate point id";
+        initializing_ = false;
+        Close(nullptr);
+        return false;
+      }
+      for (size_t j = 0; j < 3; ++j)
+        host_point_entities_[i].xyz[j] = point.xyz[j];
+    }
+    for (size_t i = 0; i < camera_entity_count_; ++i) {
+      const CameraSnapshot& camera = legacy_initial_snapshot->cameras[i];
+      if (!camera_indices.emplace(camera.camera_id,
+                                  static_cast<uint32_t>(i)).second ||
+          camera.model_id != kOpenCvcCameraModelId || camera.params.size() != 8) {
+        *error = "device-state layout requires unique 8-parameter OPENCV cameras";
+        initializing_ = false;
+        Close(nullptr);
+        return false;
+      }
+      for (size_t j = 0; j < 8; ++j)
+        host_camera_entities_[i].params[j] = camera.params[j];
+    }
+  } else {
+    const auto graph_cameras = native_view->catalog.cameras();
+    const auto graph_images = native_view->catalog.images();
+    const auto graph_points = native_view->catalog.points();
+    std::unordered_map<uint32_t, const DenseCameraState*> camera_state;
+    std::unordered_map<uint32_t, const DenseImageState*> image_state;
+    std::unordered_map<uint32_t, const DensePointState*> point_state;
+    if (!BuildNativeStateLookup(native_initial_state->cameras,
+                                native_initial_state->state_generation,
+                                &camera_state, error) ||
+        !BuildNativeStateLookup(native_initial_state->images,
+                                native_initial_state->state_generation,
+                                &image_state, error) ||
+        !BuildNativeStateLookup(native_initial_state->points,
+                                native_initial_state->state_generation,
+                                &point_state, error)) {
       initializing_ = false;
       Close(nullptr);
       return false;
     }
-    for (size_t j = 0; j < 4; ++j)
-      host_image_entities_[i].quaternion[j] = image.qvec[j];
-    for (size_t j = 0; j < 3; ++j)
-      host_image_entities_[i].translation[j] = image.tvec[j];
-  }
-  for (size_t i = 0; i < point_entity_count_; ++i) {
-    const PointSnapshot& point = initial_snapshot.points[i];
-    if (!point_indices.emplace(point.point3D_id, static_cast<uint32_t>(i)).second) {
-      *error = "device-state layout contains a duplicate point id";
-      initializing_ = false;
-      Close(nullptr);
-      return false;
+    native_camera_slots_ = native->camera_slots;
+    native_image_slots_ = native->image_slots;
+    native_point_slots_ = native->point_slots;
+    for (size_t i = 0; i < native_image_slots_.size(); ++i) {
+      const uint32_t slot = native_image_slots_[i];
+      const auto state = image_state.find(slot);
+      if (slot >= graph_images.size || state == image_state.end() ||
+          !image_indices.emplace(graph_images[slot].image_id,
+                                 static_cast<uint32_t>(i)).second) {
+        *error = "native device image entity layout is invalid";
+        initializing_ = false;
+        Close(nullptr);
+        return false;
+      }
+      std::copy(state->second->quaternion.begin(),
+                state->second->quaternion.end(),
+                host_image_entities_[i].quaternion);
+      std::copy(state->second->translation.begin(),
+                state->second->translation.end(),
+                host_image_entities_[i].translation);
     }
-    for (size_t j = 0; j < 3; ++j)
-      host_point_entities_[i].xyz[j] = point.xyz[j];
-  }
-  for (size_t i = 0; i < camera_entity_count_; ++i) {
-    const CameraSnapshot& camera = initial_snapshot.cameras[i];
-    if (!camera_indices.emplace(camera.camera_id, static_cast<uint32_t>(i)).second ||
-        camera.model_id != kOpenCvcCameraModelId || camera.params.size() != 8) {
-      *error = "device-state layout requires unique 8-parameter OPENCV cameras";
-      initializing_ = false;
-      Close(nullptr);
-      return false;
+    for (size_t i = 0; i < native_point_slots_.size(); ++i) {
+      const uint32_t slot = native_point_slots_[i];
+      const auto state = point_state.find(slot);
+      if (slot >= graph_points.size || state == point_state.end() ||
+          !point_indices.emplace(graph_points[slot].point3D_id,
+                                 static_cast<uint32_t>(i)).second) {
+        *error = "native device point entity layout is invalid";
+        initializing_ = false;
+        Close(nullptr);
+        return false;
+      }
+      std::copy(state->second->xyz.begin(), state->second->xyz.end(),
+                host_point_entities_[i].xyz);
     }
-    for (size_t j = 0; j < 8; ++j)
-      host_camera_entities_[i].params[j] = camera.params[j];
+    for (size_t i = 0; i < native_camera_slots_.size(); ++i) {
+      const uint32_t slot = native_camera_slots_[i];
+      const auto state = camera_state.find(slot);
+      if (slot >= graph_cameras.size || state == camera_state.end() ||
+          graph_cameras[slot].model_id != kOpenCvcCameraModelId ||
+          state->second->parameters.size() != 8 ||
+          !camera_indices.emplace(graph_cameras[slot].camera_id,
+                                  static_cast<uint32_t>(i)).second) {
+        *error = "native device camera entity layout is invalid";
+        initializing_ = false;
+        Close(nullptr);
+        return false;
+      }
+      std::copy(state->second->parameters.begin(),
+                state->second->parameters.end(),
+                host_camera_entities_[i].params);
+    }
   }
   for (size_t i = 0; i < visual_count_; ++i) {
     visual_static[i].source_index = initial.visual[i].source_index;
@@ -11705,8 +12734,12 @@ bool GpuBaDeviceContext::Initialize(
       Close(nullptr);
       return false;
     }
-    const auto camera_it = camera_indices.find(
-        initial_snapshot.images[image_it->second].camera_id);
+    const uint32_t camera_id = native_initialization
+        ? native_view->catalog.cameras()[
+              native->image_camera_slots[image_it->second]]
+              .camera_id
+        : legacy_initial_snapshot->images[image_it->second].camera_id;
+    const auto camera_it = camera_indices.find(camera_id);
     if (camera_it == camera_indices.end()) {
       *error = "device-state visual binding references a missing camera";
       initializing_ = false;
@@ -12779,6 +13812,42 @@ bool GpuBaDeviceContext::RunLayerBFromDeviceState(
         return false;
       }
     }
+  }
+  DeviceStateView state =
+      site == CudaFaultLogicalSite::kAcceptedPendingLinearization
+          ? TrialStateView(identity, error)
+          : CurrentStateView(identity, error);
+  if (!state.identity.valid) {
+    result->error = *error;
+    return false;
+  }
+  DeviceLayerAView layer_a;
+  if (!RunLayerAFromDeviceState(
+          state, options.layer_a, identity, 0,
+          PersistentSlotKind::kLayerAWorking, &layer_a,
+          &result->layer_a.runtime, error)) {
+    result->error = *error;
+    return false;
+  }
+  return AssembleLayerB(layer_a, &state, options, identity, site, loss_mode,
+                        loss_scale, result, token, error);
+}
+
+bool GpuBaDeviceContext::RunLayerBFromNativeDeviceState(
+    const CudaLayerBOptions& options,
+    const CudaLinearizationIdentity& identity,
+    const CudaFaultLogicalSite site,
+    const CudaLossMode loss_mode,
+    const double loss_scale,
+    CudaLayerBResult* result,
+    CudaDeviceLinearizationToken* token,
+    std::string* error) {
+  if (!device_state_enabled_ || result == nullptr || token == nullptr ||
+      error == nullptr || native_image_slots_.size() != image_entity_count_ ||
+      native_point_slots_.size() != point_entity_count_ ||
+      native_camera_slots_.size() != camera_entity_count_) {
+    if (error != nullptr) *error = "native device-state Layer B is invalid";
+    return false;
   }
   DeviceStateView state =
       site == CudaFaultLogicalSite::kAcceptedPendingLinearization
@@ -13930,11 +14999,36 @@ bool GpuBaDeviceContext::BuildDeviceTrialState(
     const bool materialize_host_state,
     Snapshot* trial,
     std::string* error) {
-  if (!device_state_enabled_ || !state_ready_ || trial == nullptr ||
-      error == nullptr || block_size <= 0 || block_size > 1024 ||
+  if (trial == nullptr ||
       host_current.images.size() != image_entity_count_ ||
       host_current.points.size() != point_entity_count_ ||
       host_current.cameras.size() != camera_entity_count_) {
+    if (error != nullptr) *error = "device-state trial preparation is invalid";
+    return false;
+  }
+  return BuildDeviceTrialStateImpl(current_identity, block_size,
+                                   materialize_host_state, trial,
+                                   &host_current, error);
+}
+
+bool GpuBaDeviceContext::BuildNativeDeviceTrialState(
+    const CudaLinearizationIdentity& current_identity,
+    const int block_size,
+    std::string* error) {
+  return BuildDeviceTrialStateImpl(current_identity, block_size, false,
+                                   nullptr, nullptr, error);
+}
+
+bool GpuBaDeviceContext::BuildDeviceTrialStateImpl(
+    const CudaLinearizationIdentity& current_identity,
+    const int block_size,
+    const bool materialize_host_state,
+    Snapshot* trial,
+    const Snapshot* host_current,
+    std::string* error) {
+  if (!device_state_enabled_ || !state_ready_ || error == nullptr ||
+      block_size <= 0 || block_size > 1024 ||
+      (materialize_host_state && (trial == nullptr || host_current == nullptr))) {
     if (error != nullptr) *error = "device-state trial preparation is invalid";
     return false;
   }
@@ -14039,7 +15133,7 @@ bool GpuBaDeviceContext::BuildDeviceTrialState(
     return false;
   }
   if (!materialize_host_state) return true;
-  *trial = host_current;
+  *trial = *host_current;
   for (size_t i = 0; i < image_entity_count_; ++i) {
     for (size_t j = 0; j < 4; ++j)
       trial->images[i].qvec[j] = host_image_entities_[i].quaternion[j];
@@ -14314,6 +15408,99 @@ bool GpuBaDeviceContext::MaterializeCurrentState(
   for (size_t i = 0; i < point_entity_count_; ++i) {
     for (size_t j = 0; j < 3; ++j)
       output->points[i].xyz[j] = host_point_entities_[i].xyz[j];
+  }
+  return true;
+}
+
+bool GpuBaDeviceContext::DownloadCurrentNativeState(
+    const NativeHostSolveView& view,
+    const ActiveStateBuffer& initial_state,
+    const CudaLinearizationIdentity& expected,
+    DenseActiveState* output,
+    std::string* error) {
+  if (!device_state_enabled_ || output == nullptr || error == nullptr ||
+      view.identity.owner_epoch != initial_state.owner_epoch ||
+      native_image_slots_.size() != image_entity_count_ ||
+      native_point_slots_.size() != point_entity_count_ ||
+      native_camera_slots_.size() != camera_entity_count_) {
+    if (error != nullptr) *error = "native final-state download is invalid";
+    return false;
+  }
+  const StateSlot& current = state_slots_[current_state_slot_];
+  if (!current.identity.valid ||
+      !SameLinearizationIdentity(current.identity.linearization, expected)) {
+    *error = "native current device state slot is invalid";
+    return false;
+  }
+  const auto download = [&](auto* source, auto* destination) {
+    if (destination->empty()) return true;
+    const uint64_t bytes = destination->size() * sizeof((*destination)[0]);
+    HostPhaseScope timing(CUDA_TIMING_PHASE(d2h_memcpy), bytes);
+    const cudaError_t status = cudaMemcpyAsync(
+        destination->data(), source, bytes, cudaMemcpyDeviceToHost, stream_);
+    if (status != cudaSuccess) return false;
+    ++runtime_->persistent_device.final_entity_state_d2h_calls;
+    runtime_->persistent_device.final_entity_state_d2h_bytes = SaturatingAdd(
+        runtime_->persistent_device.final_entity_state_d2h_bytes, bytes);
+    ++runtime_->persistent_device.final_state_d2h_calls;
+    runtime_->persistent_device.final_state_d2h_bytes = SaturatingAdd(
+        runtime_->persistent_device.final_state_d2h_bytes, bytes);
+    return true;
+  };
+  ++runtime_->persistent_device.final_state_materialization_operations;
+  if (!download(current.images, &host_image_entities_) ||
+      !download(current.points, &host_point_entities_) ||
+      !Synchronize(CudaSyncSite::kLayerCFinal, error)) {
+    if (error->empty()) *error = "native final-state download failed";
+    return false;
+  }
+  std::unordered_map<uint32_t, const DenseCameraState*> initial_cameras;
+  if (!BuildNativeStateLookup(initial_state.cameras,
+                              initial_state.state_generation,
+                              &initial_cameras, error)) {
+    return false;
+  }
+  *output = DenseActiveState();
+  output->owner_epoch = initial_state.owner_epoch;
+  if (expected.state_epoch >
+      std::numeric_limits<uint64_t>::max() - initial_state.state_generation) {
+    *error = "native final state generation overflow";
+    return false;
+  }
+  output->state_generation =
+      initial_state.state_generation + expected.state_epoch;
+  output->cameras.reserve(native_camera_slots_.size());
+  for (const uint32_t slot : native_camera_slots_) {
+    const auto found = initial_cameras.find(slot);
+    if (found == initial_cameras.end()) {
+      *error = "native final state is missing fixed camera state";
+      return false;
+    }
+    DenseCameraState camera = *found->second;
+    camera.state_generation = output->state_generation;
+    output->cameras.push_back(std::move(camera));
+  }
+  output->images.reserve(native_image_slots_.size());
+  for (size_t i = 0; i < native_image_slots_.size(); ++i) {
+    DenseImageState image;
+    image.image_slot = native_image_slots_[i];
+    image.state_generation = output->state_generation;
+    std::copy(host_image_entities_[i].quaternion,
+              host_image_entities_[i].quaternion + 4,
+              image.quaternion.begin());
+    std::copy(host_image_entities_[i].translation,
+              host_image_entities_[i].translation + 3,
+              image.translation.begin());
+    output->images.push_back(image);
+  }
+  output->points.reserve(native_point_slots_.size());
+  for (size_t i = 0; i < native_point_slots_.size(); ++i) {
+    DensePointState point;
+    point.point_slot = native_point_slots_[i];
+    point.state_generation = output->state_generation;
+    std::copy(host_point_entities_[i].xyz,
+              host_point_entities_[i].xyz + 3, point.xyz.begin());
+    output->points.push_back(point);
   }
   return true;
 }
@@ -18311,6 +19498,42 @@ static bool RunCudaLayerBFromContext(GpuBaSolveContext* context,
   return true;
 }
 
+static bool RunCudaNativeLayerBFromContext(
+    GpuBaSolveContext* context,
+    const CudaLayerBOptions& options,
+    const CudaLinearizationIdentity& identity,
+    const CudaFaultLogicalSite site,
+    CudaLayerBResult* result,
+    CudaDeviceLinearizationToken* token,
+    std::string* error) {
+  if (context == nullptr || result == nullptr || token == nullptr ||
+      error == nullptr) {
+    return false;
+  }
+  *result = CudaLayerBResult();
+  InclusiveCallScope inclusive_call(CUDA_TIMING_PHASE(layer_b_call));
+  if (g_cuda_solve_call_counters != nullptr)
+    ++g_cuda_solve_call_counters->layer_b;
+  if (g_cuda_timing_sink != nullptr) ++g_cuda_timing_sink->layer_b_calls;
+  if (!std::isfinite(options.min_lm_diagonal) ||
+      !std::isfinite(options.max_lm_diagonal) ||
+      options.min_lm_diagonal <= 0.0 ||
+      options.max_lm_diagonal < options.min_lm_diagonal ||
+      !context->ValidateNativeLayerBOptions(options, error)) {
+    if (error->empty()) *error = "native Layer B options are invalid";
+    result->error = *error;
+    return false;
+  }
+  context->RecordDynamicRefresh();
+  if (!context->persistent_device()->RunLayerBFromNativeDeviceState(
+          options, identity, site, context->loss_mode(), context->loss_scale(),
+          result, token, error)) {
+    result->error = *error;
+    return false;
+  }
+  return result->success;
+}
+
 bool RunCudaSnapshotLayerB(const Snapshot& snapshot,
                            const CudaLayerBOptions& options,
                            CudaLayerBResult* result,
@@ -19207,6 +20430,59 @@ static bool RunCudaSnapshotLayerCFromLinearization(
                                   error);
 }
 
+static bool RunCudaNativeLayerCFromContext(
+    GpuBaSolveContext* context,
+    const CudaLayerCOptions& options,
+    const CudaLayerBResult& layer_b,
+    const CudaLinearizationIdentity& identity,
+    const CudaDeviceLinearizationToken& token,
+    CudaLayerCStepResult* result,
+    std::string* error) {
+  if (context == nullptr || result == nullptr || error == nullptr ||
+      !context->device_control_enabled() || context->audit_mirror_enabled() ||
+      !std::isfinite(options.lambda) || options.lambda < 0.0 || !token.valid) {
+    if (error != nullptr) *error = "native Layer C invocation is invalid";
+    return false;
+  }
+  *result = CudaLayerCStepResult();
+  InclusiveCallScope inclusive_call(CUDA_TIMING_PHASE(layer_c_call));
+  if (g_cuda_solve_call_counters != nullptr)
+    ++g_cuda_solve_call_counters->layer_c;
+  if (g_cuda_timing_sink != nullptr) ++g_cuda_timing_sink->layer_c_calls;
+  const LayerBTopology& layer_b_topology = context->BorrowLayerBTopology();
+  const LayerCTopology& layer_c_topology = context->BorrowLayerCTopology();
+  result->pose_dimension = layer_c_topology.pose_dimension;
+  result->point_dimension = layer_c_topology.points.size() * 3;
+  if (layer_c_topology.pose_dimension == 0) {
+    *error = "native Layer C requires at least one variable pose";
+    result->error = *error;
+    return false;
+  }
+  if (!context->persistent_device()->RunLayerCLinearSolve(
+          layer_b_topology, layer_c_topology, options, identity, token, layer_b,
+          result, error) ||
+      !context->persistent_device()->BuildNativeDeviceTrialState(
+          identity, options.layer_b.layer_a.block_size, error)) {
+    context->DiscardDeviceTrialState();
+    result->error = *error;
+    return false;
+  }
+  CudaLinearizationIdentity trial_identity = identity;
+  ++trial_identity.state_epoch;
+  if (!context->persistent_device()->RunDeviceTrialCost(
+          options.layer_b, trial_identity, context->loss_mode(),
+          context->loss_scale(), &result->trial_cost,
+          &result->runtime.trial_cost_kernel_milliseconds, error) ||
+      !context->persistent_device()->RunDeviceDiagnostics(
+          identity, token, options.lambda, result, error)) {
+    context->DiscardDeviceTrialState();
+    result->error = *error;
+    return false;
+  }
+  result->success = true;
+  return true;
+}
+
 bool RunCudaSnapshotLayerC(const Snapshot& snapshot,
                            const CudaLayerCOptions& options,
                            CudaLayerCResult* result,
@@ -19775,6 +21051,68 @@ class CurrentLinearizationController {
     }
   }
 
+  bool BuildNative(const CudaLinearizationIdentity& identity,
+                   const CudaLayerBOptions& options,
+                   const CudaFaultLogicalSite site,
+                   UndampedCurrentLinearization* output,
+                   std::string* error) {
+    if (!ValidateIdentity(identity)) {
+      *error = "CURRENT_LINEARIZATION_IDENTITY_MISMATCH";
+      return false;
+    }
+    ++runtime_->current_linearization_logical_requests;
+    const CudaFaultInjection before_lookup = faults_->Consume(
+        site, CudaFaultTriggerPhase::kBeforeCacheLookup, 0,
+        identity.state_epoch);
+    if (before_lookup != CudaFaultInjection::kNone) {
+      ++runtime_->current_linearization_lookup_aborts;
+      *error = "CURRENT_LINEARIZATION_LOOKUP_ABORTED";
+      return false;
+    }
+    ++runtime_->current_linearization_cache_lookups;
+    ++runtime_->current_linearization_cache_misses;
+    ++runtime_->current_linearization_build_attempts;
+    const CudaFaultInjection after_miss = faults_->Consume(
+        site, CudaFaultTriggerPhase::kAfterCacheMiss, 0,
+        identity.state_epoch);
+    if (after_miss != CudaFaultInjection::kNone) {
+      ++runtime_->current_linearization_build_failures;
+      *error = "CURRENT_LINEARIZATION_BUILD_ABORTED_AFTER_CACHE_MISS";
+      return false;
+    }
+    CudaLayerBResult layer_b;
+    CudaDeviceLinearizationToken device_token;
+    if (!RunCudaNativeLayerBFromContext(context_, options, identity, site,
+                                        &layer_b, &device_token, error)) {
+      ++runtime_->current_linearization_build_failures;
+      return false;
+    }
+    const CudaFaultInjection before_publish = faults_->Consume(
+        site, CudaFaultTriggerPhase::kAfterTopologyRefreshBeforePublish, 0,
+        identity.state_epoch);
+    if (before_publish != CudaFaultInjection::kNone) {
+      context_->DiscardPersistentBuild(site);
+      ++runtime_->current_linearization_build_failures;
+      *error = "ACCEPTED_PENDING_LINEARIZATION_FAILED";
+      return false;
+    }
+    if (!layer_b.success || !std::isfinite(layer_b.cost) ||
+        !std::isfinite(layer_b.projected_gradient_max_norm) ||
+        !std::isfinite(layer_b.scaled_gradient_max_norm) ||
+        identity.state_epoch >=
+            runtime_->current_linearization_builds_by_state_epoch.size()) {
+      ++runtime_->current_linearization_build_failures;
+      *error = "native current linearization validation failed";
+      return false;
+    }
+    ++runtime_->current_linearization_build_successes;
+    ++runtime_->current_linearization_builds_by_state_epoch[
+        identity.state_epoch];
+    *output = UndampedCurrentLinearization::Adopt(
+        identity, std::move(layer_b), device_token);
+    return true;
+  }
+
   void PublishInitial(UndampedCurrentLinearization&& value) noexcept {
     current_ = std::move(value);
     has_current_ = true;
@@ -19823,6 +21161,45 @@ class CurrentLinearizationController {
     if (!Build(snapshot, identity, options,
                CudaFaultLogicalSite::kCurrentTrialRecompute, temporary,
                error)) {
+      return false;
+    }
+    ++runtime_->current_linearization_temporary_builds;
+    ++runtime_->current_linearization_borrows;
+    runtime_->last_borrowed_layer_b_address = reinterpret_cast<uintptr_t>(
+        temporary->borrowed_layer_b_address());
+    *borrowed = temporary;
+    return true;
+  }
+
+  bool ResolveNative(const CudaLinearizationIdentity& identity,
+                     const CudaLayerBOptions& options,
+                     UndampedCurrentLinearization* temporary,
+                     const UndampedCurrentLinearization** borrowed,
+                     std::string* error) {
+    if (cache_enabled_) {
+      if (!ValidateIdentity(identity)) {
+        *error = "CURRENT_LINEARIZATION_IDENTITY_MISMATCH";
+        return false;
+      }
+      ++runtime_->current_linearization_logical_requests;
+      ++runtime_->current_linearization_cache_lookups;
+      if (!has_current_ || !current_.valid() ||
+          !SameLinearizationIdentity(current_.identity(), identity)) {
+        ++runtime_->current_linearization_cache_misses;
+        ++runtime_->current_linearization_invalidations;
+        *error = "CURRENT_LINEARIZATION_IDENTITY_MISMATCH";
+        return false;
+      }
+      ++runtime_->current_linearization_cache_hits;
+      ++runtime_->current_linearization_borrows;
+      runtime_->last_borrowed_layer_b_address = reinterpret_cast<uintptr_t>(
+          current_.borrowed_layer_b_address());
+      *borrowed = &current_;
+      return true;
+    }
+    if (!BuildNative(identity, options,
+                     CudaFaultLogicalSite::kCurrentTrialRecompute, temporary,
+                     error)) {
       return false;
     }
     ++runtime_->current_linearization_temporary_builds;
@@ -19974,15 +21351,59 @@ void CommitAcceptedState(PendingAcceptedState&& pending,
   result->trace.push_back(std::move(pending.prepared_iteration_trace));
 }
 
+void CommitAcceptedNativeState(
+    PendingAcceptedState&& pending,
+    GpuBaSolveContext* solve_context,
+    CurrentLinearizationController* linearizations,
+    CudaFullLmResult* result,
+    uint64_t* internal_state_epoch,
+    uint64_t* legacy_state_epoch,
+    CudaLinearizationIdentity* current_identity,
+    uint64_t* last_linearization_state_epoch,
+    bool* has_linearization,
+    uint64_t* linearization_id,
+    std::string* linearization_reason,
+    double* radius,
+    double* decrease_factor) noexcept {
+  const CudaLinearizationIdentity committed_identity =
+      pending.next_linearization.identity();
+  solve_context->CommitPersistentPending(std::move(pending.device_commit_token));
+  linearizations->CommitPending(std::move(pending.next_linearization));
+  *internal_state_epoch = pending.prepared_internal_state_epoch;
+  *legacy_state_epoch = pending.prepared_legacy_state_epoch;
+  *current_identity = committed_identity;
+  *last_linearization_state_epoch = pending.prepared_legacy_state_epoch;
+  *has_linearization = true;
+  *linearization_id = pending.prepared_linearization_id;
+  linearization_reason->swap(pending.prepared_linearization_reason);
+  *radius = pending.prepared_radius;
+  *decrease_factor = pending.prepared_decrease_factor;
+  ++result->accepted_steps;
+  ++result->accepted_commits;
+  result->trace.push_back(std::move(pending.prepared_iteration_trace));
+}
+
 }  // namespace
 
-bool RunCustomCudaSolveCore(const CudaSolveProblem& snapshot,
+bool RunCustomCudaSolveCore(const CudaSolveProblem* problem,
                             const Snapshot* legacy_snapshot,
+                            const NativeCudaSolveRequest* native_request,
+                            LegacyKernelInputBundle::Impl* native_bundle,
+                            BaSolveResult* native_result,
                             const CudaFullLmOptions& options,
                             CudaFullLmResult* result,
                             std::string* error) {
   CudaCacheCallScope cache_scope;
-  if (result == nullptr || error == nullptr) return false;
+  const bool native_mode = native_request != nullptr;
+  if (result == nullptr || error == nullptr ||
+      native_mode != (native_bundle != nullptr) ||
+      native_mode != (native_result != nullptr) ||
+      native_mode == (problem != nullptr) ||
+      (native_mode && (native_request->view == nullptr ||
+                       native_request->initial_state == nullptr))) {
+    if (error != nullptr) *error = "custom CUDA controller source is invalid";
+    return false;
+  }
   *result = CudaFullLmResult();
   if (options.prepared_host_view != nullptr) {
     result->runtime.host_problem_store =
@@ -20001,6 +21422,12 @@ bool RunCustomCudaSolveCore(const CudaSolveProblem& snapshot,
         "invalid";
     return false;
   }
+  if (native_mode && arithmetic_precision !=
+                         native_request->view->config.arithmetic_precision) {
+    *error = "native arithmetic precision identity mismatch";
+    result->error = *error;
+    return false;
+  }
   if (arithmetic_precision != CudaArithmeticPrecision::kFp64 &&
       arithmetic_precision != CudaArithmeticPrecision::kFp32MixedStable) {
     result->runtime.audit_profile_requested =
@@ -20015,7 +21442,7 @@ bool RunCustomCudaSolveCore(const CudaSolveProblem& snapshot,
       result->error_classification = CudaSolveErrorClass::kInvalidOptions;
       return false;
     }
-    if (legacy_snapshot == nullptr) {
+    if (legacy_snapshot == nullptr || native_mode) {
       *error = "legacy FP32 experiment precision requires a legacy Snapshot";
       result->error = *error;
       result->termination_reason = "active_spec_legacy_fp32_unsupported";
@@ -20069,6 +21496,16 @@ bool RunCustomCudaSolveCore(const CudaSolveProblem& snapshot,
     result->error_classification = CudaSolveErrorClass::kInvalidOptions;
     return false;
   }
+  if (native_mode &&
+      (audit_profile != CudaAuditProfile::kProduction ||
+       capture_state_trace || instrumentation_enabled || audit_mirror_enabled ||
+       options.fault_injection != CudaFaultInjection::kNone ||
+       options.fault_trigger.fault_kind != CudaFaultInjection::kNone)) {
+    *error = "native CUDA vertical slice requires production audit without faults";
+    result->error = *error;
+    result->termination_reason = "native_audit_configuration_unsupported";
+    return false;
+  }
   result->runtime.audit_profile_effective = AuditProfileName(audit_profile);
   result->runtime.capture_state_trace_effective = capture_state_trace;
   RuntimeAuditFinalizer runtime_audit_finalizer(
@@ -20081,6 +21518,13 @@ bool RunCustomCudaSolveCore(const CudaSolveProblem& snapshot,
   SolveCallCounterScope call_counter_scope(&solve_call_counters);
   GpuBaSolveContext solve_context;
   solve_context.SetArithmeticPrecisionForSolve(arithmetic_precision);
+  if (native_mode && (options.prepared_host_view != nullptr ||
+                      options.indexed_active_solve != nullptr ||
+                      options.indexed_catalog_tables != nullptr)) {
+    *error = "native request cannot bind legacy prepared/indexed inputs";
+    result->error = *error;
+    return false;
+  }
   if (options.prepared_host_view != nullptr &&
       options.indexed_active_solve != nullptr) {
     *error = "prepared host view and indexed active solve are mutually exclusive";
@@ -20125,6 +21569,11 @@ bool RunCustomCudaSolveCore(const CudaSolveProblem& snapshot,
   }
   const bool persistent_device =
       device_backend != CudaDeviceContextBackend::kLegacy;
+  if (native_mode && device_backend != CudaDeviceContextBackend::kDeviceControl) {
+    *error = "native CUDA vertical slice requires device_control";
+    result->error = *error;
+    return false;
+  }
   HotKernelImplementation hot_kernel_implementation =
       HotKernelImplementation::kReference;
   if (!ResolveHotKernelImplementation(
@@ -20161,7 +21610,85 @@ bool RunCustomCudaSolveCore(const CudaSolveProblem& snapshot,
     result->error_classification = CudaSolveErrorClass::kInvalidOptions;
     return false;
   }
-  if (options.indexed_active_solve != nullptr) {
+  if (native_mode) {
+    const NativeCudaResolvedConfig& config = native_request->view->config;
+    CudaReductionMode effective_reduction =
+        options.layer_c.layer_b.reduction_mode;
+    int32_t effective_cost_reduction_threads =
+        options.layer_c.layer_b.cost_reduction_threads;
+    if (options.performance_mode) {
+      effective_reduction = CudaReductionMode::kParallelDeterministic;
+      if (effective_cost_reduction_threads <= 1)
+        effective_cost_reduction_threads = 128;
+    }
+    CudaHessianAssemblyBackend resolved_hessian =
+        CudaHessianAssemblyBackend::kCompatibilityDefault;
+    std::string hessian_requested;
+    if (!config.resolved || config.config_generation == 0 ||
+        !ResolveHessianAssemblyBackend(
+            options.layer_c.layer_b.hessian_assembly_backend,
+            hot_kernel_implementation, &resolved_hessian, &hessian_requested,
+            error) ||
+        options.performance_mode != config.performance_mode ||
+        resolved_hessian != config.hessian_backend ||
+        schur_contribution_backend != config.schur_backend ||
+        options.hot_kernel_mode != config.hot_kernel ||
+        options.execution_profile != config.execution_profile ||
+        options.device_context_mode != config.device_context ||
+        options.layer_c.layer_b.layer_a.memory_mode != config.memory_mode ||
+        options.layer_c.layer_b.layer_a.device != config.device ||
+        options.layer_c.layer_b.layer_a.block_size != config.block_size ||
+        effective_reduction != config.reduction_mode ||
+        effective_cost_reduction_threads !=
+            config.cost_reduction_threads ||
+        options.layer_c.layer_b.layer_a.residual_order !=
+            config.residual_order ||
+        options.layer_c.layer_b.loss_mode != config.loss_mode ||
+        (config.loss_mode != CudaLossMode::kTrivial &&
+         options.layer_c.layer_b.loss_scale != config.loss_scale) ||
+        options.layer_c.layer_b.min_lm_diagonal != config.min_lm_diagonal ||
+        options.layer_c.layer_b.max_lm_diagonal != config.max_lm_diagonal ||
+        options.pair_chunk_limit_bytes_for_testing !=
+            config.pair_chunk_limit_bytes ||
+        options.layer_c.layer_b.hessian_segment_size_for_testing !=
+            config.hessian_segment_size ||
+        options.layer_c.schur_segment_size_for_testing !=
+            config.schur_segment_size ||
+        options.current_linearization_cache_mode !=
+            config.linearization_cache ||
+        options.audit_profile != config.audit_profile ||
+        (options.max_num_iterations >= 0 &&
+         options.max_num_iterations != config.max_num_iterations) ||
+        (options.max_num_consecutive_invalid_steps >= 0 &&
+         options.max_num_consecutive_invalid_steps !=
+             config.max_consecutive_invalid_steps) ||
+        (options.function_tolerance >= 0.0 &&
+         options.function_tolerance != config.function_tolerance) ||
+        (options.gradient_tolerance >= 0.0 &&
+         options.gradient_tolerance != config.gradient_tolerance) ||
+        (options.parameter_tolerance >= 0.0 &&
+         options.parameter_tolerance != config.parameter_tolerance) ||
+        options.max_solver_time_in_seconds !=
+            config.max_solver_time_in_seconds ||
+        options.initial_trust_region_radius !=
+            config.initial_trust_region_radius ||
+        options.min_trust_region_radius != config.min_trust_region_radius ||
+        options.max_trust_region_radius != config.max_trust_region_radius ||
+        options.min_relative_decrease != config.min_relative_decrease) {
+      if (error->empty()) *error = "native resolved configuration mismatch";
+      result->error = *error;
+      result->termination_reason = "native_resolved_configuration_mismatch";
+      result->error_classification = CudaSolveErrorClass::kInvalidOptions;
+      return false;
+    }
+    if (!ProfileAtLeast(config.execution_profile,
+                        CudaExecutionProfile::kCompactControl)) {
+      *error = "native CUDA vertical slice requires compact_control";
+      result->error = *error;
+      return false;
+    }
+  }
+  if (!native_mode && options.indexed_active_solve != nullptr) {
     CudaHessianAssemblyBackend indexed_hessian_backend =
         CudaHessianAssemblyBackend::kCompatibilityDefault;
     std::string indexed_hessian_requested;
@@ -20184,7 +21711,7 @@ bool RunCustomCudaSolveCore(const CudaSolveProblem& snapshot,
             options.layer_c.layer_b.hessian_assembly_backend,
             hot_kernel_implementation, &indexed_hessian_backend,
             &indexed_hessian_requested, error) ||
-        !ResolveCudaLoss(snapshot, options.layer_c.layer_b,
+        !ResolveCudaLoss(*problem, options.layer_c.layer_b,
                          &indexed_loss_mode, &indexed_loss_scale, error) ||
         !solve_context.SetIndexedCatalogForSolve(
             options.indexed_catalog_tables, options.indexed_active_solve,
@@ -20197,7 +21724,7 @@ bool RunCustomCudaSolveCore(const CudaSolveProblem& snapshot,
       result->error_classification = CudaSolveErrorClass::kInvalidOptions;
       return false;
     }
-  } else if (!solve_context.SetIndexedCatalogForSolve(
+  } else if (!native_mode && !solve_context.SetIndexedCatalogForSolve(
                  options.indexed_catalog_tables, nullptr,
                  arithmetic_precision,
                  CudaHessianAssemblyBackend::kCompatibilityDefault,
@@ -20256,23 +21783,32 @@ bool RunCustomCudaSolveCore(const CudaSolveProblem& snapshot,
   };
 
   const int32_t max_iterations =
-      options.max_num_iterations < 0 ? snapshot.metadata.max_num_iterations
-                                     : options.max_num_iterations;
+      options.max_num_iterations < 0
+          ? (native_mode ? native_request->view->config.max_num_iterations
+                         : problem->metadata.max_num_iterations)
+          : options.max_num_iterations;
   const int32_t invalid_limit =
       options.max_num_consecutive_invalid_steps < 0
-          ? (snapshot.metadata.max_consecutive_invalid_steps > 0
-                 ? snapshot.metadata.max_consecutive_invalid_steps
-                 : 10)
+          ? (native_mode
+                 ? native_request->view->config.max_consecutive_invalid_steps
+                 : (problem->metadata.max_consecutive_invalid_steps > 0
+                        ? problem->metadata.max_consecutive_invalid_steps
+                        : 10))
           : options.max_num_consecutive_invalid_steps;
   const double function_tolerance =
-      options.function_tolerance < 0.0 ? snapshot.metadata.function_tolerance
-                                       : options.function_tolerance;
+      options.function_tolerance < 0.0
+          ? (native_mode ? native_request->view->config.function_tolerance
+                         : problem->metadata.function_tolerance)
+          : options.function_tolerance;
   const double gradient_tolerance =
-      options.gradient_tolerance < 0.0 ? snapshot.metadata.gradient_tolerance
-                                       : options.gradient_tolerance;
+      options.gradient_tolerance < 0.0
+          ? (native_mode ? native_request->view->config.gradient_tolerance
+                         : problem->metadata.gradient_tolerance)
+          : options.gradient_tolerance;
   const double parameter_tolerance =
       options.parameter_tolerance < 0.0
-          ? snapshot.metadata.parameter_tolerance
+          ? (native_mode ? native_request->view->config.parameter_tolerance
+                         : problem->metadata.parameter_tolerance)
           : options.parameter_tolerance;
   if (max_iterations < 0 || invalid_limit <= 0 ||
       (device_context_backend != "legacy" &&
@@ -20398,15 +21934,18 @@ bool RunCustomCudaSolveCore(const CudaSolveProblem& snapshot,
   result->runtime.audit_capacity_preflight_pass = true;
 
   try {
-    static_cast<CudaSolveProblem&>(result->final_state) = snapshot;
-    if (legacy_snapshot != nullptr) {
+    if (!native_mode) {
+      static_cast<CudaSolveProblem&>(result->final_state) = *problem;
+    }
+    if (!native_mode && legacy_snapshot != nullptr) {
       result->final_state.tracks = legacy_snapshot->tracks;
       result->final_state.parameter_blocks_canonical_order =
           legacy_snapshot->parameter_blocks_canonical_order;
     }
-    if (!state_hash.Initialize(result->final_state, error) ||
-        !state_hash.Current(result->final_state,
-                           &result->runtime.initial_state_hash, error)) {
+    if (!native_mode &&
+        (!state_hash.Initialize(result->final_state, error) ||
+         !state_hash.Current(result->final_state,
+                            &result->runtime.initial_state_hash, error))) {
       result->error_classification = CudaSolveErrorClass::kFinalStateHash;
       result->error = *error;
       return false;
@@ -20491,8 +22030,9 @@ bool RunCustomCudaSolveCore(const CudaSolveProblem& snapshot,
   CudaLayerCOptions step_options = options.layer_c;
   step_options.pair_chunk_limit_bytes_for_testing =
       options.pair_chunk_limit_bytes_for_testing;
-  step_options.layer_b.layer_a.residual_order =
-      CudaResidualOrder::kSourceInsertion;
+  step_options.layer_b.layer_a.residual_order = native_mode
+      ? native_request->view->config.residual_order
+      : CudaResidualOrder::kSourceInsertion;
   if (options.performance_mode) {
     step_options.layer_b.reduction_mode =
         CudaReductionMode::kParallelDeterministic;
@@ -20521,7 +22061,13 @@ bool RunCustomCudaSolveCore(const CudaSolveProblem& snapshot,
     result->error = *error;
     return false;
   }
-  const bool context_initialized = prepared_host_data == nullptr
+  const bool context_initialized = native_mode
+      ? solve_context.InitializeNative(
+            *native_request->view, *native_request->initial_state,
+            *native_bundle, step_options.layer_b,
+            result->runtime.resource_generation, hot_kernel_implementation,
+            &result->runtime, error)
+      : prepared_host_data == nullptr
       ? solve_context.Initialize(
             result->final_state, step_options.layer_b,
             step_options.pair_chunk_limit_bytes_for_testing,
@@ -20570,10 +22116,16 @@ bool RunCustomCudaSolveCore(const CudaSolveProblem& snapshot,
       current_identity.topology_generation);
   observe_linearization(state_epoch);
   UndampedCurrentLinearization initial_linearization;
-  if (!linearizations.Build(result->final_state, current_identity,
-                            step_options.layer_b,
-                            CudaFaultLogicalSite::kInitialLinearization,
-                            &initial_linearization, error)) {
+  const bool initial_linearization_built = native_mode
+      ? linearizations.BuildNative(
+            current_identity, step_options.layer_b,
+            CudaFaultLogicalSite::kInitialLinearization,
+            &initial_linearization, error)
+      : linearizations.Build(
+            result->final_state, current_identity, step_options.layer_b,
+            CudaFaultLogicalSite::kInitialLinearization,
+            &initial_linearization, error);
+  if (!initial_linearization_built) {
     result->error_classification = CudaSolveErrorClass::kInitialLinearization;
     result->error = *error;
     return false;
@@ -20595,8 +22147,9 @@ bool RunCustomCudaSolveCore(const CudaSolveProblem& snapshot,
   } else {
     CaptureFrozenJacobiScaling(initial_linearization.layer_b(),
                                &step_options.layer_b);
-    current_identity.config_generation =
-        ComputeConfigGeneration(result->final_state, step_options.layer_b);
+    current_identity.config_generation = native_mode
+        ? native_request->view->identity.config_generation
+        : ComputeConfigGeneration(result->final_state, step_options.layer_b);
   }
   if (!solve_context.FinalizeResolvedConfig(
           current_identity.config_generation, error)) {
@@ -20655,7 +22208,8 @@ bool RunCustomCudaSolveCore(const CudaSolveProblem& snapshot,
   iteration_zero.accepted_decision = true;
   iteration_zero.accepted_commit_success = true;
   iteration_zero.accepted = true;
-  if (!state_hash.Current(result->final_state,
+  if (!native_mode &&
+      !state_hash.Current(result->final_state,
                           &iteration_zero.current_state_hash, error)) {
     result->error = *error;
     return false;
@@ -20675,7 +22229,7 @@ bool RunCustomCudaSolveCore(const CudaSolveProblem& snapshot,
       initial_counters.topology_refresh;
   iteration_zero.cumulative_cache_hits = initial_counters.cache_hit;
   result->trace.push_back(iteration_zero);
-  if (capture_state_trace) {
+  if (!native_mode && capture_state_trace) {
     result->accepted_state_trace.push_back(result->final_state);
   }
 
@@ -20704,7 +22258,8 @@ bool RunCustomCudaSolveCore(const CudaSolveProblem& snapshot,
     const LifecycleCounters counters_before =
         ReadLifecycleCounters(result->runtime.timing);
     std::string current_state_hash;
-    if (!state_hash.Current(result->final_state, &current_state_hash, error)) {
+    if (!native_mode &&
+        !state_hash.Current(result->final_state, &current_state_hash, error)) {
       result->termination_type = CudaTerminationType::kFailure;
       result->termination_reason = "current_state_hash_failed";
       result->error = *error;
@@ -20712,10 +22267,14 @@ bool RunCustomCudaSolveCore(const CudaSolveProblem& snapshot,
     }
     UndampedCurrentLinearization temporary_linearization;
     const UndampedCurrentLinearization* borrowed_linearization = nullptr;
-    if (!linearizations.Resolve(result->final_state, current_identity,
-                                step_options.layer_b,
-                                &temporary_linearization,
-                                &borrowed_linearization, error)) {
+    const bool current_linearization_resolved = native_mode
+        ? linearizations.ResolveNative(
+              current_identity, step_options.layer_b,
+              &temporary_linearization, &borrowed_linearization, error)
+        : linearizations.Resolve(
+              result->final_state, current_identity, step_options.layer_b,
+              &temporary_linearization, &borrowed_linearization, error);
+    if (!current_linearization_resolved) {
       result->termination_type = CudaTerminationType::kFailure;
       result->termination_reason = "current_linearization_failed";
       result->error_classification =
@@ -20809,9 +22368,14 @@ bool RunCustomCudaSolveCore(const CudaSolveProblem& snapshot,
       *error = result->error;
       break;
     }
-    const bool solved = RunCudaSnapshotLayerCFromLinearization(
-        &solve_context, result->final_state, trial_options,
-        *borrowed_linearization, &step, &step_error);
+    const bool solved = native_mode
+        ? RunCudaNativeLayerCFromContext(
+              &solve_context, trial_options,
+              borrowed_linearization->layer_b(), current_identity,
+              borrowed_linearization->device_token(), &step, &step_error)
+        : RunCudaSnapshotLayerCFromLinearization(
+              &solve_context, result->final_state, trial_options,
+              *borrowed_linearization, &step, &step_error);
     ++result->trial_iterations;
     iteration.factorization_success = solved;
     if ((options.fault_injection ==
@@ -20882,8 +22446,9 @@ bool RunCustomCudaSolveCore(const CudaSolveProblem& snapshot,
                            step.predicted_reduction > 0.0;
     iteration.trial_cost = step.trial_cost;
     iteration.trial_finite = std::isfinite(step.trial_cost);
-    if (!state_hash.Trial(step.trial_state, &iteration.trial_state_hash,
-                         error)) {
+    if (!native_mode &&
+        !state_hash.Trial(step.trial_state, &iteration.trial_state_hash,
+                          error)) {
       solve_context.DiscardDeviceTrialState();
       result->termination_type = CudaTerminationType::kFailure;
       result->termination_reason = "trial_state_hash_failed";
@@ -21047,12 +22612,17 @@ bool RunCustomCudaSolveCore(const CudaSolveProblem& snapshot,
       next_identity.state_epoch = internal_state_epoch + 1;
       const uint64_t pending_layer_b_calls_before =
           solve_call_counters.layer_b;
-      const Snapshot& pending_host_state =
-          pending.has_host_state ? pending.next_state : result->final_state;
-      const bool pending_linearization_built = linearizations.Build(
-          pending_host_state, next_identity, step_options.layer_b,
-          CudaFaultLogicalSite::kAcceptedPendingLinearization,
-          &pending.next_linearization, error);
+      const bool pending_linearization_built = native_mode
+          ? linearizations.BuildNative(
+                next_identity, step_options.layer_b,
+                CudaFaultLogicalSite::kAcceptedPendingLinearization,
+                &pending.next_linearization, error)
+          : linearizations.Build(
+                pending.has_host_state ? pending.next_state
+                                       : result->final_state,
+                next_identity, step_options.layer_b,
+                CudaFaultLogicalSite::kAcceptedPendingLinearization,
+                &pending.next_linearization, error);
       const bool pending_identity_valid =
           pending_linearization_built && linearizations.ValidatePendingPublish(
               next_identity, pending.next_linearization) &&
@@ -21114,13 +22684,21 @@ bool RunCustomCudaSolveCore(const CudaSolveProblem& snapshot,
       iteration.accepted_commit_success = true;
       finalize_iteration_counters();
       pending.prepared_iteration_trace = std::move(iteration);
-      CommitAcceptedState(
-          std::move(pending), capture_state_trace, &state_hash,
-          &solve_context, &linearizations, result, &internal_state_epoch,
-          &state_epoch,
-          &current_identity, &last_linearization_state_epoch,
-          &has_linearization, &linearization_id, &linearization_reason,
-          &radius, &decrease_factor);
+      if (native_mode) {
+        CommitAcceptedNativeState(
+            std::move(pending), &solve_context, &linearizations, result,
+            &internal_state_epoch, &state_epoch, &current_identity,
+            &last_linearization_state_epoch, &has_linearization,
+            &linearization_id, &linearization_reason, &radius,
+            &decrease_factor);
+      } else {
+        CommitAcceptedState(
+            std::move(pending), capture_state_trace, &state_hash,
+            &solve_context, &linearizations, result, &internal_state_epoch,
+            &state_epoch, &current_identity, &last_linearization_state_epoch,
+            &has_linearization, &linearization_id, &linearization_reason,
+            &radius, &decrease_factor);
+      }
       current = &linearizations.current().layer_b();
       accepted_commit = true;
     } else {
@@ -21155,16 +22733,27 @@ bool RunCustomCudaSolveCore(const CudaSolveProblem& snapshot,
 
   if (solve_context.device_state_enabled() &&
       result->termination_type != CudaTerminationType::kFailure) {
-    Snapshot materialized_final;
-    if (!solve_context.persistent_device()->MaterializeCurrentState(
-            result->final_state, &materialized_final, true, error)) {
+    bool materialized = false;
+    if (native_mode) {
+      materialized = solve_context.persistent_device()->DownloadCurrentNativeState(
+          *native_request->view, *native_request->initial_state,
+          current_identity, &native_result->final_state, error);
+      if (materialized)
+        ++native_result->runtime.dense_active_state_device_download_calls;
+    } else {
+      Snapshot materialized_final;
+      materialized = solve_context.persistent_device()->MaterializeCurrentState(
+          result->final_state, &materialized_final, true, error);
+      if (materialized) {
+        using std::swap;
+        swap(result->final_state, materialized_final);
+      }
+    }
+    if (!materialized) {
       result->termination_type = CudaTerminationType::kFailure;
       result->termination_reason = "device_state_final_materialization_failed";
       result->error_classification = CudaSolveErrorClass::kCudaStep;
       result->error = *error;
-    } else {
-      using std::swap;
-      swap(result->final_state, materialized_final);
     }
   }
 
@@ -21181,7 +22770,8 @@ bool RunCustomCudaSolveCore(const CudaSolveProblem& snapshot,
       std::chrono::duration<double, std::milli>(
           std::chrono::steady_clock::now() - host_start)
           .count();
-  if (!state_hash.Current(result->final_state,
+  if (!native_mode &&
+      !state_hash.Current(result->final_state,
                           &result->runtime.final_state_hash, error)) {
     result->termination_type = CudaTerminationType::kFailure;
     result->termination_reason = "final_state_hash_failed";
@@ -21319,6 +22909,48 @@ bool RunCustomCudaSolveCore(const CudaSolveProblem& snapshot,
                          audit_interval_milliseconds);
   }
   runtime_audit_finalizer.Finalize();
+  if (native_mode) {
+    native_result->success = result->success;
+    native_result->error = result->error;
+    native_result->termination_reason = result->termination_reason;
+    native_result->initial_cost = result->initial_cost;
+    native_result->final_cost = result->final_cost;
+    native_result->trial_iterations = result->trial_iterations;
+    native_result->accepted_steps = result->accepted_steps;
+    native_result->accepted_commits = result->accepted_commits;
+    native_result->rejected_steps = result->rejected_steps;
+    native_result->invalid_steps = result->invalid_steps;
+    native_result->final_internal_state_epoch =
+        result->runtime.final_internal_state_epoch;
+    native_result->runtime.legacy_kernel_input_bundle_calls =
+        native_bundle->runtime.legacy_kernel_input_bundle_calls;
+    native_result->runtime.build_cuda_layer_a_inputs_calls =
+        native_bundle->runtime.build_cuda_layer_a_inputs_calls;
+    native_result->runtime.build_static_layout_calls =
+        native_bundle->runtime.build_static_layout_calls;
+    native_result->runtime.build_cost_layout_calls =
+        native_bundle->runtime.build_cost_layout_calls;
+    native_result->runtime.build_layer_b_topology_calls =
+        native_bundle->runtime.build_layer_b_topology_calls;
+    native_result->runtime.build_layer_c_topology_calls =
+        native_bundle->runtime.build_layer_c_topology_calls;
+    native_result->runtime.temporary_visual_input_bytes =
+        native_bundle->runtime.temporary_visual_input_bytes;
+    native_result->runtime.temporary_lidar_input_bytes =
+        native_bundle->runtime.temporary_lidar_input_bytes;
+    native_result->runtime.temporary_legacy_kernel_abi = true;
+    native_result->runtime.native_lm_controller_handoff_complete = true;
+    native_result->runtime.real_cost_layout_entries =
+        native_bundle->runtime.real_cost_layout_entries;
+    native_result->runtime.real_pose_adjacency_entries =
+        native_bundle->runtime.real_pose_adjacency_entries;
+    native_result->runtime.real_point_adjacency_entries =
+        native_bundle->runtime.real_point_adjacency_entries;
+    native_result->runtime.real_edge_adjacency_entries =
+        native_bundle->runtime.real_edge_adjacency_entries;
+    native_result->runtime.real_schur_pair_contributions =
+        native_bundle->runtime.real_schur_pair_contributions;
+  }
   return result->success;
 }
 
@@ -21326,14 +22958,40 @@ bool RunCustomCudaSolve(const Snapshot& snapshot,
                         const CudaFullLmOptions& options,
                         CudaFullLmResult* result,
                         std::string* error) {
-  return RunCustomCudaSolveCore(snapshot, &snapshot, options, result, error);
+  return RunCustomCudaSolveCore(&snapshot, &snapshot, nullptr, nullptr, nullptr,
+                                options, result, error);
 }
 
 bool RunCustomCudaSolve(const CudaSolveProblem& problem,
                         const CudaFullLmOptions& options,
                         CudaFullLmResult* result,
                         std::string* error) {
-  return RunCustomCudaSolveCore(problem, nullptr, options, result, error);
+  return RunCustomCudaSolveCore(&problem, nullptr, nullptr, nullptr, nullptr,
+                                options, result, error);
+}
+
+bool RunCustomCudaSolve(const NativeCudaSolveRequest& request,
+                        BaSolveResult* result,
+                        std::string* error) {
+  if (result == nullptr || error == nullptr || request.view == nullptr ||
+      request.initial_state == nullptr || request.options == nullptr) {
+    if (error != nullptr) *error = "native CUDA solve request is incomplete";
+    return false;
+  }
+  *result = BaSolveResult();
+  error->clear();
+  LegacyKernelInputBundle bundle;
+  if (!BuildLegacyKernelInputBundle(*request.view, *request.initial_state,
+                                    &bundle, error)) {
+    result->error = *error;
+    return false;
+  }
+  CudaFullLmResult controller_result;
+  const bool success = RunCustomCudaSolveCore(
+      nullptr, nullptr, &request, bundle.impl_.get(), result,
+      *request.options, &controller_result, error);
+  if (!success && result->error.empty()) result->error = *error;
+  return success;
 }
 
 bool RunCustomCudaSolveWithStateUpdateStatusForTesting(
