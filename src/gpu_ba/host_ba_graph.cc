@@ -129,6 +129,105 @@ bool SetError(const char* message, std::string* error) {
   return false;
 }
 
+bool AddCounter(const uint64_t value,
+                uint64_t* counter,
+                std::string* error) {
+  if (counter == nullptr ||
+      value > std::numeric_limits<uint64_t>::max() - *counter) {
+    return SetError("host BA graph telemetry counter overflow", error);
+  }
+  *counter += value;
+  return true;
+}
+
+bool ComputeGrowthTarget(const size_t current_capacity,
+                         const size_t required,
+                         const size_t max_size,
+                         size_t* target) noexcept {
+  if (target == nullptr || required > max_size) return false;
+  if (required <= current_capacity && current_capacity != 0) {
+    *target = current_capacity;
+    return true;
+  }
+  size_t geometric = 0;
+  if (current_capacity == 0) {
+    const size_t headroom = required / 4 + (required % 4 != 0 ? 1 : 0);
+    geometric = required > max_size - headroom ? max_size
+                                                : required + headroom;
+    geometric = std::max(geometric, std::min<size_t>(64, max_size));
+  } else {
+    const size_t headroom =
+        current_capacity / 2 + (current_capacity % 2 != 0 ? 1 : 0);
+    geometric = current_capacity > max_size - headroom
+                    ? max_size
+                    : current_capacity + headroom;
+  }
+  *target = std::max(required, geometric);
+  return *target <= max_size;
+}
+
+template <typename T>
+bool EnsureVectorCapacity(std::vector<T>* values,
+                          const size_t required,
+                          HostBaGraphUpdateResult* result,
+                          std::string* error) {
+  if (values == nullptr || result == nullptr)
+    return SetError("host BA graph vector capacity output is null", error);
+  size_t target = 0;
+  if (!ComputeGrowthTarget(values->capacity(), required, values->max_size(),
+                           &target)) {
+    return SetError("host BA graph vector capacity exhausted", error);
+  }
+  if (target <= values->capacity()) return true;
+  if (values->size() >
+      std::numeric_limits<uint64_t>::max() / sizeof(T)) {
+    return SetError("host BA graph capacity copy byte count overflow", error);
+  }
+  const uint64_t copy_bytes =
+      static_cast<uint64_t>(values->size()) * sizeof(T);
+  values->reserve(target);
+  return AddCounter(1, &result->capacity_growth_events, error) &&
+         AddCounter(copy_bytes, &result->capacity_growth_copy_bytes, error);
+}
+
+template <typename Map>
+size_t HashEntryCapacity(const Map& values) noexcept {
+  const long double capacity =
+      static_cast<long double>(values.bucket_count()) *
+      static_cast<long double>(values.max_load_factor());
+  if (capacity >=
+      static_cast<long double>(std::numeric_limits<size_t>::max())) {
+    return std::numeric_limits<size_t>::max();
+  }
+  return static_cast<size_t>(capacity);
+}
+
+template <typename Map>
+bool EnsureHashCapacity(Map* values,
+                        const size_t required,
+                        HostBaGraphUpdateResult* result,
+                        std::string* error) {
+  if (values == nullptr || result == nullptr)
+    return SetError("host BA graph hash capacity output is null", error);
+  const size_t current_capacity = HashEntryCapacity(*values);
+  if (required <= current_capacity &&
+      (current_capacity >= 64 || !values->empty())) {
+    return true;
+  }
+  const size_t growth_base =
+      values->empty() && current_capacity < 64 ? 0 : current_capacity;
+  size_t target = 0;
+  if (!ComputeGrowthTarget(growth_base, required, values->max_size(),
+                           &target)) {
+    return SetError("host BA graph hash capacity exhausted", error);
+  }
+  if (target <= current_capacity) return true;
+  const uint64_t moved_entries = static_cast<uint64_t>(values->size());
+  values->reserve(target);
+  return AddCounter(1, &result->hash_rehash_events, error) &&
+         AddCounter(moved_entries, &result->hash_rehash_entries, error);
+}
+
 }  // namespace
 
 using CameraIndex = std::unordered_map<uint32_t, uint32_t>;
@@ -320,16 +419,28 @@ bool BuildColdPublication(const HostBaGraphColdInput& input,
       input.observations.size() > graph->point_incidence_nodes.max_size()) {
     return SetError("host BA graph cold input exceeds storage capacity", error);
   }
-  graph->cameras.reserve(input.cameras.size());
-  graph->images.reserve(input.images.size());
-  graph->points.reserve(input.points.size());
-  graph->observations.reserve(input.observations.size());
-  graph->image_incidence_nodes.reserve(input.observations.size());
-  graph->point_incidence_nodes.reserve(input.observations.size());
-  graph->camera_by_id.reserve(input.cameras.size());
-  graph->image_by_id.reserve(input.images.size());
-  graph->point_by_id.reserve(input.points.size());
-  graph->observation_by_identity.reserve(input.observations.size());
+  if (!EnsureVectorCapacity(&graph->cameras, input.cameras.size(), result,
+                            error) ||
+      !EnsureVectorCapacity(&graph->images, input.images.size(), result,
+                            error) ||
+      !EnsureVectorCapacity(&graph->points, input.points.size(), result,
+                            error) ||
+      !EnsureVectorCapacity(&graph->observations, input.observations.size(),
+                            result, error) ||
+      !EnsureVectorCapacity(&graph->image_incidence_nodes,
+                            input.observations.size(), result, error) ||
+      !EnsureVectorCapacity(&graph->point_incidence_nodes,
+                            input.observations.size(), result, error) ||
+      !EnsureHashCapacity(&graph->camera_by_id, input.cameras.size(), result,
+                          error) ||
+      !EnsureHashCapacity(&graph->image_by_id, input.images.size(), result,
+                          error) ||
+      !EnsureHashCapacity(&graph->point_by_id, input.points.size(), result,
+                          error) ||
+      !EnsureHashCapacity(&graph->observation_by_identity,
+                          input.observations.size(), result, error)) {
+    return false;
+  }
   for (const HostBaCameraRecord& input_camera : input.cameras) {
     HostBaCameraSlot camera;
     camera.header.slot = static_cast<uint32_t>(graph->cameras.size());
@@ -450,6 +561,24 @@ struct MapInsertionRollback {
   std::vector<PointIndex::iterator> points;
   std::vector<ObservationIndex::iterator> observations;
   bool keep = false;
+};
+
+class AcceptedBatchFailureGuard {
+ public:
+  AcceptedBatchFailureGuard(bool* valid, HostBaGraphUpdateResult* result)
+      : valid_(valid), result_(result) {}
+  ~AcceptedBatchFailureGuard() noexcept {
+    if (!armed_) return;
+    if (valid_ != nullptr) *valid_ = false;
+    if (result_ != nullptr) result_->full_rebuild_required = true;
+  }
+
+  void Disarm() noexcept { armed_ = false; }
+
+ private:
+  bool* valid_ = nullptr;
+  HostBaGraphUpdateResult* result_ = nullptr;
+  bool armed_ = true;
 };
 
 template <typename T>
@@ -684,10 +813,9 @@ bool HostBaGraphStore::ApplyCoalescedMutation(
       mutation.revision_after <= mutation.revision_before) {
     return SetError("host BA graph mutation identity mismatch", error);
   }
+  AcceptedBatchFailureGuard accepted_batch_failure(&valid_, result);
   if (mutation.force_full_rebuild ||
       !mutation.tombstone_camera_ids.empty()) {
-    valid_ = false;
-    result->full_rebuild_required = true;
     return SetError("host BA graph mutation requires a full cold rebuild", error);
   }
   if (next_generation_ == std::numeric_limits<uint64_t>::max()) {
@@ -737,27 +865,19 @@ bool HostBaGraphStore::ApplyCoalescedMutation(
         !CheckedSizeAdd(staged_observation_capacity, 8,
                         &staged_observation_capacity) ||
         !CheckedSizeAdd(point_cascade_capacity, image_cascade_capacity,
-                        &cascade_capacity) ||
-        !CanAppendUint32(graph.cameras.size(),
-                         mutation.camera_upserts.size()) ||
-        !CanAppendUint32(graph.images.size(), mutation.image_upserts.size()) ||
-        !CanAppendUint32(graph.points.size(), mutation.point_upserts.size()) ||
-        !CanAppendUint32(graph.observations.size(),
-                         mutation.observation_upserts.size()) ||
-        !CanAppendUint32(graph.image_incidence_nodes.size(),
-                         mutation.observation_upserts.size()) ||
-        !CanAppendUint32(graph.point_incidence_nodes.size(),
-                         mutation.observation_upserts.size())) {
+                        &cascade_capacity)) {
       return SetError("host BA graph mutation size overflow", error);
     }
     StagedCameras staged_cameras;
     StagedImages staged_images;
     StagedPoints staged_points;
     StagedObservations staged_observations;
+    std::vector<uint32_t> staged_observation_order;
     staged_cameras.reserve(mutation.camera_upserts.size());
     staged_images.reserve(staged_image_capacity);
     staged_points.reserve(staged_point_capacity);
     staged_observations.reserve(staged_observation_capacity);
+    staged_observation_order.reserve(staged_observation_capacity);
 
     std::unordered_set<uint64_t> observation_tombstones;
     observation_tombstones.reserve(mutation.tombstone_observations.size());
@@ -772,31 +892,75 @@ bool HostBaGraphStore::ApplyCoalescedMutation(
     tombstoned_point_slots.reserve(mutation.tombstone_point_ids.size());
     tombstoned_image_slots.reserve(mutation.tombstone_image_ids.size());
 
+    std::unordered_set<uint32_t> new_camera_ids;
+    std::unordered_set<uint32_t> new_image_ids;
+    std::unordered_set<uint64_t> new_point_ids;
+    std::unordered_set<uint64_t> new_observation_identities;
+    new_camera_ids.reserve(mutation.camera_upserts.size());
+    new_image_ids.reserve(mutation.image_upserts.size());
+    new_point_ids.reserve(mutation.point_upserts.size());
+    new_observation_identities.reserve(mutation.observation_upserts.size());
+    for (const HostBaCameraRecord& value : mutation.camera_upserts) {
+      if (graph.camera_by_id.count(value.camera_id) == 0)
+        new_camera_ids.insert(value.camera_id);
+    }
+    for (const HostBaImageRecord& value : mutation.image_upserts) {
+      if (graph.image_by_id.count(value.image_id) == 0)
+        new_image_ids.insert(value.image_id);
+    }
+    for (const HostBaPointRecord& value : mutation.point_upserts) {
+      if (graph.point_by_id.count(value.point3D_id) == 0)
+        new_point_ids.insert(value.point3D_id);
+    }
+    for (const HostBaObservationRecord& value :
+         mutation.observation_upserts) {
+      const uint64_t identity =
+          ObservationIdentity(value.image_id, value.point2D_idx);
+      if (graph.observation_by_identity.count(identity) == 0 &&
+          observation_tombstones.count(identity) == 0) {
+        new_observation_identities.insert(identity);
+      }
+    }
+    if (!CanAppendUint32(graph.cameras.size(), new_camera_ids.size()) ||
+        !CanAppendUint32(graph.images.size(), new_image_ids.size()) ||
+        !CanAppendUint32(graph.points.size(), new_point_ids.size()) ||
+        !CanAppendUint32(graph.observations.size(),
+                         new_observation_identities.size())) {
+      return SetError("host BA graph stable slot capacity exhausted", error);
+    }
+    const size_t required_cameras = graph.cameras.size() + new_camera_ids.size();
+    const size_t required_images = graph.images.size() + new_image_ids.size();
+    const size_t required_points = graph.points.size() + new_point_ids.size();
+    const size_t required_observations =
+        graph.observations.size() + new_observation_identities.size();
+    if (!EnsureVectorCapacity(&graph.cameras, required_cameras, result,
+                              error) ||
+        !EnsureVectorCapacity(&graph.images, required_images, result, error) ||
+        !EnsureVectorCapacity(&graph.points, required_points, result, error) ||
+        !EnsureVectorCapacity(&graph.observations, required_observations,
+                              result, error) ||
+        !EnsureHashCapacity(&graph.camera_by_id,
+                            graph.camera_by_id.size() + new_camera_ids.size(),
+                            result, error) ||
+        !EnsureHashCapacity(&graph.image_by_id,
+                            graph.image_by_id.size() + new_image_ids.size(),
+                            result, error) ||
+        !EnsureHashCapacity(&graph.point_by_id,
+                            graph.point_by_id.size() + new_point_ids.size(),
+                            result, error) ||
+        !EnsureHashCapacity(
+            &graph.observation_by_identity,
+            graph.observation_by_identity.size() +
+                new_observation_identities.size(),
+            result, error)) {
+      return false;
+    }
+
     MapInsertionRollback new_keys(&graph);
-    new_keys.cameras.reserve(mutation.camera_upserts.size());
-    new_keys.images.reserve(mutation.image_upserts.size());
-    new_keys.points.reserve(mutation.point_upserts.size());
-    new_keys.observations.reserve(mutation.observation_upserts.size());
-    graph.cameras.reserve(graph.cameras.size() + mutation.camera_upserts.size());
-    graph.images.reserve(graph.images.size() + mutation.image_upserts.size());
-    graph.points.reserve(graph.points.size() + mutation.point_upserts.size());
-    graph.observations.reserve(graph.observations.size() +
-                               mutation.observation_upserts.size());
-    graph.image_incidence_nodes.reserve(
-        graph.image_incidence_nodes.size() +
-        mutation.observation_upserts.size());
-    graph.point_incidence_nodes.reserve(
-        graph.point_incidence_nodes.size() +
-        mutation.observation_upserts.size());
-    graph.camera_by_id.reserve(graph.camera_by_id.size() +
-                               mutation.camera_upserts.size());
-    graph.image_by_id.reserve(graph.image_by_id.size() +
-                              mutation.image_upserts.size());
-    graph.point_by_id.reserve(graph.point_by_id.size() +
-                              mutation.point_upserts.size());
-    graph.observation_by_identity.reserve(
-        graph.observation_by_identity.size() +
-        mutation.observation_upserts.size());
+    new_keys.cameras.reserve(new_camera_ids.size());
+    new_keys.images.reserve(new_image_ids.size());
+    new_keys.points.reserve(new_point_ids.size());
+    new_keys.observations.reserve(new_observation_identities.size());
 
     for (const HostBaCameraRecord& value : mutation.camera_upserts) {
       if (graph.camera_by_id.count(value.camera_id) != 0) continue;
@@ -866,7 +1030,9 @@ bool HostBaGraphStore::ApplyCoalescedMutation(
       HostBaObservationSlot value;
       if (slot < graph.observations.size()) value = graph.observations[slot];
       value.header.slot = slot;
-      return staged_observations.emplace(slot, value).first->second;
+      const auto inserted = staged_observations.emplace(slot, value);
+      staged_observation_order.push_back(slot);
+      return inserted.first->second;
     };
     const auto camera_value = [&](const uint32_t slot)
         -> const HostBaCameraSlot* {
@@ -1052,15 +1218,15 @@ bool HostBaGraphStore::ApplyCoalescedMutation(
         return false;
       }
     }
-    for (auto& staged : staged_observations) {
-      HostBaObservationSlot& observation = staged.second;
+    for (const uint32_t slot : staged_observation_order) {
+      HostBaObservationSlot& observation = staged_observations.at(slot);
       const HostBaImageSlot* image = image_value(observation.image_slot);
       const HostBaPointSlot* point = point_value(observation.point_slot);
       if (observation.header.alive &&
           (image == nullptr || point == nullptr || !image->header.alive ||
            !point->header.alive)) {
         observation.header.alive = 0;
-        cascaded_observations.insert(staged.first);
+        cascaded_observations.insert(slot);
       }
     }
 
@@ -1096,9 +1262,8 @@ bool HostBaGraphStore::ApplyCoalescedMutation(
           static_cast<int64_t>(point.track_length) + delta);
       return true;
     };
-    for (auto& staged : staged_observations) {
-      const uint32_t slot = staged.first;
-      HostBaObservationSlot& value = staged.second;
+    for (const uint32_t slot : staged_observation_order) {
+      HostBaObservationSlot& value = staged_observations.at(slot);
       HostBaObservationSlot original;
       original.header.slot = slot;
       if (slot < graph.observations.size()) original = graph.observations[slot];
@@ -1164,6 +1329,22 @@ bool HostBaGraphStore::ApplyCoalescedMutation(
       ++point.lifetime_incidence_count;
       point_nodes.push_back(point_node);
     }
+    if (!CanAppendUint32(graph.image_incidence_nodes.size(),
+                         image_nodes.size()) ||
+        !CanAppendUint32(graph.point_incidence_nodes.size(),
+                         point_nodes.size())) {
+      return SetError("host BA graph incidence capacity exhausted", error);
+    }
+    if (!EnsureVectorCapacity(
+            &graph.image_incidence_nodes,
+            graph.image_incidence_nodes.size() + image_nodes.size(), result,
+            error) ||
+        !EnsureVectorCapacity(
+            &graph.point_incidence_nodes,
+            graph.point_incidence_nodes.size() + point_nodes.size(), result,
+            error)) {
+      return false;
+    }
 
     for (const auto& staged : staged_images) {
       const HostBaImageSlot& image = staged.second;
@@ -1228,30 +1409,23 @@ bool HostBaGraphStore::ApplyCoalescedMutation(
       else
         ++result->updated_slots;
     }
-    for (auto& staged : staged_observations) {
-      HostBaObservationSlot value = staged.second;
-      const bool existed = staged.first < graph.observations.size();
+    for (const uint32_t slot : staged_observation_order) {
+      HostBaObservationSlot value = staged_observations.at(slot);
+      const bool existed = slot < graph.observations.size();
       const HostBaObservationSlot original =
-          existed ? graph.observations[staged.first] : HostBaObservationSlot();
+          existed ? graph.observations[slot] : HostBaObservationSlot();
       if (existed && SameObservation(original, value)) continue;
       value.header.generation = candidate_generation;
-      observation_commits.emplace_back(staged.first, value);
+      observation_commits.emplace_back(slot, value);
       if (!existed)
         ++result->appended_slots;
       else if (original.header.alive && !value.header.alive)
         ++result->tombstoned_slots;
       else
         ++result->updated_slots;
-      if (cascaded_observations.count(staged.first) != 0)
+      if (cascaded_observations.count(slot) != 0)
         ++result->cascaded_observation_tombstones;
     }
-    const auto by_slot = [](const auto& lhs, const auto& rhs) {
-      return lhs.first < rhs.first;
-    };
-    std::sort(camera_commits.begin(), camera_commits.end(), by_slot);
-    std::sort(image_commits.begin(), image_commits.end(), by_slot);
-    std::sort(point_commits.begin(), point_commits.end(), by_slot);
-    std::sort(observation_commits.begin(), observation_commits.end(), by_slot);
     result->touched_entity_records = camera_commits.size() +
                                      image_commits.size() +
                                      point_commits.size();
@@ -1267,6 +1441,7 @@ bool HostBaGraphStore::ApplyCoalescedMutation(
       result->generation_after = graph.generation;
       result->semantic_noop = true;
       result->published = true;
+      accepted_batch_failure.Disarm();
       return true;
     }
 
@@ -1294,6 +1469,7 @@ bool HostBaGraphStore::ApplyCoalescedMutation(
     result->revision_after = graph.topology_revision;
     result->generation_after = graph.generation;
     result->published = true;
+    accepted_batch_failure.Disarm();
     return true;
   } catch (const std::bad_alloc&) {
     return SetError("host BA graph mutation allocation failed", error);
@@ -1315,7 +1491,13 @@ CatalogReadLease HostBaGraphStore::AcquireReadLease() const noexcept {
   }
 }
 bool HostBaGraphStore::IsCurrent(const CatalogReadLease& lease) const noexcept {
-  return lease.valid() && valid_ && publication_ != nullptr &&
+  if (!lease.valid() || gate_ == nullptr || lease.guard_ == nullptr ||
+      lease.guard_->gate.get() != gate_.get()) {
+    return false;
+  }
+  // A same-gate lease owns the shared lock, so these mutable fields are stable
+  // without recursively acquiring shared_timed_mutex.
+  return valid_ && publication_ != nullptr &&
          lease.publication_ == publication_ &&
          lease.generation() == publication_->generation &&
          lease.topology_revision() == publication_->topology_revision;

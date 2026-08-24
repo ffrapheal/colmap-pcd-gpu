@@ -127,6 +127,10 @@ BOOST_AUTO_TEST_CASE(ColdBuildLeaseAndNativeView) {
   std::string error;
   BOOST_REQUIRE_MESSAGE(store.ColdBuild(MakeGraph(), &update, &error), error);
   BOOST_CHECK(update.published);
+  BOOST_CHECK_EQUAL(update.capacity_growth_events, 6);
+  BOOST_CHECK_EQUAL(update.capacity_growth_copy_bytes, 0);
+  BOOST_CHECK_EQUAL(update.hash_rehash_events, 4);
+  BOOST_CHECK_EQUAL(update.hash_rehash_entries, 0);
   BOOST_CHECK_EQUAL(store.generation(), 1);
   const CatalogReadLease lease = store.AcquireReadLease();
   BOOST_REQUIRE(lease.valid());
@@ -209,25 +213,54 @@ BOOST_AUTO_TEST_CASE(TransactionNoopReassignAndFailureDoNotPartiallyPublish) {
   BOOST_CHECK_EQUAL(store.topology_revision(), 2);
   BOOST_CHECK(!store.IsCurrent(generation1));
 
-  CoalescedBaGraphMutation invalid;
-  invalid.owner_epoch = 101;
-  invalid.revision_before = 2;
-  invalid.revision_after = 3;
-  invalid.observation_upserts.push_back({20, 2, 999, {{3.0, 4.0}}});
-  BOOST_CHECK(!store.ApplyCoalescedMutation(invalid, &update, &error));
+  CoalescedBaGraphMutation wrong_owner;
+  wrong_owner.owner_epoch = 202;
+  wrong_owner.revision_before = 2;
+  wrong_owner.revision_after = 3;
+  BOOST_CHECK(!store.ApplyCoalescedMutation(wrong_owner, &update, &error));
+  BOOST_CHECK(store.AcquireReadLease().valid());
+  CoalescedBaGraphMutation stale_duplicate;
+  stale_duplicate.owner_epoch = 101;
+  stale_duplicate.revision_before = 1;
+  stale_duplicate.revision_after = 2;
+  BOOST_CHECK(
+      !store.ApplyCoalescedMutation(stale_duplicate, &update, &error));
+  BOOST_CHECK(store.AcquireReadLease().valid());
+  CoalescedBaGraphMutation malformed;
+  malformed.owner_epoch = 101;
+  malformed.revision_before = 2;
+  malformed.revision_after = 2;
+  BOOST_CHECK(!store.ApplyCoalescedMutation(malformed, &update, &error));
+  BOOST_CHECK(store.AcquireReadLease().valid());
+
+  CoalescedBaGraphMutation accepted_invalid;
+  accepted_invalid.owner_epoch = 101;
+  accepted_invalid.revision_before = 2;
+  accepted_invalid.revision_after = 3;
+  accepted_invalid.observation_upserts.push_back(
+      {20, 2, 999, {{3.0, 4.0}}});
+  BOOST_CHECK(
+      !store.ApplyCoalescedMutation(accepted_invalid, &update, &error));
   BOOST_CHECK(!update.published);
+  BOOST_CHECK(update.full_rebuild_required);
   BOOST_CHECK_EQUAL(store.topology_revision(), 2);
   BOOST_CHECK_EQUAL(store.generation(), 1);
+  BOOST_CHECK(!store.AcquireReadLease().valid());
+  HostBaGraphColdInput accepted_failure_rebuild = MakeGraph();
+  accepted_failure_rebuild.topology_revision = 3;
+  BOOST_REQUIRE_MESSAGE(
+      store.ColdBuild(accepted_failure_rebuild, &update, &error), error);
   {
     const CatalogReadLease lease = store.AcquireReadLease();
     BOOST_REQUIRE(lease.valid());
+    BOOST_CHECK_EQUAL(lease.topology_revision(), 3);
     BOOST_CHECK(lease.FindObservation(20, 2) == nullptr);
   }
 
   CoalescedBaGraphMutation reassign;
   reassign.owner_epoch = 101;
-  reassign.revision_before = 2;
-  reassign.revision_after = 3;
+  reassign.revision_before = 3;
+  reassign.revision_after = 4;
   reassign.camera_upserts.push_back({8, 4, 1920, 1080, 8});
   reassign.image_upserts.push_back({21, 8, true});
   reassign.point_upserts.push_back({31});
@@ -264,15 +297,15 @@ BOOST_AUTO_TEST_CASE(TransactionNoopReassignAndFailureDoNotPartiallyPublish) {
 
   CoalescedBaGraphMutation erase;
   erase.owner_epoch = 101;
-  erase.revision_before = 3;
-  erase.revision_after = 4;
+  erase.revision_before = 4;
+  erase.revision_after = 5;
   erase.tombstone_point_ids.push_back(31);
   BOOST_REQUIRE(store.ApplyCoalescedMutation(erase, &update, &error));
   BOOST_CHECK(!store.AcquireReadLease().points()[1].header.alive);
   CoalescedBaGraphMutation revive;
   revive.owner_epoch = 101;
-  revive.revision_before = 4;
-  revive.revision_after = 5;
+  revive.revision_before = 5;
+  revive.revision_after = 6;
   revive.point_upserts.push_back({31});
   revive.observation_upserts.push_back({21, 1, 31, {{110.0, 210.0}}});
   BOOST_REQUIRE(store.ApplyCoalescedMutation(revive, &update, &error));
@@ -282,30 +315,30 @@ BOOST_AUTO_TEST_CASE(TransactionNoopReassignAndFailureDoNotPartiallyPublish) {
 
   CoalescedBaGraphMutation full_rebuild;
   full_rebuild.owner_epoch = 101;
-  full_rebuild.revision_before = 5;
-  full_rebuild.revision_after = 6;
+  full_rebuild.revision_before = 6;
+  full_rebuild.revision_after = 7;
   full_rebuild.force_full_rebuild = true;
   BOOST_CHECK(!store.ApplyCoalescedMutation(full_rebuild, &update, &error));
   BOOST_CHECK(update.full_rebuild_required);
-  BOOST_CHECK_EQUAL(store.topology_revision(), 5);
+  BOOST_CHECK_EQUAL(store.topology_revision(), 6);
   BOOST_CHECK(!store.AcquireReadLease().valid());
 
   HostBaGraphColdInput invalid_rebuild = MakeGraph();
-  invalid_rebuild.topology_revision = 6;
+  invalid_rebuild.topology_revision = 7;
   invalid_rebuild.cameras.clear();
   BOOST_CHECK(!store.ColdBuild(invalid_rebuild, &update, &error));
-  BOOST_CHECK_EQUAL(store.topology_revision(), 5);
+  BOOST_CHECK_EQUAL(store.topology_revision(), 6);
   HostBaGraphColdInput rebuild = MakeGraph();
-  rebuild.topology_revision = 6;
+  rebuild.topology_revision = 7;
   BOOST_REQUIRE_MESSAGE(store.ColdBuild(rebuild, &update, &error), error);
   BOOST_CHECK(update.full_rebuild);
-  BOOST_CHECK_EQUAL(store.topology_revision(), 6);
+  BOOST_CHECK_EQUAL(store.topology_revision(), 7);
   BOOST_CHECK_GT(store.generation(), generation2_value);
 
   CoalescedBaGraphMutation camera_delete;
   camera_delete.owner_epoch = 101;
-  camera_delete.revision_before = 6;
-  camera_delete.revision_after = 7;
+  camera_delete.revision_before = 7;
+  camera_delete.revision_after = 8;
   camera_delete.tombstone_camera_ids.push_back(7);
   BOOST_CHECK(!store.ApplyCoalescedMutation(camera_delete, &update, &error));
   BOOST_CHECK(update.full_rebuild_required);
@@ -321,7 +354,16 @@ BOOST_AUTO_TEST_CASE(OwnerIsolationAndCascadingTombstone) {
   HostBaGraphColdInput other = MakeGraph();
   other.owner_epoch = 202;
   BOOST_REQUIRE(second.ColdBuild(other, &update, &error));
-  BOOST_CHECK(!second.IsCurrent(first.AcquireReadLease()));
+  {
+    const CatalogReadLease first_lease = first.AcquireReadLease();
+    const CatalogReadLease second_lease = second.AcquireReadLease();
+    BOOST_REQUIRE(first_lease.valid());
+    BOOST_REQUIRE(second_lease.valid());
+    BOOST_CHECK(first.IsCurrent(first_lease));
+    BOOST_CHECK(second.IsCurrent(second_lease));
+    BOOST_CHECK(!second.IsCurrent(first_lease));
+    BOOST_CHECK(!first.IsCurrent(second_lease));
+  }
 
   CoalescedBaGraphMutation mutation;
   mutation.owner_epoch = 101;
@@ -355,6 +397,10 @@ BOOST_AUTO_TEST_CASE(DeltaComplexityTracksOnlyTouchedIncidence) {
     BOOST_CHECK(update.in_place_delta);
     BOOST_CHECK_EQUAL(update.transaction_copy_bytes, 0);
     BOOST_CHECK_EQUAL(update.full_catalog_scans, 0);
+    BOOST_CHECK_EQUAL(update.capacity_growth_events, 0);
+    BOOST_CHECK_EQUAL(update.capacity_growth_copy_bytes, 0);
+    BOOST_CHECK_EQUAL(update.hash_rehash_events, 0);
+    BOOST_CHECK_EQUAL(update.hash_rehash_entries, 0);
   };
 
   CoalescedBaGraphMutation add;
@@ -415,22 +461,6 @@ BOOST_AUTO_TEST_CASE(DeltaComplexityTracksOnlyTouchedIncidence) {
       {10000, 0, 20000, {{0.0, 1.0}}});
   apply(original_to_a);
 
-  CoalescedBaGraphMutation invalid;
-  invalid.owner_epoch = 303;
-  invalid.revision_before = 8;
-  invalid.revision_after = 9;
-  invalid.observation_upserts.push_back(
-      {10000, 2, 999999, {{1.0, 2.0}}});
-  BOOST_CHECK(!store.ApplyCoalescedMutation(invalid, &update, &error));
-  BOOST_CHECK(!update.published);
-  {
-    const CatalogReadLease lease = store.AcquireReadLease();
-    BOOST_REQUIRE(lease.valid());
-    BOOST_CHECK_EQUAL(lease.topology_revision(), 8);
-    BOOST_CHECK(lease.FindObservation(10000, 0)->header.alive);
-    BOOST_CHECK_EQUAL(lease.FindObservation(10000, 0)->point_slot, 0);
-  }
-
   CoalescedBaGraphMutation delete_point;
   delete_point.revision_before = 8;
   delete_point.revision_after = 9;
@@ -455,6 +485,63 @@ BOOST_AUTO_TEST_CASE(DeltaComplexityTracksOnlyTouchedIncidence) {
   BOOST_CHECK_EQUAL(update.adjacency_nodes_visited, 1);
   BOOST_CHECK_LT(update.adjacency_nodes_visited,
                  kUnrelatedObservationCount);
+}
+
+BOOST_AUTO_TEST_CASE(GeometricCapacityGrowthIsAmortized) {
+  HostBaGraphStore store(404);
+  HostBaGraphColdInput cold = MakeGraph();
+  cold.owner_epoch = 404;
+  HostBaGraphUpdateResult update;
+  std::string error;
+  BOOST_REQUIRE_MESSAGE(store.ColdBuild(cold, &update, &error), error);
+
+  uint64_t revision = 1;
+  for (uint64_t i = 0; i < 8; ++i) {
+    CoalescedBaGraphMutation append;
+    append.owner_epoch = 404;
+    append.revision_before = revision;
+    append.revision_after = ++revision;
+    append.point_upserts.push_back({1000 + i});
+    BOOST_REQUIRE_MESSAGE(
+        store.ApplyCoalescedMutation(append, &update, &error), error);
+    BOOST_CHECK_EQUAL(update.capacity_growth_events, 0);
+    BOOST_CHECK_EQUAL(update.hash_rehash_events, 0);
+  }
+
+  CoalescedBaGraphMutation cross_capacity;
+  cross_capacity.owner_epoch = 404;
+  cross_capacity.revision_before = revision;
+  cross_capacity.revision_after = ++revision;
+  for (uint64_t i = 0; i < 60; ++i)
+    cross_capacity.point_upserts.push_back({2000 + i});
+  BOOST_REQUIRE_MESSAGE(
+      store.ApplyCoalescedMutation(cross_capacity, &update, &error), error);
+  BOOST_CHECK_EQUAL(update.capacity_growth_events, 1);
+  BOOST_CHECK_EQUAL(update.capacity_growth_copy_bytes,
+                    9 * sizeof(HostBaPointSlot));
+  BOOST_CHECK_EQUAL(update.hash_rehash_events, 1);
+  BOOST_CHECK_EQUAL(update.hash_rehash_entries, 9);
+
+  CoalescedBaGraphMutation within_headroom;
+  within_headroom.owner_epoch = 404;
+  within_headroom.revision_before = revision;
+  within_headroom.revision_after = ++revision;
+  within_headroom.point_upserts.push_back({3000});
+  BOOST_REQUIRE_MESSAGE(
+      store.ApplyCoalescedMutation(within_headroom, &update, &error), error);
+  BOOST_CHECK_EQUAL(update.capacity_growth_events, 0);
+  BOOST_CHECK_EQUAL(update.hash_rehash_events, 0);
+
+  CoalescedBaGraphMutation update_only;
+  update_only.owner_epoch = 404;
+  update_only.revision_before = revision;
+  update_only.revision_after = ++revision;
+  update_only.point_upserts.push_back({30});
+  BOOST_REQUIRE_MESSAGE(
+      store.ApplyCoalescedMutation(update_only, &update, &error), error);
+  BOOST_CHECK(update.semantic_noop);
+  BOOST_CHECK_EQUAL(update.capacity_growth_events, 0);
+  BOOST_CHECK_EQUAL(update.hash_rehash_events, 0);
 }
 
 BOOST_AUTO_TEST_CASE(GlobalWholeAndSelectionRevisionRemainExplicitIdentity) {
