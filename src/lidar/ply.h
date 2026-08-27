@@ -36,6 +36,7 @@ class PointCloudProcess{
   private:
     std::string path_;
     LidarPointcloudPtr global_pcd_ptr_;
+    LidarPointcloudPtr ba_pcd_ptr_;
     LidarPointcloudPtr downsized_map_ptr_;
 };
 } // lidar

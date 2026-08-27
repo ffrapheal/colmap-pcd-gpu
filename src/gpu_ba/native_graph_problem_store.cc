@@ -2001,10 +2001,22 @@ bool ValidateAndCommitNativeBaDelta(
   std::vector<uint32_t> expected_points = candidate.expected_point_slots;
   std::vector<uint32_t> view_expected_images;
   std::vector<uint32_t> view_expected_points;
-  for (const ImageFixedPolicyResult& value : view.Fixed().images)
-    if (!value.pose_constant) view_expected_images.push_back(value.image_slot);
-  for (const PointFixedPolicyResult& value : view.Fixed().points)
-    if (!value.constant) view_expected_points.push_back(value.point_slot);
+  // The active view may retain selected entities that no longer participate
+  // in any residual after Mapper filtering. They are present in Fixed() but
+  // are intentionally absent from the native CUDA parameter layout and from
+  // the variable-only device download. Derive commit coverage from the
+  // residual-backed parameter ordinals, which are the authoritative solve
+  // parameter set, rather than from every selected fixed-policy record.
+  for (const ParameterOrdinal& value : view.ParameterOrdinals()) {
+    if (value.constant) continue;
+    if (value.kind == ParameterKind::kQuaternion) {
+      view_expected_images.push_back(
+          static_cast<uint32_t>(value.entity_slot));
+    } else if (value.kind == ParameterKind::kPoint3D) {
+      view_expected_points.push_back(
+          static_cast<uint32_t>(value.entity_slot));
+    }
+  }
   std::sort(actual_images.begin(), actual_images.end());
   std::sort(actual_points.begin(), actual_points.end());
   std::sort(expected_images.begin(), expected_images.end());

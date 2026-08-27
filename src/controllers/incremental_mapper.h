@@ -82,6 +82,19 @@ struct IncrementalMapperOptions {
   bool if_add_lidar_constraint = true;
   // Lidar point cloud file
   std::string lidar_pointcloud_path;
+  // Optional point cloud with local normals used only by KD/BA constraints.
+  std::string lidar_ba_pointcloud_path;
+  // Mesh-depth file/cache for initial-pair registration only.
+  std::string initial_mesh_depth_path;
+  std::string initial_mesh_depth_generator_path;
+  std::string initial_mesh_path;
+  std::string initial_mesh_depth_dataset_path;
+  std::string initial_mesh_depth_intrinsics_path;
+  double initial_mesh_depth_fx = 0.0;
+  double initial_mesh_depth_fy = 0.0;
+  double initial_mesh_depth_cx = 0.0;
+  double initial_mesh_depth_cy = 0.0;
+  double initial_mesh_depth_pnp_max_error = 12.0;
   // If use image poses initial guess
   bool if_import_pose_prior = false; 
   // Image poses initial guess file

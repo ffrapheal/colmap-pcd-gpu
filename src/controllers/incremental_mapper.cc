@@ -429,6 +429,21 @@ BundleAdjustmentOptions IncrementalMapperOptions::LocalBundleAdjustment()
 lidar::PcdProjectionOptions IncrementalMapperOptions::PcdProjector() 
     const {
   lidar::PcdProjectionOptions options;
+  options.ba_pointcloud_path = lidar_ba_pointcloud_path;
+  options.initial_mesh_depth_path = initial_mesh_depth_path;
+  options.initial_mesh_depth_generator_path =
+      initial_mesh_depth_generator_path;
+  options.initial_mesh_path = initial_mesh_path;
+  options.initial_mesh_depth_dataset_path =
+      initial_mesh_depth_dataset_path;
+  options.initial_mesh_depth_intrinsics_path =
+      initial_mesh_depth_intrinsics_path;
+  options.initial_mesh_depth_fx = initial_mesh_depth_fx;
+  options.initial_mesh_depth_fy = initial_mesh_depth_fy;
+  options.initial_mesh_depth_cx = initial_mesh_depth_cx;
+  options.initial_mesh_depth_cy = initial_mesh_depth_cy;
+  options.initial_mesh_depth_pnp_max_error =
+      initial_mesh_depth_pnp_max_error;
   options.depth_image_scale = depth_image_scale;
   options.choose_meter = static_cast<float>(choose_meter);
   options.max_proj_scale = max_proj_scale;
@@ -780,10 +795,21 @@ void IncrementalMapperController::Reconstruct(
                   << std::endl;
         mapper.EndReconstruction(kDiscardReconstruction);
         reconstruction_manager_->Delete(reconstruction_idx);
+        if (options_->init_image_id1 == -1 || options_->init_image_id2 == -1) {
+          continue;
+        }
         break;
       }
 
       if (!AdjustGlobalBundle(*options_, &mapper, 0)) {
+        if (options_->init_image_id1 == -1 || options_->init_image_id2 == -1) {
+          std::cout << "  => Initial pair BA failed; trying the next "
+                       "geometrically valid pair."
+                    << std::endl;
+          mapper.EndReconstruction(kDiscardReconstruction);
+          reconstruction_manager_->Delete(reconstruction_idx);
+          continue;
+        }
         ba_failed_.store(true);
         mapper.EndReconstruction(false);
         return;

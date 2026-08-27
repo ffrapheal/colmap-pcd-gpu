@@ -25,7 +25,23 @@ const bool PointCloudProcess::Initialize(const PcdProjectionOptions& pp_options)
     global_pcd_ptr_ = PointCloudDirectionTrans(ptr);
     // Cut point cloud to nodes
     pcd_proj_->BuildSubMap(global_pcd_ptr_);
-    kdtree_ptr_->BuildMap(global_pcd_ptr_);
+
+    ba_pcd_ptr_ = global_pcd_ptr_;
+    if (!pp_options.ba_pointcloud_path.empty() &&
+        pp_options.ba_pointcloud_path != path_) {
+        LidarPointcloudPtr ba_ptr(new LidarPointcloud);
+        if (pcl::io::loadPLYFile<LidarPoint>(
+                pp_options.ba_pointcloud_path, *ba_ptr) == -1) {
+            std::cout << "Couldn't read BA point cloud "
+                      << pp_options.ba_pointcloud_path << std::endl;
+            return false;
+        }
+        std::cout << "Read " << ba_ptr->width * ba_ptr->height
+                  << " BA points from " << pp_options.ba_pointcloud_path
+                  << std::endl << std::endl;
+        ba_pcd_ptr_ = PointCloudDirectionTrans(ba_ptr);
+    }
+    kdtree_ptr_->BuildMap(ba_pcd_ptr_);
 
     return true;
 }

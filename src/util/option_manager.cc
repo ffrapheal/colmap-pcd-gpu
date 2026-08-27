@@ -535,7 +535,29 @@ void OptionManager::AddMapperOptions() {
   AddAndRegisterDefaultOption("Mapper.if_add_lidar_constraint",
                               &mapper->if_add_lidar_constraint);
   AddAndRegisterDefaultOption("Mapper.lidar_pointcloud_path",
-                              &mapper->lidar_pointcloud_path);  
+                              &mapper->lidar_pointcloud_path);
+  AddAndRegisterDefaultOption("Mapper.lidar_ba_pointcloud_path",
+                              &mapper->lidar_ba_pointcloud_path);
+  AddAndRegisterDefaultOption("Mapper.initial_mesh_depth_path",
+                              &mapper->initial_mesh_depth_path);
+  AddAndRegisterDefaultOption("Mapper.initial_mesh_depth_generator_path",
+                              &mapper->initial_mesh_depth_generator_path);
+  AddAndRegisterDefaultOption("Mapper.initial_mesh_path",
+                              &mapper->initial_mesh_path);
+  AddAndRegisterDefaultOption("Mapper.initial_mesh_depth_dataset_path",
+                              &mapper->initial_mesh_depth_dataset_path);
+  AddAndRegisterDefaultOption("Mapper.initial_mesh_depth_intrinsics_path",
+                              &mapper->initial_mesh_depth_intrinsics_path);
+  AddAndRegisterDefaultOption("Mapper.initial_mesh_depth_fx",
+                              &mapper->initial_mesh_depth_fx);
+  AddAndRegisterDefaultOption("Mapper.initial_mesh_depth_fy",
+                              &mapper->initial_mesh_depth_fy);
+  AddAndRegisterDefaultOption("Mapper.initial_mesh_depth_cx",
+                              &mapper->initial_mesh_depth_cx);
+  AddAndRegisterDefaultOption("Mapper.initial_mesh_depth_cy",
+                              &mapper->initial_mesh_depth_cy);
+  AddAndRegisterDefaultOption("Mapper.initial_mesh_depth_pnp_max_error",
+                              &mapper->initial_mesh_depth_pnp_max_error);
   AddAndRegisterDefaultOption("Mapper.if_import_pose_prior",
                               &mapper->if_import_pose_prior);  
   AddAndRegisterDefaultOption("Mapper.image_pose_prior_path",

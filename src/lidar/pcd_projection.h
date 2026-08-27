@@ -32,6 +32,22 @@ class NonBaStageSink;
 namespace lidar{
 
 struct PcdProjectionOptions {
+  std::string ba_pointcloud_path;
+  // Float32 axial-depth file or on-demand cache directory used only to
+  // initialize image pairs. Later registration and triangulation do not read
+  // it.
+  std::string initial_mesh_depth_path;
+  // Optional on-demand renderer. When initial_mesh_depth_path is a directory,
+  // the first image of each attempted model is rendered once and cached there.
+  std::string initial_mesh_depth_generator_path;
+  std::string initial_mesh_path;
+  std::string initial_mesh_depth_dataset_path;
+  std::string initial_mesh_depth_intrinsics_path;
+  double initial_mesh_depth_fx = 0.0;
+  double initial_mesh_depth_fy = 0.0;
+  double initial_mesh_depth_cx = 0.0;
+  double initial_mesh_depth_cy = 0.0;
+  double initial_mesh_depth_pnp_max_error = 12.0;
   double depth_image_scale = 0.2;
   bool if_save_depth_image = false;
   std::string depth_image_folder = "/Users/baixuxing/code/colmap/25-photos/test";
@@ -83,6 +99,13 @@ class PcdProj{
             const Camera& camera, 
             std::vector<std::pair<Eigen::Vector2d, bool>,Eigen::aligned_allocator<std::pair<Eigen::Vector2d, bool>>>& pt_xys, 
             std::vector<Eigen::Vector3d,Eigen::aligned_allocator<Eigen::Vector3d>>& pt_xyzs);
+    bool HasInitialMeshDepth() const;
+    double InitialMeshDepthPnpMaxError() const;
+    bool SetInitialImageFromMeshDepth(
+        const Image& image,
+        const Camera& camera,
+        std::vector<std::pair<Eigen::Vector2d, bool>, Eigen::aligned_allocator<std::pair<Eigen::Vector2d, bool>>>& pt_xys,
+        std::vector<Eigen::Vector3d, Eigen::aligned_allocator<Eigen::Vector3d>>& pt_xyzs) const;
     inline KeyType GetKeyType(const PointType& pt){
       Eigen::Vector3f pt_cor = pt.getVector3fMap();
       KeyType key;
@@ -186,6 +209,7 @@ class PcdProj{
     void SearchImageMap(QuadPyramid& quad, ImageMapType& image_map);
     // Distort model of the opencv model
     Eigen::Vector2d DistortOpenCV(Eigen::Vector2d& ori_uv, const Camera& camera);
+    std::string ResolveInitialMeshDepthPath(const Image& image) const;
 
     MapType global_map_ptr_; // ptr to the whole point cloud map
     PcdProjectionOptions options_;
@@ -200,6 +224,7 @@ class PcdProj{
     std::map<KeyType,NodeType,compare> submap_;
 
     std::mutex proj_mutex_;
+    mutable std::mutex initial_mesh_depth_mutex_;
     NonBaStageSink* non_ba_profiler_ = nullptr;
 
 };

@@ -10,7 +10,9 @@ build*/
 install-debug/
 install-release/
 data/
+/Data/
 doc/_build
+*.code-workspace
 
 # Compiled Object files
 *.slo

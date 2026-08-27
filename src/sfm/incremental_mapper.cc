@@ -181,6 +181,7 @@ void IncrementalMapper::BeginReconstruction(
 
   prev_init_image_pair_id_ = kInvalidImagePairId;
   prev_init_two_view_geometry_ = TwoViewGeometry();
+  initial_anchor_image_id_ = kInvalidImageId;
 
   filtered_images_.clear();
   num_reg_trials_.clear();
@@ -474,6 +475,7 @@ bool IncrementalMapper::RegisterInitialImagePair(const Options& options,
 
   reconstruction_->RegisterImage(image_id1);
   reconstruction_->RegisterImage(image_id2);
+  initial_anchor_image_id_ = image_id1;
   RegisterImageEvent(image_id1);
   RegisterImageEvent(image_id2);
 
@@ -512,6 +514,7 @@ bool IncrementalMapper::RegisterInitialImagePair(const Options& options,
 
   return true;
 }
+
 bool IncrementalMapper::RegisterInitialImagePairByDepthProj(const Options& options,
                                                             const image_t image_id1,
                                                             const image_t image_id2){
@@ -607,8 +610,16 @@ bool IncrementalMapper::RegisterInitialImagePairByDepthProj(const Options& optio
     NonBaStageScope projection(
         non_ba_profiler_, NonBaStageId::kInitialLidarProjection,
         image1_point2ds.size());
-    lidar_pointcloud_process_->pcd_proj_->SetNewImage(
-        image1, camera1, image1_point2ds, image1_pt_xyzs);
+    const auto& projector = lidar_pointcloud_process_->pcd_proj_;
+    if (projector->HasInitialMeshDepth()) {
+      if (!projector->SetInitialImageFromMeshDepth(
+              image1, camera1, image1_point2ds, image1_pt_xyzs)) {
+        return false;
+      }
+    } else {
+      projector->SetNewImage(
+          image1, camera1, image1_point2ds, image1_pt_xyzs);
+    }
     size_t projected_matches = 0;
     if (non_ba_profiler_ != nullptr) {
       for (const auto& point2D : image1_point2ds) {
@@ -637,7 +648,11 @@ bool IncrementalMapper::RegisterInitialImagePairByDepthProj(const Options& optio
   abs_pose_options.num_focal_length_samples = 30;
   abs_pose_options.min_focal_length_ratio = options.min_focal_length_ratio;
   abs_pose_options.max_focal_length_ratio = options.max_focal_length_ratio;
-  abs_pose_options.ransac_options.max_error = options.abs_pose_max_error;
+  abs_pose_options.ransac_options.max_error =
+      lidar_pointcloud_process_->pcd_proj_->HasInitialMeshDepth()
+          ? lidar_pointcloud_process_->pcd_proj_
+                ->InitialMeshDepthPnpMaxError()
+          : options.abs_pose_max_error;
   abs_pose_options.ransac_options.min_inlier_ratio =
       options.abs_pose_min_inlier_ratio;
   // Use high confidence to avoid preemptive termination of P3P RANSAC
@@ -686,6 +701,7 @@ bool IncrementalMapper::RegisterInitialImagePairByDepthProj(const Options& optio
         non_ba_profiler_, NonBaStageId::kInitialCommit, num_inliers);
     reconstruction_->RegisterImage(image_id1);
     reconstruction_->RegisterImage(image_id2);
+    initial_anchor_image_id_ = image_id1;
     RegisterImageEvent(image_id1);
     RegisterImageEvent(image_id2);
     Track track;
@@ -998,22 +1014,18 @@ IncrementalMapper::AdjustLocalBundle(
 
     ba_config.AddImage(image_id);
 
-    bool if_first_image_exist = false;
-
     for (const image_t local_image_id : local_bundle) {
-      if (local_image_id == options.init_image_id1){
-          if_first_image_exist = true;
-      }
       ba_config.AddImage(local_image_id);
     }
     // for (const image_t local_image_id : local_bundle) {
     //   ba_config.AddImage(local_image_id);
     // }
-    if (ba_options.if_add_lidar_constraint && 
-        if_first_image_exist && 
-        reconstruction_->NumRegImages() < options.first_image_fixed_frames){
-      ba_config.SetConstantPose(options.init_image_id1);
-    } 
+    if (ba_options.if_add_lidar_constraint &&
+        ba_config.HasImage(initial_anchor_image_id_) &&
+        reconstruction_->NumRegImages() <
+            static_cast<size_t>(options.first_image_fixed_frames)) {
+      ba_config.SetConstantPose(initial_anchor_image_id_);
+    }
 
     // Fix the existing images, if option specified.
     if (options.fix_existing_images) {
@@ -1416,10 +1428,14 @@ bool IncrementalMapper::AdjustGlobalBundleByLidar(
     //     !existing_image_ids_.count(reg_image_ids[1])) {
     //   ba_config.SetConstantTvec(reg_image_ids[1], {0});
     // }
-    int num = reg_image_ids.size() - 1;
-    if (num < options.first_image_fixed_frames) {
-      ba_config.SetConstantPose(options.init_image_id1);
-      num += 1;
+    const size_t num_other_images = reg_image_ids.size() - 1;
+    if (num_other_images <
+        static_cast<size_t>(options.first_image_fixed_frames)) {
+      image_t fixed_image_id = initial_anchor_image_id_;
+      if (!ba_config.HasImage(fixed_image_id)) {
+        fixed_image_id = reg_image_ids.front();
+      }
+      ba_config.SetConstantPose(fixed_image_id);
     }
     image_config.SetOutputItems(ba_config.NumImages());
   }

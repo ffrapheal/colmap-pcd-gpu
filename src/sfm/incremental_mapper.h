@@ -222,7 +222,7 @@ class IncrementalMapper {
   // Attempt to seed the reconstruction from an image pair.
   bool RegisterInitialImagePair(const Options& options, const image_t image_id1,
                                 const image_t image_id2);
-                                
+
   // Attempt to seed tne reconstruction from an image pair and lidar pointcloud.
   bool RegisterInitialImagePairByDepthProj(const Options& options,
                                                             const image_t image_id1,
@@ -391,6 +391,7 @@ class IncrementalMapper {
   std::shared_ptr<lidar::PointCloudProcess> lidar_pointcloud_process_;
   bool if_import_pose_prior_ = false;// if initial image pose guess exist
   std::map<uint32_t, std::vector<double>> existed_poses_;// existed initial image pose guess
+  image_t initial_anchor_image_id_ = kInvalidImageId;
 #ifdef GPU_BA_CUDA_ENABLED
   gpu_ba::CudaHostProblemStoreMode gpu_ba_host_store_mode_ =
       gpu_ba::CudaHostProblemStoreMode::kDisabled;

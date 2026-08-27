@@ -5,10 +5,216 @@
 #include "pcd_projection.h"
 #include "sfm/nonba_profiler.h"
 
+#include <algorithm>
+#include <cerrno>
+#include <cctype>
+#include <cstring>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#include <vector>
+
 namespace colmap{
 namespace lidar{
 
 using namespace Eigen;
+
+namespace {
+
+bool IsRegularFile(const std::string& path) {
+    struct stat status;
+    return stat(path.c_str(), &status) == 0 && S_ISREG(status.st_mode);
+}
+
+std::string JoinPath(const std::string& directory,
+                     const std::string& filename) {
+    if (directory.empty() || directory.back() == '/') {
+        return directory + filename;
+    }
+    return directory + "/" + filename;
+}
+
+bool ParseFrameId(const std::string& image_name, std::string* frame_id) {
+    const size_t slash = image_name.find_last_of("/\\");
+    const size_t begin = slash == std::string::npos ? 0 : slash + 1;
+    const size_t dot = image_name.find_last_of('.');
+    size_t end = dot == std::string::npos || dot < begin
+                     ? image_name.size()
+                     : dot;
+    size_t digits_begin = end;
+    while (digits_begin > begin &&
+           std::isdigit(static_cast<unsigned char>(image_name[digits_begin - 1]))) {
+        --digits_begin;
+    }
+    if (digits_begin == end) {
+        return false;
+    }
+    try {
+        *frame_id = std::to_string(
+            std::stoull(image_name.substr(digits_begin, end - digits_begin)));
+    } catch (const std::exception&) {
+        return false;
+    }
+    return true;
+}
+
+bool RunProcess(const std::vector<std::string>& arguments) {
+    if (arguments.empty()) {
+        return false;
+    }
+    std::vector<char*> argv;
+    argv.reserve(arguments.size() + 1);
+    for (const std::string& argument : arguments) {
+        argv.push_back(const_cast<char*>(argument.c_str()));
+    }
+    argv.push_back(nullptr);
+
+    const pid_t child = fork();
+    if (child < 0) {
+        std::cerr << "Failed to fork mesh-depth renderer: "
+                  << std::strerror(errno) << std::endl;
+        return false;
+    }
+    if (child == 0) {
+        execv(argv[0], argv.data());
+        _exit(127);
+    }
+
+    int status = 0;
+    pid_t waited;
+    do {
+        waited = waitpid(child, &status, 0);
+    } while (waited < 0 && errno == EINTR);
+    return waited == child && WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
+
+}  // namespace
+
+bool PcdProj::HasInitialMeshDepth() const {
+    return !options_.initial_mesh_depth_path.empty() &&
+           (IsRegularFile(options_.initial_mesh_depth_path) ||
+            (!options_.initial_mesh_depth_generator_path.empty() &&
+             !options_.initial_mesh_path.empty() &&
+             !options_.initial_mesh_depth_dataset_path.empty() &&
+             !options_.initial_mesh_depth_intrinsics_path.empty()));
+}
+
+double PcdProj::InitialMeshDepthPnpMaxError() const {
+    return options_.initial_mesh_depth_pnp_max_error;
+}
+
+std::string PcdProj::ResolveInitialMeshDepthPath(const Image& image) const {
+    if (IsRegularFile(options_.initial_mesh_depth_path)) {
+        return options_.initial_mesh_depth_path;
+    }
+
+    std::string frame_id;
+    if (!ParseFrameId(image.Name(), &frame_id)) {
+        std::cerr << "Cannot extract frame id for mesh depth from image name: "
+                  << image.Name() << std::endl;
+        return std::string();
+    }
+
+    const std::string depth_path = JoinPath(
+        options_.initial_mesh_depth_path,
+        "imgs_" + frame_id + "_mesh_depth_m.tiff");
+    std::lock_guard<std::mutex> lock(initial_mesh_depth_mutex_);
+    if (IsRegularFile(depth_path)) {
+        std::cout << "Initial mesh depth cache hit: " << depth_path
+                  << std::endl;
+        return depth_path;
+    }
+
+    const std::string odometry_path = JoinPath(
+        options_.initial_mesh_depth_dataset_path,
+        "odoms_" + frame_id + ".txt");
+    const std::vector<std::string> arguments = {
+        options_.initial_mesh_depth_generator_path,
+        options_.initial_mesh_depth_dataset_path,
+        frame_id,
+        options_.initial_mesh_path,
+        "--output-directory",
+        options_.initial_mesh_depth_path,
+        "--intrinsics",
+        options_.initial_mesh_depth_intrinsics_path,
+        "--odometry",
+        odometry_path};
+    std::cout << "Rendering initial mesh depth for " << image.Name()
+              << " from " << options_.initial_mesh_path << std::endl;
+    if (!RunProcess(arguments) || !IsRegularFile(depth_path)) {
+        std::cerr << "Failed to generate initial mesh depth: " << depth_path
+                  << std::endl;
+        return std::string();
+    }
+    return depth_path;
+}
+
+bool PcdProj::SetInitialImageFromMeshDepth(
+        const Image& image,
+        const Camera& camera,
+        std::vector<std::pair<Eigen::Vector2d, bool>, Eigen::aligned_allocator<std::pair<Eigen::Vector2d, bool>>>& pt_xys,
+        std::vector<Eigen::Vector3d, Eigen::aligned_allocator<Eigen::Vector3d>>& pt_xyzs) const {
+    pt_xyzs.clear();
+    pt_xyzs.reserve(pt_xys.size());
+
+    const std::string depth_path = ResolveInitialMeshDepthPath(image);
+    if (depth_path.empty()) {
+        return false;
+    }
+    const cv::Mat depth = cv::imread(depth_path, cv::IMREAD_UNCHANGED);
+    if (depth.empty() || depth.type() != CV_32FC1) {
+        std::cerr << "Failed to load float32 initial mesh depth: "
+                  << depth_path << std::endl;
+        return false;
+    }
+    if (!(options_.initial_mesh_depth_fx > 0.0) ||
+        !(options_.initial_mesh_depth_fy > 0.0)) {
+        std::cerr << "Initial mesh depth intrinsics must have positive fx/fy."
+                  << std::endl;
+        return false;
+    }
+
+    const Eigen::Matrix3d rotation_wc = image.RotationMatrix().transpose();
+    const Eigen::Vector3d center_world = image.ProjectionCenter();
+    size_t valid_depths = 0;
+    for (auto& pt_xy : pt_xys) {
+        const Eigen::Vector2d normalized = camera.ImageToWorld(pt_xy.first);
+        const double depth_u =
+            options_.initial_mesh_depth_fx * normalized.x() +
+            options_.initial_mesh_depth_cx;
+        const double depth_v =
+            options_.initial_mesh_depth_fy * normalized.y() +
+            options_.initial_mesh_depth_cy;
+        const int u = static_cast<int>(std::lround(depth_u));
+        const int v = static_cast<int>(std::lround(depth_v));
+        if (u < 0 || u >= depth.cols || v < 0 || v >= depth.rows) {
+            pt_xy.second = false;
+            pt_xyzs.push_back(Eigen::Vector3d::Zero());
+            continue;
+        }
+
+        const float z = depth.at<float>(v, u);
+        if (!std::isfinite(z) || z <= 0.0f) {
+            pt_xy.second = false;
+            pt_xyzs.push_back(Eigen::Vector3d::Zero());
+            continue;
+        }
+
+        const Eigen::Vector3d point_camera(
+            static_cast<double>(z) * normalized.x(),
+            static_cast<double>(z) * normalized.y(),
+            static_cast<double>(z));
+        pt_xy.second = true;
+        pt_xyzs.push_back(center_world + rotation_wc * point_camera);
+        ++valid_depths;
+    }
+
+    std::cout << "Initial mesh depth: " << valid_depths << "/"
+              << pt_xys.size() << " matched features have valid depth from "
+              << depth_path << std::endl;
+    return true;
+}
 
 void PcdProj::SetNewImage(const Image& image, const Camera& camera, std::map<point3D_t,Eigen::Matrix<double,6,1>>& map){
     NonBaStageSink* const non_ba_profiler = non_ba_profiler_;
