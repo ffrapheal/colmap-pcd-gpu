@@ -33,8 +33,11 @@
 
 #include <array>
 #include <atomic>
+#include <cmath>
 #include <fstream>
 #include <iostream>
+#include <limits>
+#include <map>
 
 #include "base/projection.h"
 #include "base/triangulation.h"
@@ -185,6 +188,7 @@ void IncrementalMapper::BeginReconstruction(
 
   filtered_images_.clear();
   num_reg_trials_.clear();
+  mesh_depth_feature_cache_.clear();
 }
 
 void IncrementalMapper::EndReconstruction(const bool discard) {
@@ -426,6 +430,344 @@ std::vector<image_t> IncrementalMapper::FindNextImages(const Options& options) {
   SortAndAppendNextImages(other_image_ranks, &ranked_images_ids);
 
   return ranked_images_ids;
+}
+
+std::vector<image_t> IncrementalMapper::FindNextImagesFromPosePrior(
+    const Options& options) {
+  CHECK_NOTNULL(reconstruction_);
+  CHECK(options.Check());
+
+  const CorrespondenceGraph& correspondence_graph =
+      database_cache_->CorrespondenceGraph();
+  std::vector<std::pair<image_t, float>> image_ranks;
+  std::vector<std::pair<image_t, float>> other_image_ranks;
+
+  for (const auto& image_entry : reconstruction_->Images()) {
+    const image_t image_id = image_entry.first;
+    if (image_entry.second.IsRegistered() ||
+        existed_poses_.count(image_id) == 0) {
+      continue;
+    }
+
+    const size_t num_reg_trials = num_reg_trials_[image_id];
+    if (num_reg_trials >= static_cast<size_t>(options.max_reg_trials)) {
+      continue;
+    }
+
+    size_t num_verified_matches = 0;
+    for (const image_t reg_image_id : reconstruction_->RegImageIds()) {
+      num_verified_matches +=
+          correspondence_graph.NumCorrespondencesBetweenImages(image_id,
+                                                                reg_image_id);
+    }
+    if (num_verified_matches == 0) {
+      continue;
+    }
+
+    const float rank = static_cast<float>(num_verified_matches);
+    if (filtered_images_.count(image_id) == 0 && num_reg_trials == 0) {
+      image_ranks.emplace_back(image_id, rank);
+    } else {
+      other_image_ranks.emplace_back(image_id, rank);
+    }
+  }
+
+  std::vector<image_t> ranked_image_ids;
+  SortAndAppendNextImages(image_ranks, &ranked_image_ids);
+  SortAndAppendNextImages(other_image_ranks, &ranked_image_ids);
+  return ranked_image_ids;
+}
+
+bool IncrementalMapper::SetImagePoseFromPrior(const image_t image_id) {
+  if (!if_import_pose_prior_) {
+    return false;
+  }
+
+  const auto pose_it = existed_poses_.find(image_id);
+  if (pose_it == existed_poses_.end() || pose_it->second.size() < 7) {
+    return false;
+  }
+
+  const std::vector<double>& pose = pose_it->second;
+  for (size_t i = 0; i < 7; ++i) {
+    if (!std::isfinite(pose[i])) {
+      return false;
+    }
+  }
+
+  Eigen::Vector4d qvec;
+  qvec << pose[3], pose[4], pose[5], pose[6];
+  if (!(qvec.norm() > std::numeric_limits<double>::epsilon())) {
+    return false;
+  }
+
+  Image& image = reconstruction_->Image(image_id);
+  image.SetTvec(Eigen::Vector3d(pose[0], pose[1], pose[2]));
+  image.SetQvec(qvec);
+  image.NormalizeQvec();
+  return true;
+}
+
+bool IncrementalMapper::RegisterInitialImagePairFromPosePrior(
+    const Options& options,
+    const image_t image_id1,
+    const image_t image_id2) {
+  CHECK_NOTNULL(reconstruction_);
+  CHECK_EQ(reconstruction_->NumRegImages(), 0);
+  CHECK(options.Check());
+
+  init_num_reg_trials_[image_id1] += 1;
+  init_num_reg_trials_[image_id2] += 1;
+  num_reg_trials_[image_id1] += 1;
+  num_reg_trials_[image_id2] += 1;
+  init_image_pairs_.insert(Database::ImagePairToPairId(image_id1, image_id2));
+
+  const CorrespondenceGraph& correspondence_graph =
+      database_cache_->CorrespondenceGraph();
+  if (correspondence_graph.NumCorrespondencesBetweenImages(image_id1,
+                                                           image_id2) == 0 ||
+      !SetImagePoseFromPrior(image_id1) ||
+      !SetImagePoseFromPrior(image_id2)) {
+    return false;
+  }
+
+  reconstruction_->RegisterImage(image_id1);
+  reconstruction_->RegisterImage(image_id2);
+  initial_anchor_image_id_ = image_id1;
+  RegisterImageEvent(image_id1);
+  RegisterImageEvent(image_id2);
+  return true;
+}
+
+bool IncrementalMapper::RegisterNextImageFromPosePrior(
+    const Options& options, const image_t image_id) {
+  CHECK_NOTNULL(reconstruction_);
+  CHECK_GE(reconstruction_->NumRegImages(), 2);
+  CHECK(options.Check());
+
+  Image& image = reconstruction_->Image(image_id);
+  CHECK(!image.IsRegistered()) << "Image cannot be registered multiple times";
+  num_reg_trials_[image_id] += 1;
+
+  if (!SetImagePoseFromPrior(image_id)) {
+    return false;
+  }
+
+  reconstruction_->RegisterImage(image_id);
+  RegisterImageEvent(image_id);
+  return true;
+}
+
+const IncrementalMapper::MeshDepthFeatureCache*
+IncrementalMapper::GetMeshDepthFeatureCache(const image_t image_id) {
+  MeshDepthFeatureCache& cache = mesh_depth_feature_cache_[image_id];
+  if (cache.attempted) {
+    return cache.xyzs.empty() ? nullptr : &cache;
+  }
+  cache.attempted = true;
+
+  if (lidar_pointcloud_process_ == nullptr ||
+      lidar_pointcloud_process_->pcd_proj_ == nullptr ||
+      !lidar_pointcloud_process_->pcd_proj_->HasInitialMeshDepth()) {
+    return nullptr;
+  }
+
+  const Image& image = reconstruction_->Image(image_id);
+  const Camera& camera = reconstruction_->Camera(image.CameraId());
+  std::vector<std::pair<Eigen::Vector2d, bool>,
+              Eigen::aligned_allocator<std::pair<Eigen::Vector2d, bool>>>
+      point2Ds;
+  point2Ds.reserve(image.NumPoints2D());
+  for (const Point2D& point2D : image.Points2D()) {
+    point2Ds.emplace_back(point2D.XY(), false);
+  }
+
+  std::vector<Eigen::Vector3d, Eigen::aligned_allocator<Eigen::Vector3d>>
+      point3Ds;
+  if (!lidar_pointcloud_process_->pcd_proj_->SetInitialImageFromMeshDepth(
+          image, camera, point2Ds, point3Ds) ||
+      point3Ds.size() != point2Ds.size()) {
+    return nullptr;
+  }
+
+  cache.valid.resize(point2Ds.size(), false);
+  for (size_t i = 0; i < point2Ds.size(); ++i) {
+    cache.valid[i] = point2Ds[i].second;
+  }
+  cache.xyzs = std::move(point3Ds);
+  return &cache;
+}
+
+size_t IncrementalMapper::InitializeImageTracksFromMeshDepth(
+    const IncrementalTriangulator::Options& tri_options,
+    const image_t image_id) {
+  CHECK_NOTNULL(reconstruction_);
+  CHECK(tri_options.Check());
+
+  const Image& image = reconstruction_->Image(image_id);
+  if (!image.IsRegistered() || GetMeshDepthFeatureCache(image_id) == nullptr) {
+    return 0;
+  }
+
+  const CorrespondenceGraph& correspondence_graph =
+      database_cache_->CorrespondenceGraph();
+  const size_t transitivity = static_cast<size_t>(
+      std::max(1, tri_options.complete_max_transitivity));
+  const double max_squared_reproj_error =
+      tri_options.complete_max_reproj_error *
+      tri_options.complete_max_reproj_error;
+  size_t num_initialized_observations = 0;
+  std::vector<CorrespondenceGraph::Correspondence> found_corrs;
+
+  for (point2D_t point2D_idx = 0; point2D_idx < image.NumPoints2D();
+       ++point2D_idx) {
+    if (image.Point2D(point2D_idx).HasPoint3D() ||
+        !correspondence_graph.HasCorrespondences(image_id, point2D_idx)) {
+      continue;
+    }
+
+    correspondence_graph.FindTransitiveCorrespondences(
+        image_id, point2D_idx, transitivity, &found_corrs);
+    std::map<image_t, point2D_t> unique_observations;
+    bool conflicting_track = false;
+    for (const CorrespondenceGraph::Correspondence& corr : found_corrs) {
+      const auto inserted =
+          unique_observations.emplace(corr.image_id, corr.point2D_idx);
+      if (!inserted.second && inserted.first->second != corr.point2D_idx) {
+        conflicting_track = true;
+        break;
+      }
+    }
+    const auto inserted_reference =
+        unique_observations.emplace(image_id, point2D_idx);
+    if (!inserted_reference.second &&
+        inserted_reference.first->second != point2D_idx) {
+      conflicting_track = true;
+    }
+    if (conflicting_track) {
+      continue;
+    }
+
+    std::vector<TrackElement> track_elements;
+    bool has_existing_point3D = false;
+    bool has_reference = false;
+    for (const auto& observation : unique_observations) {
+      if (!reconstruction_->ExistsImage(observation.first)) {
+        continue;
+      }
+      const Image& track_image = reconstruction_->Image(observation.first);
+      if (!track_image.IsRegistered()) {
+        continue;
+      }
+      const Point2D& track_point2D =
+          track_image.Point2D(observation.second);
+      if (track_point2D.HasPoint3D()) {
+        has_existing_point3D = true;
+        break;
+      }
+      track_elements.emplace_back(observation.first, observation.second);
+      has_reference = has_reference ||
+                      (observation.first == image_id &&
+                       observation.second == point2D_idx);
+    }
+    if (has_existing_point3D || !has_reference || track_elements.size() < 2) {
+      continue;
+    }
+
+    Eigen::Vector3d best_xyz = Eigen::Vector3d::Zero();
+    std::vector<TrackElement> best_inliers;
+    double best_error = std::numeric_limits<double>::max();
+    const MeshDepthFeatureCache* source_cache =
+        GetMeshDepthFeatureCache(image_id);
+    if (source_cache != nullptr && point2D_idx < source_cache->valid.size() &&
+        source_cache->valid[point2D_idx]) {
+      const Eigen::Vector3d& xyz = source_cache->xyzs[point2D_idx];
+      if (!xyz.allFinite()) {
+        continue;
+      }
+
+      std::vector<TrackElement> inliers;
+      inliers.reserve(track_elements.size());
+      double total_error = 0.0;
+      bool reference_is_inlier = false;
+      for (const TrackElement& track_el : track_elements) {
+        const Image& track_image = reconstruction_->Image(track_el.image_id);
+        const Camera& track_camera =
+            reconstruction_->Camera(track_image.CameraId());
+        const auto pose_it = existed_poses_.find(track_el.image_id);
+        if (pose_it == existed_poses_.end() || pose_it->second.size() < 7) {
+          continue;
+        }
+        const std::vector<double>& pose = pose_it->second;
+        Eigen::Vector4d prior_qvec;
+        prior_qvec << pose[3], pose[4], pose[5], pose[6];
+        prior_qvec.normalize();
+        const Eigen::Vector3d prior_tvec(pose[0], pose[1], pose[2]);
+        const double squared_error = CalculateSquaredReprojectionError(
+            track_image.Point2D(track_el.point2D_idx).XY(), xyz,
+            prior_qvec, prior_tvec, track_camera);
+        if (squared_error <= max_squared_reproj_error) {
+          inliers.push_back(track_el);
+          total_error += squared_error;
+          reference_is_inlier = reference_is_inlier ||
+                                (track_el.image_id == image_id &&
+                                 track_el.point2D_idx == point2D_idx);
+        }
+      }
+
+      if (!reference_is_inlier || inliers.size() < 2) {
+        continue;
+      }
+      if (inliers.size() > best_inliers.size() ||
+          (inliers.size() == best_inliers.size() &&
+           total_error < best_error)) {
+        best_xyz = xyz;
+        best_inliers = std::move(inliers);
+        best_error = total_error;
+      }
+    }
+
+    if (best_inliers.size() < 2) {
+      continue;
+    }
+
+    Track track;
+    track.Reserve(best_inliers.size());
+    for (const TrackElement& track_el : best_inliers) {
+      track.AddElement(track_el);
+    }
+    const point3D_t point3D_id =
+        reconstruction_->AddPoint3D(best_xyz, std::move(track));
+    triangulator_->AddModifiedPoint3D(point3D_id);
+    num_initialized_observations += best_inliers.size();
+  }
+
+  return num_initialized_observations;
+}
+
+void IncrementalMapper::DeRegisterImage(const image_t image_id) {
+  CHECK_NOTNULL(reconstruction_);
+  if (!reconstruction_->Image(image_id).IsRegistered()) {
+    return;
+  }
+  reconstruction_->DeRegisterImage(image_id);
+  DeRegisterImageEvent(image_id);
+  if (initial_anchor_image_id_ == image_id) {
+    initial_anchor_image_id_ = kInvalidImageId;
+  }
+}
+
+size_t IncrementalMapper::DeRegisterImagesWithoutObservations() {
+  CHECK_NOTNULL(reconstruction_);
+  const std::vector<image_t> image_ids = reconstruction_->RegImageIds();
+  size_t num_deregistered = 0;
+  for (const image_t image_id : image_ids) {
+    if (reconstruction_->Image(image_id).NumPoints3D() == 0) {
+      DeRegisterImage(image_id);
+      ++num_deregistered;
+    }
+  }
+  return num_deregistered;
 }
 
 bool IncrementalMapper::RegisterInitialImagePair(const Options& options,

@@ -33,9 +33,8 @@ namespace lidar{
 
 struct PcdProjectionOptions {
   std::string ba_pointcloud_path;
-  // Float32 axial-depth file or on-demand cache directory used only to
-  // initialize image pairs. Later registration and triangulation do not read
-  // it.
+  // Float32 axial-depth file or on-demand cache directory used to initialize
+  // image pairs and unmatched known-pose feature tracks.
   std::string initial_mesh_depth_path;
   // Optional on-demand renderer. When initial_mesh_depth_path is a directory,
   // the first image of each attempted model is rendered once and cached there.

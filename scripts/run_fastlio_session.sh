@@ -9,6 +9,7 @@ CUDA_NORMAL_BIN="${COLMAP_PCD_CUDA_NORMAL_BIN:-/home/nvidia/colmap-PCD-gpu-build
 MESH_DEPTH_GENERATOR="${COLMAP_PCD_MESH_DEPTH_GENERATOR:-/home/nvidia/intensity_opt/build/generate_mesh_depth}"
 INTRINSICS="${COLMAP_PCD_INTRINSICS:-$REPO_ROOT/config/fastlio_camera_1224x1024.json}"
 LOCK_FILE="${COLMAP_PCD_LOCK_FILE:-/home/nvidia/.codex/colmap-pcd-gpu-build-test.lock}"
+KNOWN_POSE_REGISTRATION="${COLMAP_PCD_KNOWN_POSE_REGISTRATION:-0}"
 SESSION_DIR=""
 OUTPUT_ROOT=""
 MESH_PATH=""
@@ -29,6 +30,14 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ -n "$SESSION_DIR" && -n "$OUTPUT_ROOT" ]] || { usage >&2; exit 2; }
+[[ "$KNOWN_POSE_REGISTRATION" == 0 || "$KNOWN_POSE_REGISTRATION" == 1 ]] || {
+  printf 'COLMAP_PCD_KNOWN_POSE_REGISTRATION must be 0 or 1.\n' >&2
+  exit 2
+}
+MAPPER_MULTIPLE_MODELS=1
+if [[ "$KNOWN_POSE_REGISTRATION" == 1 ]]; then
+  MAPPER_MULTIPLE_MODELS=0
+fi
 SESSION_DIR="$(readlink -f "$SESSION_DIR")"
 INTRINSICS="$(readlink -f "$INTRINSICS")"
 if [[ -z "$MESH_PATH" && -f "$SESSION_DIR/mesh_0.ply" ]]; then
@@ -268,6 +277,7 @@ if ! models_ready; then
     --image_list_path "$IMAGE_LIST" --output_path "$SPARSE" \
     --Mapper.init_image_id1 -1 --Mapper.init_image_id2 -1 \
     --Mapper.if_import_pose_prior 1 \
+    --Mapper.known_pose_registration "$KNOWN_POSE_REGISTRATION" \
     --Mapper.image_pose_prior_path "$POSE_PRIOR" \
     --Mapper.if_add_lidar_constraint 1 \
     --Mapper.lidar_pointcloud_path "$LIDAR_MAP" \
@@ -283,7 +293,8 @@ if ! models_ready; then
     --Mapper.initial_mesh_depth_cy "$MESH_DEPTH_CY" \
     --Mapper.initial_mesh_depth_pnp_max_error 12 \
     --Mapper.if_add_lidar_corresponding 1 \
-    --Mapper.if_add_lidar_display 0 --Mapper.multiple_models 1 \
+    --Mapper.if_add_lidar_display 0 \
+    --Mapper.multiple_models "$MAPPER_MULTIPLE_MODELS" \
     --Mapper.max_num_models 20 --Mapper.min_model_size 10 \
     --Mapper.extract_colors 1 --Mapper.num_threads 8 \
     --Mapper.ba_refine_focal_length 0 \
@@ -333,7 +344,8 @@ if ! optimized_ready; then
 fi
 
 python3 - "$OUTPUT_ROOT" "$FRAME_COUNT" "$FRONTEND_BIN" "$MAPPER_BIN" \
-  "$MESH_PATH" "$MESH_DEPTH_GENERATOR" "$MESH_DEPTH_CACHE" <<'PY'
+  "$MESH_PATH" "$MESH_DEPTH_GENERATOR" "$MESH_DEPTH_CACHE" \
+  "$KNOWN_POSE_REGISTRATION" <<'PY'
 import hashlib, json, sys
 from pathlib import Path
 
@@ -372,7 +384,10 @@ summary = {
     'mesh_depth_generator': {
         'path': sys.argv[6], 'sha256': sha256(sys.argv[6])},
     'initial_mesh_depth_cache': sys.argv[7],
-    'initial_depth_usage': 'initial_pair_only',
+    'registration_mode': (
+        'known_pose' if int(sys.argv[8]) else 'pnp'),
+    'initial_depth_usage': (
+        'unmatched_shared_tracks' if int(sys.argv[8]) else 'initial_pair_only'),
     'optimized_session': str((root / 'optimized-session').resolve()),
 }
 (root / 'summary.json').write_text(json.dumps(summary, indent=2) + '\n')

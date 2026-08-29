@@ -39,3 +39,5 @@ Artifact rules
 - Create a new artifact directory for every experiment.
 - Do not overwrite frozen reports or previous visualization results.
 - After context compaction, consult this file before searching for these tools.
+
+实验过程中相机 内参 应当使用  /home/nvidia/colmap-PCD-gpu/Data/camera_0_intrinsics.json

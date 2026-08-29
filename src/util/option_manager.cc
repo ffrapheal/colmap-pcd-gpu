@@ -559,7 +559,9 @@ void OptionManager::AddMapperOptions() {
   AddAndRegisterDefaultOption("Mapper.initial_mesh_depth_pnp_max_error",
                               &mapper->initial_mesh_depth_pnp_max_error);
   AddAndRegisterDefaultOption("Mapper.if_import_pose_prior",
-                              &mapper->if_import_pose_prior);  
+                              &mapper->if_import_pose_prior);
+  AddAndRegisterDefaultOption("Mapper.known_pose_registration",
+                              &mapper->known_pose_registration);
   AddAndRegisterDefaultOption("Mapper.image_pose_prior_path",
                               &mapper->image_pose_prior_path);
   AddAndRegisterDefaultOption("Mapper.image_pose_save_folder",

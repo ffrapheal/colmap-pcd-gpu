@@ -33,6 +33,8 @@
 #define COLMAP_SRC_SFM_INCREMENTAL_MAPPER_H_
 
 #include <cassert>
+#include <unordered_map>
+#include <vector>
 
 #include "base/database.h"
 #include "base/database_cache.h"
@@ -219,6 +221,10 @@ class IncrementalMapper {
   // ignores images that failed to registered for `max_reg_trials`.
   std::vector<image_t> FindNextImages(const Options& options);
 
+  // Find images connected to the registered model by verified 2D matches.
+  // Unlike FindNextImages, this does not require existing visible 3D points.
+  std::vector<image_t> FindNextImagesFromPosePrior(const Options& options);
+
   // Attempt to seed the reconstruction from an image pair.
   bool RegisterInitialImagePair(const Options& options, const image_t image_id1,
                                 const image_t image_id2);
@@ -228,9 +234,30 @@ class IncrementalMapper {
                                                             const image_t image_id1,
                                                             const image_t image_id2);
 
+  // Register an initial pair directly from imported poses without PnP.
+  bool RegisterInitialImagePairFromPosePrior(const Options& options,
+                                             const image_t image_id1,
+                                             const image_t image_id2);
+
   // Attempt to register image to the existing model. This requires that
   // a previous call to `RegisterInitialImagePair` was successful.
   bool RegisterNextImage(const Options& options, const image_t image_id);
+
+  // Register an image directly from its imported pose without PnP.
+  bool RegisterNextImageFromPosePrior(const Options& options,
+                                      const image_t image_id);
+
+  // Initialize unmatched multi-image tracks from mesh depth. Standard
+  // triangulation must run first; this method only fills remaining tracks.
+  size_t InitializeImageTracksFromMeshDepth(
+      const IncrementalTriangulator::Options& tri_options,
+      const image_t image_id);
+
+  // Roll back a tentative known-pose registration.
+  void DeRegisterImage(const image_t image_id);
+
+  // Remove registered images that no longer have visual observations.
+  size_t DeRegisterImagesWithoutObservations();
 
   // Triangulate observations of image.
   size_t TriangulateImage(const IncrementalTriangulator::Options& tri_options,
@@ -338,6 +365,17 @@ class IncrementalMapper {
                                       const image_t image_id1,
                                       const image_t image_id2);
 
+  struct MeshDepthFeatureCache {
+    bool attempted = false;
+    std::vector<char> valid;
+    std::vector<Eigen::Vector3d,
+                Eigen::aligned_allocator<Eigen::Vector3d>> xyzs;
+  };
+
+  bool SetImagePoseFromPrior(const image_t image_id);
+  const MeshDepthFeatureCache* GetMeshDepthFeatureCache(
+      const image_t image_id);
+
   // Class that holds all necessary data from database in memory.
   const DatabaseCache* database_cache_;
 
@@ -392,6 +430,8 @@ class IncrementalMapper {
   bool if_import_pose_prior_ = false;// if initial image pose guess exist
   std::map<uint32_t, std::vector<double>> existed_poses_;// existed initial image pose guess
   image_t initial_anchor_image_id_ = kInvalidImageId;
+  std::unordered_map<image_t, MeshDepthFeatureCache>
+      mesh_depth_feature_cache_;
 #ifdef GPU_BA_CUDA_ENABLED
   gpu_ba::CudaHostProblemStoreMode gpu_ba_host_store_mode_ =
       gpu_ba::CudaHostProblemStoreMode::kDisabled;

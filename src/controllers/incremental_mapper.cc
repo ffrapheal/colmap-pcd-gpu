@@ -41,6 +41,8 @@
 namespace colmap {
 namespace {
 
+constexpr size_t kMinKnownPoseVisualSupport = 3;
+
 void ConfigureGpuBaOptions(const IncrementalMapperOptions& source,
                            BundleAdjustmentOptions* target) {
   target->ba_backend = source.ba_backend;
@@ -98,6 +100,19 @@ bool AdjustGlobalBundle(const IncrementalMapperOptions& options,
   NonBaStageScope stage(mapper->NonBaProfiler(),
                         NonBaStageId::kGlobalAdjustment,
                         mapper->GetReconstruction().NumRegImages());
+  if (options.known_pose_registration) {
+    const size_t num_removed =
+        mapper->DeRegisterImagesWithoutObservations();
+    if (num_removed > 0) {
+      std::cout << "  => Removed registered images without visual "
+                   "observations: "
+                << num_removed << std::endl;
+    }
+    if (mapper->GetReconstruction().NumRegImages() < 2) {
+      return false;
+    }
+  }
+
   BundleAdjustmentOptions custom_ba_options = options.GlobalBundleAdjustment();
 
   const size_t num_reg_images = mapper->GetReconstruction().NumRegImages();
@@ -527,6 +542,7 @@ bool IncrementalMapperOptions::Check() const {
   CHECK_OPTION_GT(ba_global_max_refinements, 0);
   CHECK_OPTION_GE(ba_global_max_refinement_change, 0);
   CHECK_OPTION_GE(snapshot_images_freq, 0);
+  CHECK_OPTION(!known_pose_registration || if_import_pose_prior);
   CHECK_OPTION(Mapper().Check());
   CHECK_OPTION(Triangulation().Check());
   return true;
@@ -776,7 +792,46 @@ void IncrementalMapperController::Reconstruct(
       {
         NonBaStageScope initial_pair(
             non_ba_profiler_, NonBaStageId::kInitialPair, 2);
-        if (options_->if_add_lidar_constraint) {
+        if (options_->known_pose_registration) {
+          reg_init_success = mapper.RegisterInitialImagePairFromPosePrior(
+              init_mapper_options, image_id1, image_id2);
+          if (reg_init_success) {
+            IncrementalTriangulator::Options seed_tri_options =
+                options_->Triangulation();
+            seed_tri_options.ignore_two_view_tracks = false;
+            const size_t standard_observations =
+                mapper.TriangulateImage(seed_tri_options, image_id1) +
+                mapper.TriangulateImage(seed_tri_options, image_id2);
+            const size_t min_support = static_cast<size_t>(
+                init_mapper_options.init_min_num_inliers);
+            size_t mesh_observations = 0;
+            if (reconstruction.Image(image_id1).NumPoints3D() < min_support) {
+              mesh_observations += mapper.InitializeImageTracksFromMeshDepth(
+                  seed_tri_options, image_id1);
+            }
+            if (reconstruction.Image(image_id2).NumPoints3D() < min_support) {
+              mesh_observations += mapper.InitializeImageTracksFromMeshDepth(
+                  seed_tri_options, image_id2);
+            }
+            std::cout << "  => Known-pose initial triangulated observations: "
+                      << standard_observations << std::endl;
+            std::cout << "  => Known-pose initial mesh-depth observations: "
+                      << mesh_observations << std::endl;
+
+            const size_t support1 =
+                reconstruction.Image(image_id1).NumPoints3D();
+            const size_t support2 =
+                reconstruction.Image(image_id2).NumPoints3D();
+            std::cout << "  => Known-pose initial visual support: "
+                      << support1 << " / " << support2 << std::endl;
+            if (support1 < min_support || support2 < min_support) {
+              mapper.DeRegisterImage(image_id2);
+              mapper.DeRegisterImage(image_id1);
+              mapper.ClearModifiedPoints3D();
+              reg_init_success = false;
+            }
+          }
+        } else if (options_->if_add_lidar_constraint) {
           reg_init_success = mapper.RegisterInitialImagePairByDepthProj(
               init_mapper_options, image_id1, image_id2);
         } else {
@@ -817,6 +872,9 @@ void IncrementalMapperController::Reconstruct(
 
       FilterPoints(*options_, &mapper);
       FilterImages(*options_, &mapper);
+      if (options_->known_pose_registration) {
+        mapper.ClearModifiedPoints3D();
+      }
  
       // Initial image pair failed to register.
       if (reconstruction.NumRegImages() == 0 ||
@@ -867,7 +925,9 @@ void IncrementalMapperController::Reconstruct(
         NonBaStageScope find_next(
             non_ba_profiler_, NonBaStageId::kFindNextImages,
             reconstruction.NumImages() - reconstruction.NumRegImages());
-        next_images = mapper.FindNextImages(options_->Mapper());
+        next_images = options_->known_pose_registration
+                          ? mapper.FindNextImagesFromPosePrior(options_->Mapper())
+                          : mapper.FindNextImages(options_->Mapper());
         find_next.SetOutputItems(next_images.size());
       }
 
@@ -890,14 +950,42 @@ void IncrementalMapperController::Reconstruct(
           NonBaStageScope register_next(
               non_ba_profiler_, NonBaStageId::kRegisterNextImage,
               next_image.NumObservations());
-          reg_next_success =
-              mapper.RegisterNextImage(options_->Mapper(), next_image_id);
+          reg_next_success = options_->known_pose_registration
+                                 ? mapper.RegisterNextImageFromPosePrior(
+                                       options_->Mapper(), next_image_id)
+                                 : mapper.RegisterNextImage(options_->Mapper(),
+                                                            next_image_id);
           register_next.SetOutputItems(reg_next_success ? 1 : 0);
         }
 
         if (reg_next_success) {
           mapper.ClearLidarPoints();
           TriangulateImage(*options_, next_image, &mapper);
+          if (options_->known_pose_registration) {
+            size_t mesh_observations = 0;
+            if (next_image.NumPoints3D() <
+                static_cast<size_t>(options_->Mapper()
+                                        .abs_pose_min_num_inliers)) {
+              mesh_observations = mapper.InitializeImageTracksFromMeshDepth(
+                  options_->Triangulation(), next_image_id);
+            }
+            const size_t visual_support = next_image.NumPoints3D();
+            std::cout << "  => Known-pose mesh-depth observations: "
+                      << mesh_observations << std::endl;
+            std::cout << "  => Known-pose visual support: "
+                      << visual_support << std::endl;
+            if (visual_support < kMinKnownPoseVisualSupport) {
+              std::cout << "  => Insufficient visual support; rolling back "
+                           "known-pose registration."
+                        << std::endl;
+              mapper.DeRegisterImage(next_image_id);
+              mapper.ClearModifiedPoints3D();
+              reg_next_success = false;
+            }
+          }
+        }
+
+        if (reg_next_success) {
           if (!IterativeLocalRefinement(*options_, next_image_id, &mapper)) {
             ba_failed_.store(true);
             mapper.EndReconstruction(false);
@@ -1011,7 +1099,8 @@ void IncrementalMapperController::Reconstruct(
     Callback(LAST_IMAGE_REG_CALLBACK);
 
     const size_t max_num_models = static_cast<size_t>(options_->max_num_models);
-    if (initial_reconstruction_given || !options_->multiple_models ||
+    if (initial_reconstruction_given || options_->known_pose_registration ||
+        !options_->multiple_models ||
         reconstruction_manager_->Size() >= max_num_models ||
         mapper.NumTotalRegImages() >= database_cache_.NumImages() - 1) {
       break;
