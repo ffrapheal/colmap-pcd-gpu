@@ -42,6 +42,9 @@ Install the latest stable release of [Ceres Solver](http://ceres-solver.org) (cl
 
 ## Quick Start
 
+For the current `gpu-ba` branch, including the standalone CUDA GPU BA build,
+see [中文编译教程](BUILD_CN.md).
+
 Clone the open-source repository, compile, and install.
 
 ```
@@ -119,7 +122,6 @@ The repository is licensed under BSD license.
 ## Credits
 
 This repository is based on the original [Colmap](https://colmap.github.io).
-
 
 
 
