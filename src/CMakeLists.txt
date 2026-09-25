@@ -83,6 +83,10 @@ if(GPU_BA_CUDA_ENABLED)
     # archives reference symbols from the other, so expose the dependency at
     # the library boundary and let CMake emit the required repeated link group.
     target_link_libraries(colmap gpu_ba_custom_cuda)
+
+    # The LiDAR CUDA archive has no dependency on colmap, keeping this link
+    # direction acyclic while making the API available to libcolmap users.
+    target_link_libraries(colmap colmap_cuda_lidar_normals_lib)
 endif()
 
 if(CUDA_ENABLED)

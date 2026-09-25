@@ -31,7 +31,9 @@
 
 #include "feature/extraction.h"
 
+#include <algorithm>
 #include <numeric>
+#include <utility>
 
 #include "SiftGPU/SiftGPU.h"
 #include "feature/sift.h"
@@ -79,7 +81,167 @@ void MaskKeypoints(const Bitmap& mask, FeatureKeypoints* keypoints,
   descriptors->conservativeResize(out_index, descriptors->cols());
 }
 
+void ClearFeatureOutputs(FeatureKeypoints* keypoints,
+                         FeatureDescriptors* descriptors) {
+  if (keypoints != nullptr) {
+    keypoints->clear();
+  }
+  if (descriptors != nullptr) {
+    descriptors->resize(0, 0);
+  }
+}
+
 }  // namespace
+
+PersistentCudaSiftFeatureExtractor::PersistentCudaSiftFeatureExtractor(
+    const SiftExtractionOptions& sift_options,
+    std::shared_ptr<const Bitmap> camera_mask)
+    : sift_options_(sift_options),
+      camera_mask_(std::move(camera_mask)),
+      control_thread_id_(std::this_thread::get_id()) {}
+
+PersistentCudaSiftFeatureExtractor::~PersistentCudaSiftFeatureExtractor() {
+  CHECK(IsControlThread());
+  sift_gpu_.reset();
+}
+
+SingleImageFeatureExtractionResult
+PersistentCudaSiftFeatureExtractor::Reject(const std::string& reason) const {
+  return {false, reason};
+}
+
+bool PersistentCudaSiftFeatureExtractor::IsControlThread() const {
+  return control_thread_id_ == std::this_thread::get_id();
+}
+
+SingleImageFeatureExtractionResult PersistentCudaSiftFeatureExtractor::Setup() {
+  if (!IsControlThread()) {
+    return Reject("CUDA SIFT Setup must run on the construction thread");
+  }
+  if (is_setup_) {
+    return {true, ""};
+  }
+  if (!sift_options_.use_gpu) {
+    return Reject("online extraction requires use_gpu=true");
+  }
+  if (sift_options_.gpu_index != "0") {
+    return Reject("online extraction requires exactly gpu_index=0");
+  }
+  if (sift_options_.estimate_affine_shape) {
+    return Reject("online extraction forbids affine shape estimation");
+  }
+  if (sift_options_.domain_size_pooling) {
+    return Reject("online extraction forbids domain size pooling");
+  }
+  if (sift_options_.darkness_adaptivity) {
+    return Reject("online extraction forbids darkness adaptivity");
+  }
+  if (!sift_options_.Check()) {
+    return Reject("invalid SIFT extraction options");
+  }
+
+#ifndef CUDA_ENABLED
+  return Reject("online extraction requires a CUDA_ENABLED build");
+#else
+  if (camera_mask_ != nullptr && camera_mask_->Data() == nullptr) {
+    return Reject("camera mask is empty");
+  }
+
+  sift_gpu_ = std::make_unique<SiftGPU>();
+  if (!CreateSiftGPUExtractor(sift_options_, sift_gpu_.get())) {
+    sift_gpu_.reset();
+    return Reject("CUDA SIFT context is not fully supported");
+  }
+  if (!sift_gpu_->UsesCudaBackend()) {
+    sift_gpu_.reset();
+    return Reject("CUDA SIFT initialization selected a non-CUDA backend");
+  }
+  uses_cuda_ = true;
+  is_setup_ = true;
+  setup_count_ += 1;
+  return {true, ""};
+#endif
+}
+
+SingleImageFeatureExtractionResult PersistentCudaSiftFeatureExtractor::Extract(
+    const Camera& camera, Bitmap* bitmap, const Bitmap* frame_mask,
+    FeatureKeypoints* keypoints, FeatureDescriptors* descriptors) {
+  ClearFeatureOutputs(keypoints, descriptors);
+  if (!IsControlThread()) {
+    return Reject("CUDA SIFT extraction must run on the construction thread");
+  }
+  if (!is_setup_ || !sift_gpu_) {
+    return Reject("CUDA SIFT extractor is not set up");
+  }
+  if (bitmap == nullptr || keypoints == nullptr || descriptors == nullptr) {
+    return Reject("null extraction input or output");
+  }
+  if (bitmap->Data() == nullptr || bitmap->Width() <= 0 ||
+      bitmap->Height() <= 0) {
+    return Reject("input bitmap is empty");
+  }
+  if (!bitmap->IsGrey()) {
+    return Reject("CUDA SIFT input bitmap must be grayscale");
+  }
+  if (camera.Width() == 0 || camera.Height() == 0) {
+    return Reject("camera dimensions must be positive");
+  }
+  if (static_cast<size_t>(bitmap->Width()) != camera.Width() ||
+      static_cast<size_t>(bitmap->Height()) != camera.Height()) {
+    return Reject("input bitmap dimensions must match the camera");
+  }
+  if (camera_mask_ != nullptr &&
+      (camera_mask_->Data() == nullptr ||
+       static_cast<size_t>(camera_mask_->Width()) != camera.Width() ||
+       static_cast<size_t>(camera_mask_->Height()) != camera.Height())) {
+    return Reject("camera mask dimensions must match the camera");
+  }
+  if (frame_mask != nullptr &&
+      (frame_mask->Data() == nullptr ||
+       static_cast<size_t>(frame_mask->Width()) != camera.Width() ||
+       static_cast<size_t>(frame_mask->Height()) != camera.Height())) {
+    return Reject("frame mask dimensions must match the camera");
+  }
+
+  if (bitmap->Width() > sift_options_.max_image_size ||
+      bitmap->Height() > sift_options_.max_image_size) {
+    const double scale =
+        static_cast<double>(sift_options_.max_image_size) /
+        std::max(bitmap->Width(), bitmap->Height());
+    const int new_width =
+        std::max(1, static_cast<int>(bitmap->Width() * scale));
+    const int new_height =
+        std::max(1, static_cast<int>(bitmap->Height() * scale));
+    bitmap->Rescale(new_width, new_height);
+  }
+
+  if (!ExtractSiftFeaturesGPU(sift_options_, *bitmap, sift_gpu_.get(), keypoints,
+                              descriptors)) {
+    return Reject("CUDA SIFT extraction failed");
+  }
+
+  ScaleKeypoints(*bitmap, camera, keypoints);
+  if (camera_mask_) {
+    MaskKeypoints(*camera_mask_, keypoints, descriptors);
+  }
+  if (frame_mask != nullptr && frame_mask->Data()) {
+    MaskKeypoints(*frame_mask, keypoints, descriptors);
+  }
+  extract_count_ += 1;
+  return {true, ""};
+}
+
+bool PersistentCudaSiftFeatureExtractor::IsSetup() const { return is_setup_; }
+
+size_t PersistentCudaSiftFeatureExtractor::SetupCount() const {
+  return setup_count_;
+}
+
+size_t PersistentCudaSiftFeatureExtractor::ExtractCount() const {
+  return extract_count_;
+}
+
+bool PersistentCudaSiftFeatureExtractor::UsesCuda() const { return uses_cuda_; }
 
 SiftFeatureExtractor::SiftFeatureExtractor(
     const ImageReaderOptions& reader_options,

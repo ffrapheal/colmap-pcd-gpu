@@ -3,13 +3,20 @@
 set -Eeuo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-FRONTEND_BIN="${COLMAP_PCD_FRONTEND_BIN:-/home/nvidia/colmap_test/local/colmap/bin/colmap}"
-MAPPER_BIN="${COLMAP_PCD_MAPPER_BIN:-/home/nvidia/colmap-PCD-gpu-build/cuda-release/src/exe/colmap}"
-CUDA_NORMAL_BIN="${COLMAP_PCD_CUDA_NORMAL_BIN:-/home/nvidia/colmap-PCD-gpu-build/cuda-release/src/lidar/colmap_cuda_lidar_normals}"
-MESH_DEPTH_GENERATOR="${COLMAP_PCD_MESH_DEPTH_GENERATOR:-/home/nvidia/intensity_opt/build/generate_mesh_depth}"
+resolve_command() {
+  local command_name="$1"
+  local fallback="$2"
+  command -v "$command_name" 2>/dev/null || printf '%s' "$fallback"
+}
+FRONTEND_BIN="${COLMAP_PCD_FRONTEND_BIN:-$(resolve_command colmap "$REPO_ROOT/build/src/exe/colmap")}"
+MAPPER_BIN="${COLMAP_PCD_MAPPER_BIN:-$REPO_ROOT/build/src/exe/colmap}"
+CUDA_NORMAL_BIN="${COLMAP_PCD_CUDA_NORMAL_BIN:-$REPO_ROOT/build/src/lidar/colmap_cuda_lidar_normals}"
+MESH_DEPTH_GENERATOR="${COLMAP_PCD_MESH_DEPTH_GENERATOR:-$(resolve_command generate_mesh_depth generate_mesh_depth)}"
 INTRINSICS="${COLMAP_PCD_INTRINSICS:-$REPO_ROOT/config/fastlio_camera_1224x1024.json}"
-LOCK_FILE="${COLMAP_PCD_LOCK_FILE:-/home/nvidia/.codex/colmap-pcd-gpu-build-test.lock}"
+LOCK_FILE="${COLMAP_PCD_LOCK_FILE:-${TMPDIR:-/tmp}/colmap-pcd-gpu-build.lock}"
 KNOWN_POSE_REGISTRATION="${COLMAP_PCD_KNOWN_POSE_REGISTRATION:-0}"
+GLOBAL_BA_ENABLED="${COLMAP_PCD_GLOBAL_BA_ENABLED:-1}"
+LOCAL_BA_MAX_REFINEMENTS="${COLMAP_PCD_BA_LOCAL_MAX_REFINEMENTS:-1}"
 SESSION_DIR=""
 OUTPUT_ROOT=""
 MESH_PATH=""
@@ -32,6 +39,14 @@ done
 [[ -n "$SESSION_DIR" && -n "$OUTPUT_ROOT" ]] || { usage >&2; exit 2; }
 [[ "$KNOWN_POSE_REGISTRATION" == 0 || "$KNOWN_POSE_REGISTRATION" == 1 ]] || {
   printf 'COLMAP_PCD_KNOWN_POSE_REGISTRATION must be 0 or 1.\n' >&2
+  exit 2
+}
+[[ "$GLOBAL_BA_ENABLED" == 0 || "$GLOBAL_BA_ENABLED" == 1 ]] || {
+  printf 'COLMAP_PCD_GLOBAL_BA_ENABLED must be 0 or 1.\n' >&2
+  exit 2
+}
+[[ "$LOCAL_BA_MAX_REFINEMENTS" =~ ^[1-9][0-9]*$ ]] || {
+  printf 'COLMAP_PCD_BA_LOCAL_MAX_REFINEMENTS must be a positive integer.\n' >&2
   exit 2
 }
 MAPPER_MULTIPLE_MODELS=1
@@ -306,7 +321,8 @@ if ! models_ready; then
     --Mapper.kdtree_min_search_range 0.05 \
     --Mapper.search_range_drop_speed 0.01 \
     --Mapper.local_lidar_kdtree_only 1 \
-    --Mapper.ba_local_max_refinements 1 \
+    --Mapper.ba_local_max_refinements "$LOCAL_BA_MAX_REFINEMENTS" \
+    --Mapper.ba_global_enabled "$GLOBAL_BA_ENABLED" \
     --Mapper.ba_global_images_freq 10 \
     --Mapper.non_ba_profile 1 \
     --Mapper.non_ba_profile_path "$OUTPUT_ROOT/nonba-profile.json" \

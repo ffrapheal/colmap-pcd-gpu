@@ -9,6 +9,7 @@ COLMAP_ADD_SOURCES(
     ceres_fidelity.h ceres_fidelity.cc
     fixed_linearization.h fixed_linearization.cc
     linearization.h linearization.cc
+    online_health.h online_health.cc
     snapshot.h snapshot.cc
     snapshot_recorder.h snapshot_recorder.cc
     validation.h validation.cc
@@ -43,6 +44,8 @@ if(GPU_BA_CUDA_ENABLED)
 endif()
 
 if(GPU_BA_TESTS_ENABLED)
+    COLMAP_ADD_TEST(online_health_test online_health_test.cc)
+
     add_executable(gpu_ba_active_solve_view_test active_solve_view_test.cc)
     set_target_properties(gpu_ba_active_solve_view_test PROPERTIES FOLDER
         ${COLMAP_TARGETS_ROOT_FOLDER}/${FOLDER_NAME})

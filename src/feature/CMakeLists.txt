@@ -40,5 +40,8 @@ COLMAP_ADD_SOURCES(
 )
 
 COLMAP_ADD_TEST(feature_utils_test utils_test.cc)
+COLMAP_ADD_TEST(single_image_sift_extractor_test
+                single_image_sift_extractor_test.cc)
 COLMAP_ADD_TEST(sift_test sift_test.cc)
 COLMAP_ADD_TEST(types_test types_test.cc)
+COLMAP_ADD_TEST(incremental_matching_test incremental_matching_test.cc)

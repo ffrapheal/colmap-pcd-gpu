@@ -4,10 +4,17 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <iterator>
+#include <limits>
+#include <memory>
 #include <string>
 #include <vector>
 
+#include "base/camera_models.h"
+#include "base/correspondence_graph.h"
+#include "base/reconstruction.h"
 #include "gpu_ba/custom_cuda.h"
+#include "gpu_ba/native_graph_problem_store.h"
 
 namespace colmap {
 namespace gpu_ba {
@@ -23,6 +30,28 @@ struct ShadowFixture {
   Snapshot reference;
 };
 
+struct DirectNativeFixture {
+  Reconstruction reconstruction;
+  CorrespondenceGraph graph;
+  point3D_t first_point_id = 0;
+  point3D_t second_point_id = 0;
+  uint64_t owner_epoch = 4044;
+  bool journal_started = false;
+  std::unique_ptr<GpuBaHostProblemStore> store;
+  CudaHostStoreBinding binding;
+  CudaFullLmOptions options;
+  NativeBaSolveIntent intent;
+
+  ~DirectNativeFixture() {
+    if (store != nullptr) {
+      std::string ignored;
+      store->Shutdown(&ignored);
+      store.reset();
+    }
+    if (journal_started) reconstruction.EndStructureJournal();
+  }
+};
+
 CudaFullLmOptions NativeFullLmOptions(
     const NativeCudaResolvedConfig& config) {
   CudaFullLmOptions options;
@@ -31,6 +60,7 @@ CudaFullLmOptions NativeFullLmOptions(
   options.hot_kernel_mode = config.hot_kernel;
   options.execution_profile = config.execution_profile;
   options.audit_profile = config.audit_profile;
+  options.prepared_selection_cache_mode = config.prepared_selection_cache;
   options.performance_mode = config.performance_mode;
   options.current_linearization_cache_mode = config.linearization_cache;
   options.pair_chunk_limit_bytes_for_testing =
@@ -62,6 +92,245 @@ CudaFullLmOptions NativeFullLmOptions(
   options.layer_c.layer_b.hessian_segment_size_for_testing =
       config.hessian_segment_size;
   return options;
+}
+
+bool BuildDirectNativeFixture(DirectNativeFixture* fixture,
+                              std::string* error) {
+  fixture->first_point_id = fixture->reconstruction.AddPoint3D(
+      Eigen::Vector3d(1.0, 2.0, 3.0), Track());
+  fixture->second_point_id = fixture->reconstruction.AddPoint3D(
+      Eigen::Vector3d(-1.0, 0.5, 4.0), Track());
+
+  Camera camera;
+  camera.InitializeWithId(OpenCVCameraModel::model_id, 500.0, 640, 480);
+  camera.SetCameraId(7);
+  fixture->reconstruction.AddCamera(camera);
+
+  const auto add_image = [&](const image_t image_id,
+                             const double xy_offset) {
+    Image image;
+    image.SetImageId(image_id);
+    image.SetCameraId(7);
+    image.SetName(std::to_string(image_id));
+    image.SetQvec(Eigen::Vector4d(1.0, 0.0, 0.0, 0.0));
+    image.SetTvec(Eigen::Vector3d(0.01 * image_id, 0.0, 8.0));
+    image.SetRegistered(true);
+    std::vector<Eigen::Vector2d> points2D;
+    for (point2D_t index = 0; index < 4; ++index) {
+      points2D.emplace_back(xy_offset + index,
+                            xy_offset + 10.0 + index);
+    }
+    fixture->graph.AddImage(image_id, points2D.size());
+    image.SetPoints2D(points2D);
+    fixture->reconstruction.AddImage(image);
+  };
+  add_image(20, 200.0);
+  add_image(21, 210.0);
+  add_image(22, 220.0);
+  fixture->reconstruction.SetUp(&fixture->graph);
+  fixture->reconstruction.AddObservation(
+      fixture->first_point_id, TrackElement{20, 1});
+  fixture->reconstruction.AddObservation(
+      fixture->first_point_id, TrackElement{21, 2});
+  fixture->reconstruction.AddObservation(
+      fixture->first_point_id, TrackElement{22, 0});
+  fixture->reconstruction.AddObservation(
+      fixture->second_point_id, TrackElement{20, 3});
+  fixture->reconstruction.AddObservation(
+      fixture->second_point_id, TrackElement{21, 0});
+
+  fixture->reconstruction.BeginStructureJournal(fixture->owner_epoch, 64);
+  fixture->journal_started = true;
+  fixture->store.reset(
+      new GpuBaHostProblemStore(&fixture->reconstruction,
+                                fixture->owner_epoch));
+  fixture->binding.store = fixture->store.get();
+  fixture->binding.owner_epoch = fixture->owner_epoch;
+  fixture->binding.mode = CudaHostProblemStoreMode::kHostPreparedStore;
+
+  NativeBaSolveIntent& intent = fixture->intent;
+  intent.owner_epoch = fixture->owner_epoch;
+  intent.reconstruction_identity =
+      reinterpret_cast<uintptr_t>(&fixture->reconstruction);
+  intent.expected_topology_revision =
+      fixture->reconstruction.StructureRevision();
+  intent.selection_revision = 12;
+  intent.kind = BaKind::kLocal;
+  intent.visual_observation_scope =
+      NativeBaVisualObservationScope::kActiveImagesOnly;
+  intent.config.resolved = true;
+  intent.config.config_generation = 13;
+  intent.config.arithmetic_precision = CudaArithmeticPrecision::kFp64;
+  intent.config.hessian_backend =
+      CudaHessianAssemblyBackend::kObservationSegmented;
+  intent.config.schur_backend =
+      CudaSchurContributionBackend::kSegmentedTransformed;
+  intent.config.hot_kernel = CudaHotKernelMode::kTransformed;
+  intent.config.execution_profile =
+      CudaExecutionProfile::kCompactControl;
+  intent.config.residual_order = CudaResidualOrder::kSourceInsertion;
+  intent.config.prepared_selection_cache =
+      CudaPreparedSelectionCacheMode::kEnabled;
+  intent.config.loss_mode = CudaLossMode::kTrivial;
+  intent.config.loss_scale = 1.0;
+  intent.active_image_ids = {21, 20};
+  intent.explicit_variable_point_ids = {fixture->first_point_id};
+  intent.lidar_map_generation = 17;
+  intent.lidar_match_config_generation = 13;
+  intent.online_lidar_identity.valid = true;
+  intent.online_lidar_identity.trigger_image_id = 21;
+  intent.online_lidar_identity.map_version = 17;
+  intent.online_lidar_identity.max_scan_index = 17;
+  intent.online_lidar_identity.snapshot_sha256.fill(0x41);
+  intent.online_lidar_identity.geometry_sha256.fill(0x52);
+  intent.online_lidar_identity.association_sha256.fill(0x63);
+
+  NativeBaLidarConstraint first;
+  first.point3D_id = fixture->first_point_id;
+  first.constraint_slot = 1;
+  first.physical_identity = 1;
+  first.association_id = 0;
+  first.owner_image_id = 21;
+  first.owner_point2D_idx = 2;
+  first.lidar_type = 1;
+  first.frozen_point3D_xyz = {{1.0, 2.0, 3.0}};
+  first.plane = {{0.0, 0.0, 1.0, -3.0}};
+  first.lidar_xyz = {{1.1, 2.1, 3.1}};
+  first.weight = 2.0;
+  first.search_range = 0.25;
+  intent.lidar_constraints.push_back(first);
+
+  NativeBaLidarConstraint second;
+  second.point3D_id = fixture->second_point_id;
+  second.constraint_slot = 0;
+  second.physical_identity = 2;
+  second.association_id = 1;
+  second.owner_image_id = 20;
+  second.owner_point2D_idx = 3;
+  second.lidar_type = 2;
+  second.frozen_point3D_xyz = {{-1.0, 0.5, 4.0}};
+  second.plane = {{1.0, 0.0, 0.0, 1.0}};
+  second.lidar_xyz = {{-1.1, 0.6, 4.1}};
+  second.weight = 3.0;
+  second.search_range = 0.5;
+  intent.lidar_constraints.push_back(second);
+
+  fixture->options = NativeFullLmOptions(intent.config);
+  error->clear();
+  return true;
+}
+
+bool PrepareDirectNative(DirectNativeFixture* fixture,
+                         const NativeBaSolveIntent& intent,
+                         PreparedNativeActiveSolve* prepared,
+                         std::string* error) {
+  return PrepareCudaNativeBaSolve(intent, &fixture->reconstruction,
+                                  fixture->options, fixture->binding,
+                                  prepared, error);
+}
+
+void UseLegacyLidarProvenance(NativeBaSolveIntent* intent) {
+  intent->visual_observation_scope =
+      NativeBaVisualObservationScope::kLegacyExplicitPointTrackExpansion;
+  intent->online_lidar_identity = NativeBaOnlineLidarIdentity();
+  for (NativeBaLidarConstraint& constraint : intent->lidar_constraints) {
+    constraint.association_id = kBaGraphInvalidAssociationId;
+    constraint.owner_image_id = kBaGraphInvalidSlot;
+    constraint.owner_point2D_idx = kBaGraphInvalidSlot;
+    constraint.frozen_point3D_xyz = {{0.0, 0.0, 0.0}};
+  }
+}
+
+const LidarConstraintRecord* FindLidarRecord(
+    const NativeHostSolveView& view, const uint64_t physical_identity) {
+  const std::vector<LidarConstraintRecord>& constraints =
+      view.LidarConstraints();
+  const auto found = std::find_if(
+      constraints.begin(), constraints.end(),
+      [physical_identity](const LidarConstraintRecord& constraint) {
+        return constraint.physical_identity == physical_identity;
+      });
+  return found == constraints.end() ? nullptr : &*found;
+}
+
+void CheckPackedInputsEqual(const LegacyKernelInputBundle& lhs,
+                            const LegacyKernelInputBundle& rhs) {
+  BOOST_REQUIRE_EQUAL(lhs.visual().size(), rhs.visual().size());
+  BOOST_REQUIRE_EQUAL(lhs.lidar().size(), rhs.lidar().size());
+  for (size_t index = 0; index < lhs.visual().size(); ++index) {
+    const CudaVisualInput& a = lhs.visual()[index];
+    const CudaVisualInput& b = rhs.visual()[index];
+    BOOST_CHECK_EQUAL(a.source_index, b.source_index);
+    BOOST_CHECK_EQUAL(a.image_id, b.image_id);
+    BOOST_CHECK_EQUAL(a.point3D_id, b.point3D_id);
+    BOOST_CHECK_EQUAL_COLLECTIONS(std::begin(a.quaternion),
+                                  std::end(a.quaternion),
+                                  std::begin(b.quaternion),
+                                  std::end(b.quaternion));
+    BOOST_CHECK_EQUAL_COLLECTIONS(std::begin(a.translation),
+                                  std::end(a.translation),
+                                  std::begin(b.translation),
+                                  std::end(b.translation));
+    BOOST_CHECK_EQUAL_COLLECTIONS(std::begin(a.point), std::end(a.point),
+                                  std::begin(b.point), std::end(b.point));
+    BOOST_CHECK_EQUAL_COLLECTIONS(std::begin(a.camera), std::end(a.camera),
+                                  std::begin(b.camera), std::end(b.camera));
+    BOOST_CHECK_EQUAL_COLLECTIONS(std::begin(a.observation),
+                                  std::end(a.observation),
+                                  std::begin(b.observation),
+                                  std::end(b.observation));
+  }
+  for (size_t index = 0; index < lhs.lidar().size(); ++index) {
+    const CudaLidarInput& a = lhs.lidar()[index];
+    const CudaLidarInput& b = rhs.lidar()[index];
+    BOOST_CHECK_EQUAL(a.source_index, b.source_index);
+    BOOST_CHECK_EQUAL(a.point3D_id, b.point3D_id);
+    BOOST_CHECK_EQUAL_COLLECTIONS(std::begin(a.point), std::end(a.point),
+                                  std::begin(b.point), std::end(b.point));
+    BOOST_CHECK_EQUAL_COLLECTIONS(std::begin(a.plane), std::end(a.plane),
+                                  std::begin(b.plane), std::end(b.plane));
+    BOOST_CHECK_EQUAL(a.weight, b.weight);
+    BOOST_CHECK_EQUAL(a.mode, b.mode);
+    BOOST_CHECK_EQUAL(a.near_zero_threshold, b.near_zero_threshold);
+  }
+}
+
+void CheckOnlineRecordMatches(const NativeHostSolveView& view,
+                              const NativeBaLidarConstraint& expected) {
+  const LidarConstraintRecord* record =
+      FindLidarRecord(view, expected.physical_identity);
+  BOOST_REQUIRE(record != nullptr);
+  BOOST_CHECK_EQUAL(record->constraint_slot, expected.constraint_slot);
+  BOOST_CHECK_EQUAL(record->association_id, expected.association_id);
+  BOOST_CHECK_EQUAL(record->owner_image_id, expected.owner_image_id);
+  BOOST_CHECK_EQUAL(record->owner_point2D_idx, expected.owner_point2D_idx);
+  BOOST_CHECK_EQUAL(record->lidar_type, expected.lidar_type);
+  BOOST_CHECK_EQUAL_COLLECTIONS(record->frozen_point3D_xyz.begin(),
+                                record->frozen_point3D_xyz.end(),
+                                expected.frozen_point3D_xyz.begin(),
+                                expected.frozen_point3D_xyz.end());
+  BOOST_CHECK_EQUAL_COLLECTIONS(record->plane.begin(), record->plane.end(),
+                                expected.plane.begin(), expected.plane.end());
+  BOOST_CHECK_EQUAL_COLLECTIONS(record->lidar_xyz.begin(),
+                                record->lidar_xyz.end(),
+                                expected.lidar_xyz.begin(),
+                                expected.lidar_xyz.end());
+  BOOST_CHECK_EQUAL(record->weight, expected.weight);
+  BOOST_CHECK_EQUAL(record->search_range, expected.search_range);
+
+  const std::vector<ResidualOrdinal>& ordinals = view.ResidualOrdinals();
+  const auto ordinal = std::find_if(
+      ordinals.begin(), ordinals.end(),
+      [&](const ResidualOrdinal& value) {
+        return value.kind == ResidualKind::kLidar &&
+               value.source_slot == expected.constraint_slot;
+      });
+  BOOST_REQUIRE(ordinal != ordinals.end());
+  BOOST_CHECK_EQUAL(ordinal->physical_identity, expected.physical_identity);
+  BOOST_CHECK_EQUAL(ordinal->association_id, expected.association_id);
+  BOOST_CHECK_EQUAL(ordinal->owner_image_id, expected.owner_image_id);
+  BOOST_CHECK_EQUAL(ordinal->owner_point2D_idx,
+                    expected.owner_point2D_idx);
 }
 
 bool BuildShadowFixture(ShadowFixture* fixture, std::string* error) {
@@ -401,6 +670,492 @@ bool BuildAcceptedCommitFixture(ShadowFixture* fixture, std::string* error) {
   return true;
 }
 
+BOOST_AUTO_TEST_CASE(
+    DirectNativeActiveOnlyOnlineProvenanceAndPackingParity) {
+  DirectNativeFixture fixture;
+  std::string error;
+  BOOST_REQUIRE_MESSAGE(BuildDirectNativeFixture(&fixture, &error), error);
+  NativeBaSolveIntent active_only_intent = fixture.intent;
+  active_only_intent.config.prepared_selection_cache =
+      CudaPreparedSelectionCacheMode::kDisabled;
+  PreparedNativeActiveSolve prepared;
+  BOOST_REQUIRE_MESSAGE(
+      PrepareDirectNative(&fixture, active_only_intent, &prepared, &error),
+      error);
+  const NativeHostSolveView* view = prepared.view();
+  const ActiveStateBuffer* state = prepared.initial_state();
+  BOOST_REQUIRE(view != nullptr);
+  BOOST_REQUIRE(state != nullptr);
+  BOOST_CHECK(view->identity.visual_observation_scope ==
+              NativeBaVisualObservationScope::kActiveImagesOnly);
+  BOOST_CHECK(SameNativeBaOnlineLidarIdentity(
+      view->identity.online_lidar_identity,
+      active_only_intent.online_lidar_identity));
+  BOOST_CHECK_EQUAL(view->identity.online_lidar_identity.map_version,
+                    view->identity.online_lidar_identity.max_scan_index);
+  BOOST_CHECK_EQUAL(view->identity.online_lidar_identity.trigger_image_id, 21);
+  BOOST_CHECK_EQUAL_COLLECTIONS(
+      view->identity.online_lidar_identity.snapshot_sha256.begin(),
+      view->identity.online_lidar_identity.snapshot_sha256.end(),
+      active_only_intent.online_lidar_identity.snapshot_sha256.begin(),
+      active_only_intent.online_lidar_identity.snapshot_sha256.end());
+  BOOST_CHECK_EQUAL_COLLECTIONS(
+      view->identity.online_lidar_identity.geometry_sha256.begin(),
+      view->identity.online_lidar_identity.geometry_sha256.end(),
+      active_only_intent.online_lidar_identity.geometry_sha256.begin(),
+      active_only_intent.online_lidar_identity.geometry_sha256.end());
+  BOOST_CHECK_EQUAL_COLLECTIONS(
+      view->identity.online_lidar_identity.association_sha256.begin(),
+      view->identity.online_lidar_identity.association_sha256.end(),
+      active_only_intent.online_lidar_identity.association_sha256.begin(),
+      active_only_intent.online_lidar_identity.association_sha256.end());
+
+  BOOST_REQUIRE_EQUAL(view->ActiveImageSlots().size(), 2);
+  BOOST_CHECK_EQUAL(
+      view->catalog.images()[view->ActiveImageSlots()[0]].image_id, 21);
+  BOOST_CHECK_EQUAL(
+      view->catalog.images()[view->ActiveImageSlots()[1]].image_id, 20);
+  BOOST_CHECK(view->BoundaryImageSlots().empty());
+  BOOST_REQUIRE_EQUAL(view->VisualObservationSlots().size(), 4);
+  const std::array<uint32_t, 4> expected_images{{21, 21, 20, 20}};
+  const std::array<uint32_t, 4> expected_point2D{{0, 2, 1, 3}};
+  for (size_t index = 0; index < expected_images.size(); ++index) {
+    const HostBaObservationSlot& observation =
+        view->catalog.observations()[view->VisualObservationSlots()[index]];
+    BOOST_CHECK_EQUAL(
+        view->catalog.images()[observation.image_slot].image_id,
+        expected_images[index]);
+    BOOST_CHECK_EQUAL(observation.point2D_idx, expected_point2D[index]);
+  }
+  const HostBaPointSlot* first_point =
+      view->catalog.FindPointById(fixture.first_point_id);
+  BOOST_REQUIRE(first_point != nullptr);
+  const auto point_policy = std::find_if(
+      view->Fixed().points.begin(), view->Fixed().points.end(),
+      [&](const PointFixedPolicyResult& value) {
+        return value.point_slot == first_point->header.slot;
+      });
+  BOOST_REQUIRE(point_policy != view->Fixed().points.end());
+  BOOST_CHECK_EQUAL(point_policy->constant, 0);
+
+  BOOST_REQUIRE_EQUAL(view->LidarConstraints().size(), 2);
+  CheckOnlineRecordMatches(*view, active_only_intent.lidar_constraints[0]);
+  CheckOnlineRecordMatches(*view, active_only_intent.lidar_constraints[1]);
+  for (const ResidualOrdinal& ordinal : view->ResidualOrdinals()) {
+    if (ordinal.kind != ResidualKind::kVisual) continue;
+    BOOST_CHECK_EQUAL(ordinal.association_id,
+                      kBaGraphInvalidAssociationId);
+    BOOST_CHECK_EQUAL(ordinal.owner_image_id, kBaGraphInvalidSlot);
+    BOOST_CHECK_EQUAL(ordinal.owner_point2D_idx, kBaGraphInvalidSlot);
+  }
+
+  LegacyKernelInputBundle layer_a_only;
+  BOOST_REQUIRE_MESSAGE(
+      BuildCudaLayerAInputs(*view, *state, &layer_a_only, &error), error);
+  LegacyKernelInputBundle full_online;
+  BOOST_REQUIRE_MESSAGE(
+      BuildLegacyKernelInputBundle(*view, *state, &full_online, &error),
+      error);
+  CheckPackedInputsEqual(layer_a_only, full_online);
+  BOOST_REQUIRE_EQUAL(full_online.visual().size(), 4);
+  BOOST_REQUIRE_EQUAL(full_online.lidar().size(), 2);
+  for (size_t index = 0; index < full_online.visual().size(); ++index) {
+    BOOST_CHECK_EQUAL(full_online.visual()[index].source_index, index);
+    BOOST_CHECK_EQUAL(full_online.visual()[index].image_id,
+                      expected_images[index]);
+  }
+  BOOST_CHECK_EQUAL(full_online.lidar()[0].source_index, 4);
+  BOOST_CHECK_EQUAL(full_online.lidar()[1].source_index, 5);
+  BOOST_CHECK_EQUAL(full_online.lidar()[0].point3D_id,
+                    fixture.first_point_id);
+  BOOST_CHECK_EQUAL(full_online.lidar()[1].point3D_id,
+                    fixture.second_point_id);
+
+  NativeHostSolveView legacy_provenance_view = *view;
+  legacy_provenance_view.identity.visual_observation_scope =
+      NativeBaVisualObservationScope::kLegacyExplicitPointTrackExpansion;
+  legacy_provenance_view.identity.online_lidar_identity =
+      NativeBaOnlineLidarIdentity();
+  legacy_provenance_view.lidar.online_lidar_identity =
+      NativeBaOnlineLidarIdentity();
+  for (LidarConstraintRecord& constraint :
+       legacy_provenance_view.lidar.constraints) {
+    constraint.association_id = kBaGraphInvalidAssociationId;
+    constraint.owner_image_id = kBaGraphInvalidSlot;
+    constraint.owner_point2D_idx = kBaGraphInvalidSlot;
+    constraint.frozen_point3D_xyz = {{0.0, 0.0, 0.0}};
+  }
+  for (ResidualOrdinal& ordinal : legacy_provenance_view.residual_ordinals) {
+    if (ordinal.kind != ResidualKind::kLidar) continue;
+    ordinal.association_id = kBaGraphInvalidAssociationId;
+    ordinal.owner_image_id = kBaGraphInvalidSlot;
+    ordinal.owner_point2D_idx = kBaGraphInvalidSlot;
+  }
+  BOOST_REQUIRE_MESSAGE(ValidateNativeHostSolveView(
+                            legacy_provenance_view, *state, &error),
+                        error);
+  LegacyKernelInputBundle legacy_provenance;
+  BOOST_REQUIRE_MESSAGE(BuildLegacyKernelInputBundle(
+                            legacy_provenance_view, *state,
+                            &legacy_provenance, &error),
+                        error);
+  CheckPackedInputsEqual(full_online, legacy_provenance);
+  prepared.Release();
+
+  NativeBaSolveIntent legacy_scope_intent = active_only_intent;
+  UseLegacyLidarProvenance(&legacy_scope_intent);
+  PreparedNativeActiveSolve legacy_scope;
+  BOOST_REQUIRE_MESSAGE(
+      PrepareDirectNative(&fixture, legacy_scope_intent, &legacy_scope,
+                          &error),
+      error);
+  BOOST_REQUIRE(legacy_scope.view() != nullptr);
+  BOOST_REQUIRE_EQUAL(legacy_scope.view()->BoundaryImageSlots().size(), 1);
+  BOOST_CHECK_EQUAL(
+      legacy_scope.view()
+          ->catalog.images()[legacy_scope.view()->BoundaryImageSlots()[0]]
+          .image_id,
+      22);
+  BOOST_REQUIRE_EQUAL(legacy_scope.view()->VisualObservationSlots().size(), 5);
+  const HostBaObservationSlot& expanded =
+      legacy_scope.view()->catalog.observations()[
+          legacy_scope.view()->VisualObservationSlots().back()];
+  BOOST_CHECK_EQUAL(
+      legacy_scope.view()->catalog.images()[expanded.image_slot].image_id, 22);
+  BOOST_CHECK_EQUAL(expanded.point2D_idx, 0);
+  const auto legacy_point_policy = std::find_if(
+      legacy_scope.view()->Fixed().points.begin(),
+      legacy_scope.view()->Fixed().points.end(),
+      [&](const PointFixedPolicyResult& value) {
+        return value.point_slot == first_point->header.slot;
+      });
+  BOOST_REQUIRE(legacy_point_policy !=
+                legacy_scope.view()->Fixed().points.end());
+  BOOST_CHECK_EQUAL(legacy_point_policy->constant, 0);
+  legacy_scope.Release();
+}
+
+BOOST_AUTO_TEST_CASE(DirectNativePreparedCacheKeysOnlineProvenance) {
+  DirectNativeFixture fixture;
+  std::string error;
+  BOOST_REQUIRE_MESSAGE(BuildDirectNativeFixture(&fixture, &error), error);
+
+  PreparedNativeActiveSolve cold;
+  BOOST_REQUIRE_MESSAGE(
+      PrepareDirectNative(&fixture, fixture.intent, &cold, &error), error);
+  BOOST_CHECK_EQUAL(cold.runtime().host_plan_hits, 0);
+  BOOST_CHECK_EQUAL(cold.runtime().host_plan_misses, 1);
+  BOOST_REQUIRE(cold.view() != nullptr);
+  BOOST_REQUIRE(cold.view()->prepared_plan != nullptr);
+  const std::shared_ptr<const PreparedSelectionPlan> original_plan =
+      cold.view()->prepared_plan;
+  const NativeHostSolveViewIdentity original_identity = cold.view()->identity;
+  const std::vector<LidarConstraintRecord> original_records =
+      cold.view()->LidarConstraints();
+  cold.Release();
+
+  PreparedNativeActiveSolve hot;
+  BOOST_REQUIRE_MESSAGE(
+      PrepareDirectNative(&fixture, fixture.intent, &hot, &error), error);
+  BOOST_CHECK_EQUAL(hot.runtime().host_plan_hits, 1);
+  BOOST_CHECK_EQUAL(hot.runtime().host_plan_misses, 0);
+  BOOST_REQUIRE(hot.view() != nullptr);
+  BOOST_CHECK(hot.view()->prepared_plan.get() == original_plan.get());
+  BOOST_CHECK(SameNativeBaOnlineLidarIdentity(
+      hot.view()->identity.online_lidar_identity,
+      original_identity.online_lidar_identity));
+  BOOST_REQUIRE_EQUAL(hot.view()->LidarConstraints().size(),
+                      original_records.size());
+  for (size_t index = 0; index < original_records.size(); ++index) {
+    BOOST_CHECK_EQUAL(hot.view()->LidarConstraints()[index].association_id,
+                      original_records[index].association_id);
+    BOOST_CHECK_EQUAL(hot.view()->LidarConstraints()[index].owner_image_id,
+                      original_records[index].owner_image_id);
+    BOOST_CHECK_EQUAL(hot.view()->LidarConstraints()[index].owner_point2D_idx,
+                      original_records[index].owner_point2D_idx);
+    BOOST_CHECK_EQUAL_COLLECTIONS(
+        hot.view()->LidarConstraints()[index].frozen_point3D_xyz.begin(),
+        hot.view()->LidarConstraints()[index].frozen_point3D_xyz.end(),
+        original_records[index].frozen_point3D_xyz.begin(),
+        original_records[index].frozen_point3D_xyz.end());
+  }
+  hot.Release();
+
+  const auto expect_miss = [&](const NativeBaSolveIntent& candidate) {
+    PreparedNativeActiveSolve miss;
+    error.clear();
+    BOOST_REQUIRE_MESSAGE(
+        PrepareDirectNative(&fixture, candidate, &miss, &error), error);
+    BOOST_CHECK_EQUAL(miss.runtime().host_plan_hits, 0);
+    BOOST_CHECK_EQUAL(miss.runtime().host_plan_misses, 1);
+    BOOST_REQUIRE(miss.view() != nullptr);
+    BOOST_REQUIRE(miss.view()->prepared_plan != nullptr);
+    BOOST_CHECK(miss.view()->prepared_plan.get() != original_plan.get());
+    BOOST_CHECK(SameNativeBaOnlineLidarIdentity(
+        miss.view()->identity.online_lidar_identity,
+        candidate.online_lidar_identity));
+    for (const NativeBaLidarConstraint& expected :
+         candidate.lidar_constraints) {
+      CheckOnlineRecordMatches(*miss.view(), expected);
+    }
+    miss.Release();
+  };
+
+  NativeBaSolveIntent candidate = fixture.intent;
+  candidate.online_lidar_identity.snapshot_sha256[0] ^= 0x1;
+  expect_miss(candidate);
+  candidate = fixture.intent;
+  candidate.online_lidar_identity.geometry_sha256[0] ^= 0x1;
+  expect_miss(candidate);
+  candidate = fixture.intent;
+  candidate.online_lidar_identity.association_sha256[0] ^= 0x1;
+  expect_miss(candidate);
+  candidate = fixture.intent;
+  candidate.lidar_constraints[0].owner_image_id = 20;
+  candidate.lidar_constraints[0].owner_point2D_idx = 1;
+  expect_miss(candidate);
+  candidate = fixture.intent;
+  std::swap(candidate.lidar_constraints[0].association_id,
+            candidate.lidar_constraints[1].association_id);
+  std::swap(candidate.lidar_constraints[0].physical_identity,
+            candidate.lidar_constraints[1].physical_identity);
+  expect_miss(candidate);
+
+  PreparedNativeActiveSolve original_again;
+  BOOST_REQUIRE_MESSAGE(PrepareDirectNative(
+                            &fixture, fixture.intent, &original_again, &error),
+                        error);
+  BOOST_CHECK_EQUAL(original_again.runtime().host_plan_hits, 1);
+  BOOST_REQUIRE(original_again.view() != nullptr);
+  BOOST_CHECK(original_again.view()->prepared_plan.get() ==
+              original_plan.get());
+  BOOST_CHECK(SameNativeBaOnlineLidarIdentity(
+      original_again.view()->identity.online_lidar_identity,
+      fixture.intent.online_lidar_identity));
+  CheckOnlineRecordMatches(*original_again.view(),
+                           fixture.intent.lidar_constraints[0]);
+  CheckOnlineRecordMatches(*original_again.view(),
+                           fixture.intent.lidar_constraints[1]);
+  original_again.Release();
+}
+
+BOOST_AUTO_TEST_CASE(DirectNativeOnlineIdentitySurvivesEmptyConstraintCache) {
+  DirectNativeFixture fixture;
+  std::string error;
+  BOOST_REQUIRE_MESSAGE(BuildDirectNativeFixture(&fixture, &error), error);
+  NativeBaSolveIntent intent = fixture.intent;
+  intent.lidar_constraints.clear();
+
+  PreparedNativeActiveSolve cold;
+  BOOST_REQUIRE_MESSAGE(PrepareDirectNative(&fixture, intent, &cold, &error),
+                        error);
+  BOOST_REQUIRE(cold.view() != nullptr);
+  BOOST_CHECK(cold.view()->LidarConstraints().empty());
+  BOOST_CHECK(cold.view()->identity.online_lidar_identity.valid);
+  BOOST_CHECK(SameNativeBaOnlineLidarIdentity(
+      cold.view()->identity.online_lidar_identity,
+      intent.online_lidar_identity));
+  BOOST_REQUIRE(cold.view()->prepared_plan != nullptr);
+  BOOST_CHECK(cold.view()->prepared_plan->online_lidar_identity.valid);
+  cold.Release();
+
+  PreparedNativeActiveSolve hot;
+  BOOST_REQUIRE_MESSAGE(PrepareDirectNative(&fixture, intent, &hot, &error),
+                        error);
+  BOOST_CHECK_EQUAL(hot.runtime().host_plan_hits, 1);
+  BOOST_REQUIRE(hot.view() != nullptr);
+  BOOST_CHECK(hot.view()->LidarConstraints().empty());
+  BOOST_CHECK(SameNativeBaOnlineLidarIdentity(
+      hot.view()->identity.online_lidar_identity,
+      intent.online_lidar_identity));
+  hot.Release();
+}
+
+BOOST_AUTO_TEST_CASE(DirectNativeOnlineProvenanceFailsClosedBeforeCacheReuse) {
+  DirectNativeFixture fixture;
+  std::string error;
+  BOOST_REQUIRE_MESSAGE(BuildDirectNativeFixture(&fixture, &error), error);
+  PreparedNativeActiveSolve primed;
+  BOOST_REQUIRE_MESSAGE(
+      PrepareDirectNative(&fixture, fixture.intent, &primed, &error), error);
+  primed.Release();
+
+  const auto reject = [&](const NativeBaSolveIntent& candidate,
+                          const char* context) {
+    BOOST_TEST_CONTEXT(context) {
+      PreparedNativeActiveSolve rejected;
+      BOOST_REQUIRE_MESSAGE(
+          PrepareDirectNative(&fixture, fixture.intent, &rejected, &error),
+          error);
+      BOOST_REQUIRE(rejected.valid());
+      BOOST_CHECK_EQUAL(rejected.runtime().host_plan_hits, 1);
+      error.clear();
+      BOOST_CHECK(
+          !PrepareDirectNative(&fixture, candidate, &rejected, &error));
+      BOOST_CHECK(!rejected.valid());
+      BOOST_CHECK(rejected.view() == nullptr);
+      BOOST_CHECK(rejected.initial_state() == nullptr);
+      BOOST_CHECK(!error.empty());
+    }
+  };
+
+  NativeBaSolveIntent candidate = fixture.intent;
+  candidate.visual_observation_scope =
+      NativeBaVisualObservationScope::kLegacyExplicitPointTrackExpansion;
+  reject(candidate, "online identity with legacy scope");
+  candidate = fixture.intent;
+  UseLegacyLidarProvenance(&candidate);
+  candidate.visual_observation_scope =
+      NativeBaVisualObservationScope::kActiveImagesOnly;
+  reject(candidate, "active-only scope without online identity");
+  candidate = fixture.intent;
+  UseLegacyLidarProvenance(&candidate);
+  candidate.online_lidar_identity.trigger_image_id = 21;
+  reject(candidate, "invalid identity retains trigger");
+  candidate = fixture.intent;
+  UseLegacyLidarProvenance(&candidate);
+  candidate.online_lidar_identity.map_version = 17;
+  reject(candidate, "invalid identity retains map version");
+  candidate = fixture.intent;
+  UseLegacyLidarProvenance(&candidate);
+  candidate.online_lidar_identity.snapshot_sha256[0] = 1;
+  reject(candidate, "invalid identity retains digest");
+  candidate = fixture.intent;
+  UseLegacyLidarProvenance(&candidate);
+  candidate.lidar_constraints[0].association_id = 0;
+  reject(candidate, "legacy constraint retains association");
+  candidate = fixture.intent;
+  UseLegacyLidarProvenance(&candidate);
+  candidate.lidar_constraints[0].owner_image_id = 21;
+  candidate.lidar_constraints[0].owner_point2D_idx = 2;
+  reject(candidate, "legacy constraint retains owner");
+  candidate = fixture.intent;
+  UseLegacyLidarProvenance(&candidate);
+  candidate.lidar_constraints[0].frozen_point3D_xyz[0] = 1.0;
+  reject(candidate, "legacy constraint retains frozen point");
+  candidate = fixture.intent;
+  candidate.online_lidar_identity.snapshot_sha256.fill(0);
+  reject(candidate, "zero snapshot digest");
+  candidate = fixture.intent;
+  candidate.online_lidar_identity.geometry_sha256.fill(0);
+  reject(candidate, "zero geometry digest");
+  candidate = fixture.intent;
+  candidate.online_lidar_identity.association_sha256.fill(0);
+  reject(candidate, "zero association digest");
+  candidate = fixture.intent;
+  candidate.online_lidar_identity.snapshot_sha256.fill(0);
+  candidate.online_lidar_identity.geometry_sha256.fill(0);
+  candidate.online_lidar_identity.association_sha256.fill(0);
+  reject(candidate, "all zero digests");
+  candidate = fixture.intent;
+  candidate.online_lidar_identity.trigger_image_id = kBaGraphInvalidSlot;
+  reject(candidate, "invalid trigger sentinel");
+  candidate = fixture.intent;
+  candidate.online_lidar_identity.trigger_image_id = 22;
+  reject(candidate, "trigger outside active images");
+  candidate = fixture.intent;
+  candidate.online_lidar_identity.map_version += 1;
+  reject(candidate, "map and max scan mismatch");
+  candidate = fixture.intent;
+  ++candidate.lidar_map_generation;
+  reject(candidate, "LiDAR map generation differs from online identity");
+  candidate = fixture.intent;
+  ++candidate.lidar_match_config_generation;
+  reject(candidate, "LiDAR match generation differs from resolved config");
+  candidate = fixture.intent;
+  candidate.lidar_constraints[0].owner_image_id = 22;
+  candidate.lidar_constraints[0].owner_point2D_idx = 0;
+  reject(candidate, "owner outside active images");
+  candidate = fixture.intent;
+  candidate.lidar_constraints[0].owner_image_id = 999;
+  reject(candidate, "owner does not exist");
+  candidate = fixture.intent;
+  candidate.lidar_constraints[0].owner_point2D_idx = 99;
+  reject(candidate, "owner point2D missing");
+  candidate = fixture.intent;
+  candidate.lidar_constraints[0].owner_point2D_idx = 0;
+  reject(candidate, "owner point2D does not reference point");
+  candidate = fixture.intent;
+  candidate.lidar_constraints[1].point3D_id = fixture.first_point_id;
+  candidate.lidar_constraints[1].owner_image_id = 20;
+  candidate.lidar_constraints[1].owner_point2D_idx = 1;
+  candidate.lidar_constraints[1].frozen_point3D_xyz = {{1.0, 2.0, 3.0}};
+  reject(candidate, "duplicate point association");
+  candidate = fixture.intent;
+  candidate.lidar_constraints[1].constraint_slot = 1;
+  reject(candidate, "duplicate constraint slot");
+  candidate = fixture.intent;
+  candidate.lidar_constraints[1].constraint_slot = 2;
+  reject(candidate, "non-dense constraint slot");
+  candidate = fixture.intent;
+  candidate.lidar_constraints[1].association_id = 0;
+  reject(candidate, "duplicate association id");
+  candidate = fixture.intent;
+  candidate.lidar_constraints[1].association_id = 2;
+  reject(candidate, "non-dense association id");
+  candidate = fixture.intent;
+  candidate.lidar_constraints[0].physical_identity = 0;
+  reject(candidate, "zero physical identity");
+  candidate = fixture.intent;
+  candidate.lidar_constraints[1].physical_identity =
+      candidate.lidar_constraints[0].physical_identity;
+  reject(candidate, "duplicate physical identity");
+  candidate = fixture.intent;
+  candidate.lidar_constraints[0].physical_identity = 3;
+  reject(candidate, "physical identity differs from association plus one");
+  candidate = fixture.intent;
+  candidate.lidar_constraints[0].plane[0] =
+      std::numeric_limits<double>::quiet_NaN();
+  reject(candidate, "non-finite constraint");
+  candidate = fixture.intent;
+  candidate.lidar_constraints[0].frozen_point3D_xyz[0] += 0.25;
+  reject(candidate, "frozen point mismatch");
+
+  PreparedNativeActiveSolve recovered;
+  BOOST_REQUIRE_MESSAGE(
+      PrepareDirectNative(&fixture, fixture.intent, &recovered, &error),
+      error);
+  BOOST_CHECK_EQUAL(recovered.runtime().host_plan_hits, 1);
+  BOOST_REQUIRE(recovered.view() != nullptr);
+  CheckOnlineRecordMatches(*recovered.view(),
+                           fixture.intent.lidar_constraints[0]);
+  recovered.Release();
+}
+
+BOOST_AUTO_TEST_CASE(DirectNativeFailedReuseReleasesPreparedState) {
+  DirectNativeFixture fixture;
+  std::string error;
+  BOOST_REQUIRE_MESSAGE(BuildDirectNativeFixture(&fixture, &error), error);
+  PreparedNativeActiveSolve prepared;
+  BOOST_REQUIRE_MESSAGE(
+      PrepareDirectNative(&fixture, fixture.intent, &prepared, &error), error);
+  BOOST_REQUIRE(prepared.valid());
+
+  NativeBaSolveIntent invalid = fixture.intent;
+  invalid.visual_observation_scope =
+      NativeBaVisualObservationScope::kLegacyExplicitPointTrackExpansion;
+  error.clear();
+  BOOST_CHECK(!PrepareDirectNative(&fixture, invalid, &prepared, &error));
+  BOOST_CHECK(!error.empty());
+  BOOST_CHECK(!prepared.valid());
+  BOOST_CHECK(prepared.view() == nullptr);
+  BOOST_CHECK(prepared.initial_state() == nullptr);
+
+  Camera extra_camera;
+  extra_camera.InitializeWithId(OpenCVCameraModel::model_id, 500.0, 640, 480);
+  extra_camera.SetCameraId(8);
+  fixture.reconstruction.AddCamera(extra_camera);
+  NativeBaSolveIntent recovered = fixture.intent;
+  recovered.expected_topology_revision =
+      fixture.reconstruction.StructureRevision();
+  BOOST_REQUIRE_MESSAGE(
+      PrepareDirectNative(&fixture, recovered, &prepared, &error), error);
+  BOOST_CHECK(prepared.valid());
+  BOOST_CHECK_EQUAL(prepared.runtime().reader_busy, 0);
+  BOOST_CHECK_EQUAL(prepared.runtime().catalog_delta_updates, 1);
+  prepared.Release();
+}
+
 BOOST_AUTO_TEST_CASE(SyntheticLegacyAndNativeKernelBoundaryPreparationParity) {
   ShadowFixture fixture;
   std::string error;
@@ -419,6 +1174,10 @@ BOOST_AUTO_TEST_CASE(SyntheticLegacyAndNativeKernelBoundaryPreparationParity) {
   BOOST_REQUIRE_EQUAL(view.boundary_image_slots.size(), 1);
   BOOST_REQUIRE_EQUAL(view.active_point_slots.size(), 1);
   BOOST_REQUIRE_EQUAL(view.visual_observation_slots.size(), 2);
+  BOOST_CHECK(view.identity.visual_observation_scope ==
+              NativeBaVisualObservationScope::
+                  kLegacyExplicitPointTrackExpansion);
+  BOOST_CHECK(!view.identity.online_lidar_identity.valid);
   BOOST_CHECK_EQUAL(view.catalog.cameras()[view.active_camera_slots[0]].camera_id,
                     7);
   BOOST_CHECK_EQUAL(view.catalog.images()[view.active_image_slots[0]].image_id,
@@ -441,6 +1200,13 @@ BOOST_AUTO_TEST_CASE(SyntheticLegacyAndNativeKernelBoundaryPreparationParity) {
                                 view.lidar.constraints[0].plane.end(),
                                 fixture.reference.lidar[0].plane.begin(),
                                 fixture.reference.lidar[0].plane.end());
+  for (const ResidualOrdinal& ordinal : view.residual_ordinals) {
+    if (ordinal.kind != ResidualKind::kVisual) continue;
+    BOOST_CHECK_EQUAL(ordinal.association_id,
+                      kBaGraphInvalidAssociationId);
+    BOOST_CHECK_EQUAL(ordinal.owner_image_id, kBaGraphInvalidSlot);
+    BOOST_CHECK_EQUAL(ordinal.owner_point2D_idx, kBaGraphInvalidSlot);
+  }
   CudaLayerBOptions options;
   options.layer_a.residual_order = CudaResidualOrder::kSourceInsertion;
   options.loss_mode = CudaLossMode::kSoftL1;

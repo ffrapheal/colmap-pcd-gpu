@@ -318,6 +318,139 @@ void AppendPlanStaticConfig(const NativeCudaResolvedConfig& config,
   AppendPlanKeyValue(config.schur_segment_size, bytes);
 }
 
+void AppendPlanOnlineLidarIdentity(
+    const NativeBaOnlineLidarIdentity& identity,
+    std::vector<uint8_t>* bytes) {
+  AppendPlanKeyValue(identity.valid, bytes);
+  AppendPlanKeyValue(identity.trigger_image_id, bytes);
+  AppendPlanKeyValue(identity.map_version, bytes);
+  AppendPlanKeyValue(identity.max_scan_index, bytes);
+  bytes->insert(bytes->end(), identity.snapshot_sha256.begin(),
+                identity.snapshot_sha256.end());
+  bytes->insert(bytes->end(), identity.geometry_sha256.begin(),
+                identity.geometry_sha256.end());
+  bytes->insert(bytes->end(), identity.association_sha256.begin(),
+                identity.association_sha256.end());
+}
+
+bool ValidateLidarProvenanceIntentBeforeCache(
+    const NativeBaSolveIntent& intent,
+    const CatalogReadLease& lease,
+    std::string* error) {
+  if (!IsValidNativeBaLidarScopeIdentity(intent.visual_observation_scope,
+                                         intent.online_lidar_identity)) {
+    *error = "native LiDAR scope and identity are inconsistent";
+    return false;
+  }
+  if (!intent.online_lidar_identity.valid) {
+    for (const NativeBaLidarConstraint& constraint :
+         intent.lidar_constraints) {
+      if (!IsCanonicalNativeBaLegacyLidarConstraint(constraint)) {
+        *error = "native legacy LiDAR provenance is not canonical";
+        return false;
+      }
+    }
+    return true;
+  }
+  if (intent.lidar_map_generation !=
+          intent.online_lidar_identity.map_version ||
+      intent.lidar_match_config_generation !=
+          intent.config.config_generation) {
+    *error = "native online LiDAR generations are inconsistent";
+    return false;
+  }
+  if (intent.lidar_constraints.size() >
+      static_cast<size_t>(std::numeric_limits<uint32_t>::max())) {
+    *error = "native online LiDAR constraint count is not representable";
+    return false;
+  }
+  try {
+    std::unordered_set<uint32_t> active_image_ids;
+    active_image_ids.reserve(intent.active_image_ids.size());
+    for (const uint32_t image_id : intent.active_image_ids) {
+      const HostBaImageSlot* image = lease.FindImageById(image_id);
+      if (image_id == kBaGraphInvalidSlot || image == nullptr ||
+          !image->header.alive || !image->registered ||
+          !active_image_ids.insert(image_id).second) {
+        *error = "native online LiDAR active image identity is invalid";
+        return false;
+      }
+    }
+    if (active_image_ids.count(
+            intent.online_lidar_identity.trigger_image_id) == 0) {
+      *error = "native online LiDAR trigger is outside active images";
+      return false;
+    }
+
+    const size_t constraint_count = intent.lidar_constraints.size();
+    std::vector<uint8_t> constraint_slots_seen(constraint_count, 0);
+    std::vector<uint8_t> association_ids_seen(constraint_count, 0);
+    std::unordered_set<uint64_t> point_ids;
+    std::unordered_set<uint64_t> physical_identities;
+    point_ids.reserve(constraint_count);
+    physical_identities.reserve(constraint_count);
+    for (const NativeBaLidarConstraint& constraint :
+         intent.lidar_constraints) {
+      if (constraint.constraint_slot >= constraint_count ||
+          constraint_slots_seen[constraint.constraint_slot] != 0) {
+        *error = "native online LiDAR constraint slots are not dense";
+        return false;
+      }
+      constraint_slots_seen[constraint.constraint_slot] = 1;
+      if (constraint.association_id >= constraint_count ||
+          association_ids_seen[constraint.association_id] != 0) {
+        *error = "native online LiDAR association IDs are not dense";
+        return false;
+      }
+      association_ids_seen[constraint.association_id] = 1;
+      if (constraint.physical_identity == 0 ||
+          constraint.physical_identity != constraint.association_id + 1 ||
+          !physical_identities.insert(constraint.physical_identity).second) {
+        *error = "native online LiDAR physical identity is invalid";
+        return false;
+      }
+      if (!point_ids.insert(constraint.point3D_id).second) {
+        *error = "native online LiDAR point identity is duplicated";
+        return false;
+      }
+      if (constraint.owner_image_id == kBaGraphInvalidSlot ||
+          constraint.owner_point2D_idx == kBaGraphInvalidSlot ||
+          active_image_ids.count(constraint.owner_image_id) == 0) {
+        *error = "native online LiDAR owner is outside active images";
+        return false;
+      }
+      const HostBaPointSlot* point =
+          lease.FindPointById(constraint.point3D_id);
+      const HostBaImageSlot* owner =
+          lease.FindImageById(constraint.owner_image_id);
+      const HostBaObservationSlot* observation = lease.FindObservation(
+          constraint.owner_image_id, constraint.owner_point2D_idx);
+      if (point == nullptr || !point->header.alive || owner == nullptr ||
+          !owner->header.alive || !owner->registered || observation == nullptr ||
+          !observation->header.alive ||
+          observation->image_slot != owner->header.slot ||
+          observation->point_slot != point->header.slot) {
+        *error = "native online LiDAR owner observation is invalid";
+        return false;
+      }
+      if (!Finite(constraint.frozen_point3D_xyz) ||
+          !Finite(constraint.plane) || !Finite(constraint.lidar_xyz) ||
+          !std::isfinite(constraint.weight) ||
+          !std::isfinite(constraint.search_range)) {
+        *error = "native online LiDAR constraint contains non-finite data";
+        return false;
+      }
+    }
+  } catch (const std::bad_alloc&) {
+    *error = "native online LiDAR validation allocation failed";
+    return false;
+  } catch (const std::length_error&) {
+    *error = "native online LiDAR validation size overflow";
+    return false;
+  }
+  return true;
+}
+
 bool BuildPlanLookupKey(const NativeBaSolveIntent& intent,
                         const uint64_t slot_namespace_epoch,
                         std::vector<uint8_t>* bytes,
@@ -336,6 +469,7 @@ bool BuildPlanLookupKey(const NativeBaSolveIntent& intent,
     AppendPlanKeyValue(intent.owner_epoch, bytes);
     AppendPlanKeyValue(slot_namespace_epoch, bytes);
     AppendPlanKeyValue(intent.kind, bytes);
+    AppendPlanKeyValue(intent.visual_observation_scope, bytes);
     AppendPlanStaticConfig(intent.config, bytes);
     AppendPlanKeyVector(intent.active_image_ids, bytes);
     AppendPlanKeyVector(intent.explicit_variable_point_ids, bytes);
@@ -364,13 +498,18 @@ bool BuildPlanLookupKey(const NativeBaSolveIntent& intent,
       AppendPlanKeyValue(value.has_search_range, bytes);
       AppendPlanKeyValue(value.search_range, bytes);
     }
+    AppendPlanOnlineLidarIdentity(intent.online_lidar_identity, bytes);
     const uint64_t lidar_count = intent.lidar_constraints.size();
     AppendPlanKeyValue(lidar_count, bytes);
     for (const NativeBaLidarConstraint& value : intent.lidar_constraints) {
       AppendPlanKeyValue(value.point3D_id, bytes);
       AppendPlanKeyValue(value.constraint_slot, bytes);
       AppendPlanKeyValue(value.physical_identity, bytes);
+      AppendPlanKeyValue(value.association_id, bytes);
+      AppendPlanKeyValue(value.owner_image_id, bytes);
+      AppendPlanKeyValue(value.owner_point2D_idx, bytes);
       AppendPlanKeyValue(value.lidar_type, bytes);
+      AppendPlanKeyValue(value.frozen_point3D_xyz, bytes);
       AppendPlanKeyValue(value.plane, bytes);
       AppendPlanKeyValue(value.lidar_xyz, bytes);
       AppendPlanKeyValue(value.weight, bytes);
@@ -548,6 +687,8 @@ std::shared_ptr<PreparedSelectionPlan> ExtractPreparedSelectionPlan(
       std::make_shared<PreparedSelectionPlan>();
   plan->publication_id = publication_id;
   plan->slot_namespace_epoch = view->catalog.slot_namespace_epoch();
+  plan->visual_observation_scope = view->identity.visual_observation_scope;
+  plan->online_lidar_identity = view->identity.online_lidar_identity;
   plan->active_camera_slots = std::move(view->active_camera_slots);
   plan->active_image_slots = std::move(view->active_image_slots);
   plan->boundary_image_slots = std::move(view->boundary_image_slots);
@@ -1124,12 +1265,11 @@ bool PrepareCudaNativeActiveSolve(
     const CudaHostStoreBinding& binding,
     PreparedNativeActiveSolve* prepared,
     std::string* error) {
+  if (prepared != nullptr) prepared->Release();
   if (prepared == nullptr || error == nullptr || inputs.problem == nullptr) {
     if (error != nullptr) *error = "invalid native graph prepare arguments";
     return false;
   }
-  std::string ignored;
-  prepared->Complete(&ignored);
   error->clear();
   if (binding.mode != CudaHostProblemStoreMode::kHostPreparedStore ||
       binding.store == nullptr || binding.owner_epoch == 0 ||
@@ -1430,18 +1570,20 @@ bool PrepareCudaNativeBaSolve(
     const CudaHostStoreBinding& binding,
     PreparedNativeActiveSolve* prepared,
     std::string* error) {
+  if (prepared != nullptr) prepared->Release();
   if (prepared == nullptr || error == nullptr || reconstruction == nullptr ||
       id_intent.abi_version != kNativeHostSolveViewAbiVersion ||
       id_intent.owner_epoch == 0 ||
       id_intent.reconstruction_identity !=
           reinterpret_cast<uintptr_t>(reconstruction) ||
       id_intent.expected_topology_revision == 0 ||
-      id_intent.selection_revision == 0 || !id_intent.config.resolved) {
+      id_intent.selection_revision == 0 || !id_intent.config.resolved ||
+      !IsValidNativeBaLidarScopeIdentity(
+          id_intent.visual_observation_scope,
+          id_intent.online_lidar_identity)) {
     if (error != nullptr) *error = "invalid ID-based native BA prepare";
     return false;
   }
-  std::string ignored;
-  prepared->Complete(&ignored);
   error->clear();
   if (binding.mode != CudaHostProblemStoreMode::kHostPreparedStore ||
       binding.store == nullptr || binding.owner_epoch != id_intent.owner_epoch ||
@@ -1484,6 +1626,9 @@ bool PrepareCudaNativeBaSolve(
     *error = "native graph catalog lease is unavailable";
     return false;
   }
+  if (!ValidateLidarProvenanceIntentBeforeCache(id_intent, lease, error)) {
+    return false;
+  }
   if (++state->next_state_generation == 0) ++state->next_state_generation;
 
   const bool cache_enabled =
@@ -1507,6 +1652,17 @@ bool PrepareCudaNativeBaSolve(
         std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - lookup_start).count();
     if (plan != nullptr) {
+      if (plan->visual_observation_scope !=
+              id_intent.visual_observation_scope ||
+          !IsValidNativeBaLidarScopeIdentity(
+              plan->visual_observation_scope,
+              plan->online_lidar_identity) ||
+          !SameNativeBaOnlineLidarIdentity(
+              plan->online_lidar_identity,
+              id_intent.online_lidar_identity)) {
+        *error = "native prepared plan scope or LiDAR identity mismatch";
+        return false;
+      }
       data->view.identity.owner_epoch = lease.owner_epoch();
       data->view.identity.catalog_revision = lease.topology_revision();
       data->view.identity.catalog_generation = lease.generation();
@@ -1517,6 +1673,10 @@ bool PrepareCudaNativeBaSolve(
           id_intent.lidar_map_generation;
       data->view.identity.lidar_match_config_generation =
           id_intent.lidar_match_config_generation;
+      data->view.identity.visual_observation_scope =
+          id_intent.visual_observation_scope;
+      data->view.identity.online_lidar_identity =
+          id_intent.online_lidar_identity;
       data->view.kind = id_intent.kind;
       data->view.config = id_intent.config;
       data->view.catalog = lease;
@@ -1524,6 +1684,8 @@ bool PrepareCudaNativeBaSolve(
           id_intent.lidar_map_generation;
       data->view.lidar.match_config_generation =
           id_intent.lidar_match_config_generation;
+      data->view.lidar.online_lidar_identity =
+          id_intent.online_lidar_identity;
       data->view.prepared_plan = std::move(plan);
       const auto bind_start = std::chrono::steady_clock::now();
       if (!GatherDynamicStateFromPreparedPlan(
@@ -1555,6 +1717,8 @@ bool PrepareCudaNativeBaSolve(
   slot_intent.catalog_generation = lease.generation();
   slot_intent.selection_revision = id_intent.selection_revision;
   slot_intent.kind = id_intent.kind;
+  slot_intent.visual_observation_scope =
+      id_intent.visual_observation_scope;
   slot_intent.config = id_intent.config;
   slot_intent.visual_observation_slots_fully_resolved = true;
   const auto cameras = lease.cameras();
@@ -1666,6 +1830,10 @@ bool PrepareCudaNativeBaSolve(
       slot_intent.explicit_variable_point_slots.push_back(point->header.slot);
     }
     relevant_points.insert(point->header.slot);
+    if (id_intent.visual_observation_scope ==
+        NativeBaVisualObservationScope::kActiveImagesOnly) {
+      return true;
+    }
     std::vector<uint32_t> point_observations;
     if (!visit_chain(
             point->adjacency_head, false, point->header.slot,
@@ -1750,6 +1918,8 @@ bool PrepareCudaNativeBaSolve(
   slot_intent.lidar.lidar_map_generation = id_intent.lidar_map_generation;
   slot_intent.lidar.match_config_generation =
       id_intent.lidar_match_config_generation;
+  slot_intent.lidar.online_lidar_identity =
+      id_intent.online_lidar_identity;
   slot_intent.lidar.constraints.reserve(id_intent.lidar_constraints.size());
   for (const NativeBaLidarConstraint& value : id_intent.lidar_constraints) {
     const HostBaPointSlot* point = lease.FindPointById(value.point3D_id);
@@ -1762,7 +1932,11 @@ bool PrepareCudaNativeBaSolve(
     constraint.point_slot = point->header.slot;
     constraint.constraint_slot = value.constraint_slot;
     constraint.physical_identity = value.physical_identity;
+    constraint.association_id = value.association_id;
+    constraint.owner_image_id = value.owner_image_id;
+    constraint.owner_point2D_idx = value.owner_point2D_idx;
     constraint.lidar_type = value.lidar_type;
+    constraint.frozen_point3D_xyz = value.frozen_point3D_xyz;
     constraint.plane = value.plane;
     constraint.lidar_xyz = value.lidar_xyz;
     constraint.weight = value.weight;

@@ -176,6 +176,7 @@ public:
 	SIFTGPU_EXPORT virtual int VerifyContextGL();
 	//check if all siftgpu functions are supported
 	SIFTGPU_EXPORT virtual int IsFullSupported();
+	SIFTGPU_EXPORT int UsesCudaBackend() const;
 	//set verbose mode
 	SIFTGPU_EXPORT virtual void SetVerbose(int verbose = 4);
 	//set SiftGPU to brief display mode, which is faster

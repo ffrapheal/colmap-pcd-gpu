@@ -32,6 +32,7 @@
 #include "base/reconstruction.h"
 
 #include <fstream>
+#include <memory>
 
 #include "base/database_cache.h"
 #include "base/gps.h"
@@ -43,9 +44,360 @@
 #include "util/ply.h"
 
 namespace colmap {
+namespace {
+
+bool HasSameCameraMetadata(const Camera& camera1, const Camera& camera2) {
+  return camera1.CameraId() == camera2.CameraId() &&
+         camera1.ModelId() == camera2.ModelId() &&
+         camera1.Width() == camera2.Width() &&
+         camera1.Height() == camera2.Height() &&
+         camera1.Params() == camera2.Params() &&
+         camera1.HasPriorFocalLength() == camera2.HasPriorFocalLength();
+}
+
+ReconstructionTransactionResult MakeTransactionResult(
+    const ReconstructionTransactionStatus status,
+    const std::string& detail,
+    const ReconstructionCanonicalVersion& canonical_version) {
+  ReconstructionTransactionResult result;
+  result.status = status;
+  result.detail = detail;
+  result.canonical_version = canonical_version;
+  return result;
+}
+
+}  // namespace
 
 Reconstruction::Reconstruction()
-    : correspondence_graph_(nullptr), num_added_points3D_(0) {}
+    : correspondence_graph_(nullptr),
+      num_added_points3D_(0),
+      transaction_owner_thread_id_(std::this_thread::get_id()) {}
+
+bool ReconstructionCanonicalVersion::operator==(
+    const ReconstructionCanonicalVersion& other) const {
+  return structure_owner_epoch == other.structure_owner_epoch &&
+         structure_revision == other.structure_revision &&
+         publish_version == other.publish_version &&
+         correspondence_graph_identity ==
+             other.correspondence_graph_identity;
+}
+
+bool ReconstructionCanonicalVersion::operator!=(
+    const ReconstructionCanonicalVersion& other) const {
+  return !(*this == other);
+}
+
+ReconstructionTransaction::ReconstructionTransaction() noexcept = default;
+
+ReconstructionTransaction::~ReconstructionTransaction() = default;
+
+ReconstructionTransaction::ReconstructionTransaction(
+    ReconstructionTransaction&& other) noexcept {
+  *this = std::move(other);
+}
+
+ReconstructionTransaction& ReconstructionTransaction::operator=(
+    ReconstructionTransaction&& other) noexcept {
+  if (this != &other) {
+    Reset();
+    candidate_ = std::move(other.candidate_);
+    canonical_ = other.canonical_;
+    correspondence_graph_ = other.correspondence_graph_;
+    owner_thread_id_ = other.owner_thread_id_;
+    expected_version_ = other.expected_version_;
+    prepared_ = other.prepared_;
+    other.Reset();
+  }
+  return *this;
+}
+
+bool ReconstructionTransaction::HasCandidate() const noexcept {
+  return candidate_ != nullptr;
+}
+
+bool ReconstructionTransaction::IsPrepared() const noexcept {
+  return prepared_;
+}
+
+Reconstruction* ReconstructionTransaction::MutableCandidate() noexcept {
+  if (std::this_thread::get_id() != owner_thread_id_) {
+    return nullptr;
+  }
+  prepared_ = false;
+  return candidate_.get();
+}
+
+const Reconstruction* ReconstructionTransaction::Candidate() const noexcept {
+  if (std::this_thread::get_id() != owner_thread_id_) {
+    return nullptr;
+  }
+  return candidate_.get();
+}
+
+ReconstructionCanonicalVersion ReconstructionTransaction::ExpectedVersion()
+    const noexcept {
+  return expected_version_;
+}
+
+void ReconstructionTransaction::Reset() noexcept {
+  candidate_.reset();
+  canonical_ = nullptr;
+  correspondence_graph_ = nullptr;
+  owner_thread_id_ = std::thread::id();
+  expected_version_ = ReconstructionCanonicalVersion();
+  prepared_ = false;
+}
+
+bool Reconstruction::IsTransactionOwnerThread() const noexcept {
+  return std::this_thread::get_id() == transaction_owner_thread_id_;
+}
+
+ReconstructionCanonicalVersion Reconstruction::CanonicalVersion()
+    const noexcept {
+  ReconstructionCanonicalVersion version;
+  version.structure_owner_epoch = structure_owner_epoch_;
+  version.structure_revision = structure_revision_;
+  version.publish_version = canonical_publish_version_;
+  version.correspondence_graph_identity =
+      reinterpret_cast<uintptr_t>(correspondence_graph_);
+  return version;
+}
+
+std::unique_ptr<Reconstruction> Reconstruction::CloneForTransaction() const {
+  std::unique_ptr<Reconstruction> candidate(new Reconstruction());
+  candidate->correspondence_graph_ = correspondence_graph_;
+  candidate->cameras_ = cameras_;
+  candidate->images_ = images_;
+  candidate->points3D_ = points3D_;
+  candidate->lidar_points_ = lidar_points_;
+  candidate->lidar_points_in_global_ = lidar_points_in_global_;
+  candidate->image_pair_stats_ = image_pair_stats_;
+  candidate->reg_image_ids_ = reg_image_ids_;
+  candidate->num_added_points3D_ = num_added_points3D_;
+
+  candidate->structure_journal_enabled_ = structure_journal_enabled_;
+  candidate->structure_owner_epoch_ = structure_owner_epoch_;
+  candidate->structure_revision_ = structure_revision_;
+  candidate->oldest_retained_structure_revision_ =
+      oldest_retained_structure_revision_;
+  candidate->structure_journal_capacity_ = structure_journal_capacity_;
+  candidate->structure_journal_ = structure_journal_;
+  candidate->transaction_owner_thread_id_ = transaction_owner_thread_id_;
+  candidate->canonical_publish_version_ = canonical_publish_version_;
+  return candidate;
+}
+
+ReconstructionTransactionResult Reconstruction::CreateTransactionSnapshot(
+    ReconstructionTransaction* transaction) const {
+  if (!IsTransactionOwnerThread()) {
+    return MakeTransactionResult(
+        ReconstructionTransactionStatus::WRONG_THREAD,
+        "transaction snapshots must run on the Reconstruction owner thread",
+        ReconstructionCanonicalVersion());
+  }
+  if (transaction == nullptr) {
+    return MakeTransactionResult(
+        ReconstructionTransactionStatus::NULL_TRANSACTION,
+        "transaction output is null",
+        CanonicalVersion());
+  }
+  transaction->Reset();
+  if (structure_mutation_depth_ != 0 ||
+      !pending_structure_events_.empty()) {
+    return MakeTransactionResult(
+        ReconstructionTransactionStatus::MUTATION_IN_PROGRESS,
+        "canonical Reconstruction has an unfinished structure mutation",
+        CanonicalVersion());
+  }
+  if (canonical_publish_version_ == std::numeric_limits<uint64_t>::max()) {
+    return MakeTransactionResult(
+        ReconstructionTransactionStatus::PUBLISH_VERSION_EXHAUSTED,
+        "Reconstruction publish version cannot be incremented",
+        CanonicalVersion());
+  }
+
+  transaction->candidate_ = CloneForTransaction();
+  transaction->canonical_ = this;
+  transaction->correspondence_graph_ = correspondence_graph_;
+  transaction->owner_thread_id_ = transaction_owner_thread_id_;
+  transaction->expected_version_ = CanonicalVersion();
+  return MakeTransactionResult(ReconstructionTransactionStatus::SUCCESS,
+                               std::string(),
+                               CanonicalVersion());
+}
+
+ReconstructionTransactionResult Reconstruction::ValidateTransaction(
+    const ReconstructionTransaction& transaction,
+    const bool require_prepared) const {
+  if (!IsTransactionOwnerThread() ||
+      std::this_thread::get_id() != transaction.owner_thread_id_) {
+    return MakeTransactionResult(
+        ReconstructionTransactionStatus::WRONG_THREAD,
+        "transaction validation must run on the Reconstruction owner thread",
+        ReconstructionCanonicalVersion());
+  }
+  if (transaction.canonical_ != this || transaction.candidate_ == nullptr ||
+      (require_prepared && !transaction.prepared_)) {
+    return MakeTransactionResult(
+        ReconstructionTransactionStatus::INVALID_TRANSACTION,
+        "transaction is not a prepared candidate for this Reconstruction",
+        CanonicalVersion());
+  }
+  if (CanonicalVersion() != transaction.expected_version_) {
+    return MakeTransactionResult(
+        ReconstructionTransactionStatus::STALE_CANONICAL_VERSION,
+        "transaction expected version does not match canonical state",
+        CanonicalVersion());
+  }
+  if (canonical_publish_version_ == std::numeric_limits<uint64_t>::max()) {
+    return MakeTransactionResult(
+        ReconstructionTransactionStatus::PUBLISH_VERSION_EXHAUSTED,
+        "Reconstruction publish version cannot be incremented",
+        CanonicalVersion());
+  }
+  if (structure_mutation_depth_ != 0 ||
+      !pending_structure_events_.empty() ||
+      transaction.candidate_->structure_mutation_depth_ != 0 ||
+      !transaction.candidate_->pending_structure_events_.empty()) {
+    return MakeTransactionResult(
+        ReconstructionTransactionStatus::MUTATION_IN_PROGRESS,
+        "canonical or candidate Reconstruction has an unfinished mutation",
+        CanonicalVersion());
+  }
+  if (correspondence_graph_ != transaction.correspondence_graph_ ||
+      transaction.candidate_->correspondence_graph_ !=
+          transaction.correspondence_graph_) {
+    return MakeTransactionResult(
+        ReconstructionTransactionStatus::CORRESPONDENCE_GRAPH_MISMATCH,
+        "candidate correspondence graph differs from its snapshot",
+        CanonicalVersion());
+  }
+
+  const Reconstruction& candidate = *transaction.candidate_;
+  if (candidate.structure_journal_enabled_ != structure_journal_enabled_ ||
+      candidate.structure_owner_epoch_ != structure_owner_epoch_ ||
+      candidate.structure_journal_capacity_ != structure_journal_capacity_ ||
+      candidate.structure_revision_ < structure_revision_ ||
+      candidate.canonical_publish_version_ != canonical_publish_version_ ||
+      candidate.transaction_owner_thread_id_ != transaction_owner_thread_id_) {
+    return MakeTransactionResult(
+        ReconstructionTransactionStatus::STRUCTURE_JOURNAL_MISMATCH,
+        "candidate changed journal ownership or transaction metadata",
+        CanonicalVersion());
+  }
+  if (!candidate.structure_journal_enabled_) {
+    if (candidate.structure_owner_epoch_ != 0 ||
+        candidate.structure_revision_ != 0 ||
+        candidate.oldest_retained_structure_revision_ != 0 ||
+        candidate.structure_journal_capacity_ != 0 ||
+        !candidate.structure_journal_.empty()) {
+      return MakeTransactionResult(
+          ReconstructionTransactionStatus::STRUCTURE_JOURNAL_MISMATCH,
+          "disabled candidate journal contains live state",
+          CanonicalVersion());
+    }
+  } else {
+    if (candidate.structure_owner_epoch_ == 0 ||
+        candidate.structure_revision_ == 0 ||
+        candidate.structure_journal_capacity_ == 0 ||
+        candidate.structure_journal_.size() >
+            candidate.structure_journal_capacity_) {
+      return MakeTransactionResult(
+          ReconstructionTransactionStatus::STRUCTURE_JOURNAL_MISMATCH,
+          "enabled candidate journal metadata is invalid",
+          CanonicalVersion());
+    }
+    uint64_t previous_revision = 0;
+    for (const ReconstructionStructureBatch& batch :
+         candidate.structure_journal_) {
+      if (batch.revision == 0 || batch.revision <= previous_revision ||
+          batch.revision > candidate.structure_revision_ ||
+          batch.events.empty()) {
+        return MakeTransactionResult(
+            ReconstructionTransactionStatus::STRUCTURE_JOURNAL_MISMATCH,
+            "candidate journal batches are inconsistent",
+            CanonicalVersion());
+      }
+      previous_revision = batch.revision;
+    }
+    const uint64_t expected_oldest = candidate.structure_journal_.empty()
+        ? candidate.structure_revision_ + 1
+        : candidate.structure_journal_.front().revision;
+    if (candidate.oldest_retained_structure_revision_ != expected_oldest) {
+      return MakeTransactionResult(
+          ReconstructionTransactionStatus::STRUCTURE_JOURNAL_MISMATCH,
+          "candidate journal retention cursor is inconsistent",
+          CanonicalVersion());
+    }
+  }
+  return MakeTransactionResult(ReconstructionTransactionStatus::SUCCESS,
+                               std::string(),
+                               CanonicalVersion());
+}
+
+ReconstructionTransactionResult Reconstruction::PrepareTransactionCommit(
+    ReconstructionTransaction* transaction) const {
+  if (transaction == nullptr) {
+    return MakeTransactionResult(
+        ReconstructionTransactionStatus::NULL_TRANSACTION,
+        "transaction is null",
+        CanonicalVersion());
+  }
+  transaction->prepared_ = false;
+  const ReconstructionTransactionResult validation =
+      ValidateTransaction(*transaction, false);
+  if (!validation.IsSuccess()) {
+    return validation;
+  }
+  transaction->prepared_ = true;
+  return validation;
+}
+
+ReconstructionTransactionResult Reconstruction::ValidatePreparedTransaction(
+    const ReconstructionTransaction& transaction) const {
+  return ValidateTransaction(transaction, true);
+}
+
+ReconstructionTransactionResult Reconstruction::CommitTransaction(
+    ReconstructionTransaction* transaction) {
+  const ReconstructionTransactionResult preparation =
+      PrepareTransactionCommit(transaction);
+  if (!preparation.IsSuccess()) {
+    return preparation;
+  }
+  const ReconstructionTransactionResult validation =
+      ValidatePreparedTransaction(*transaction);
+  if (!validation.IsSuccess()) {
+    return validation;
+  }
+  ReconstructionCanonicalVersion committed_version = CanonicalVersion();
+  ++committed_version.publish_version;
+  CommitPreparedTransaction(transaction);
+  return MakeTransactionResult(ReconstructionTransactionStatus::SUCCESS,
+                               std::string(),
+                               committed_version);
+}
+
+void Reconstruction::CommitPreparedTransaction(
+    ReconstructionTransaction* transaction) noexcept {
+  Reconstruction* candidate = transaction->candidate_.get();
+  cameras_.swap(candidate->cameras_);
+  images_.swap(candidate->images_);
+  points3D_.swap(candidate->points3D_);
+  lidar_points_.swap(candidate->lidar_points_);
+  lidar_points_in_global_.swap(candidate->lidar_points_in_global_);
+  image_pair_stats_.swap(candidate->image_pair_stats_);
+  reg_image_ids_.swap(candidate->reg_image_ids_);
+  std::swap(num_added_points3D_, candidate->num_added_points3D_);
+
+  structure_revision_ = candidate->structure_revision_;
+  oldest_retained_structure_revision_ =
+      candidate->oldest_retained_structure_revision_;
+  structure_journal_.swap(candidate->structure_journal_);
+  canonical_publish_version_ =
+      transaction->expected_version_.publish_version + 1;
+  transaction->Reset();
+}
 
 Reconstruction::StructureMutationBatch::StructureMutationBatch(
     Reconstruction* reconstruction, const bool suppress_nested_events)
@@ -335,6 +687,142 @@ void Reconstruction::AddImage(class Image image) {
   event.image_id = image_id;
   event.new_camera_id = camera_id;
   RecordStructureEvent(std::move(event));
+}
+
+bool Reconstruction::AddImageFromDatabaseCache(
+    const DatabaseCache& database_cache, const image_t image_id) {
+  if (correspondence_graph_ == nullptr ||
+      correspondence_graph_ != &database_cache.CorrespondenceGraph() ||
+      !database_cache.ExistsImage(image_id) || ExistsImage(image_id) ||
+      !correspondence_graph_->ExistsImage(image_id)) {
+    return false;
+  }
+
+  const class Image& source_image = database_cache.Image(image_id);
+  if (source_image.ImageId() != image_id || source_image.IsRegistered() ||
+      source_image.NumPoints3D() != 0 ||
+      source_image.NumVisiblePoints3D() != 0 ||
+      !source_image.HasCamera() ||
+      !database_cache.ExistsCamera(source_image.CameraId())) {
+    return false;
+  }
+  for (const class Point2D& point2D : source_image.Points2D()) {
+    if (point2D.HasPoint3D()) {
+      return false;
+    }
+  }
+
+  const camera_t camera_id = source_image.CameraId();
+  const class Camera& source_camera = database_cache.Camera(camera_id);
+  if (source_camera.CameraId() != camera_id ||
+      !ExistsCameraModelWithId(source_camera.ModelId()) ||
+      !source_camera.VerifyParams() ||
+      source_camera.Width() == 0 || source_camera.Height() == 0 ||
+      (ExistsCamera(camera_id) &&
+       !HasSameCameraMetadata(Camera(camera_id), source_camera))) {
+    return false;
+  }
+
+  class Image image = source_image;
+  image.SetNumObservations(
+      correspondence_graph_->NumObservationsForImage(image_id));
+  image.SetNumCorrespondences(
+      correspondence_graph_->NumCorrespondencesForImage(image_id));
+  image.SetUp(source_camera);
+
+  StructureMutationBatch mutation(this);
+  if (!ExistsCamera(camera_id)) {
+    AddCamera(source_camera);
+  }
+  AddImage(std::move(image));
+  return true;
+}
+
+bool Reconstruction::AddImagePairFromCorrespondenceGraph(
+    const image_t image_id1, const image_t image_id2) {
+  if (correspondence_graph_ == nullptr || image_id1 == image_id2 ||
+      !ExistsImage(image_id1) || !ExistsImage(image_id2) ||
+      !correspondence_graph_->ExistsImage(image_id1) ||
+      !correspondence_graph_->ExistsImage(image_id2)) {
+    return false;
+  }
+
+  const image_pair_t pair_id =
+      Database::ImagePairToPairId(image_id1, image_id2);
+  if (ExistsImagePair(pair_id)) {
+    return false;
+  }
+
+  const FeatureMatches matches =
+      correspondence_graph_->FindCorrespondencesBetweenImages(image_id1,
+                                                               image_id2);
+  if (matches.empty() ||
+      matches.size() != static_cast<size_t>(
+                            correspondence_graph_
+                                ->NumCorrespondencesBetweenImages(image_id1,
+                                                                  image_id2))) {
+    return false;
+  }
+
+  const class Image& source_image1 = Image(image_id1);
+  const class Image& source_image2 = Image(image_id2);
+  ImagePairStat image_pair_stat;
+  image_pair_stat.num_total_corrs = matches.size();
+  std::vector<std::pair<bool, bool>> match_has_point3D;
+  match_has_point3D.reserve(matches.size());
+  for (const FeatureMatch& match : matches) {
+    if (match.point2D_idx1 >= source_image1.NumPoints2D() ||
+        match.point2D_idx2 >= source_image2.NumPoints2D()) {
+      return false;
+    }
+
+    const class Point2D& point2D1 =
+        source_image1.Point2D(match.point2D_idx1);
+    const class Point2D& point2D2 =
+        source_image2.Point2D(match.point2D_idx2);
+    const bool point2D1_has_point3D = point2D1.HasPoint3D();
+    const bool point2D2_has_point3D = point2D2.HasPoint3D();
+    if ((point2D1_has_point3D &&
+         !ExistsPoint3D(point2D1.Point3DId())) ||
+        (point2D2_has_point3D &&
+         !ExistsPoint3D(point2D2.Point3DId()))) {
+      return false;
+    }
+    match_has_point3D.emplace_back(point2D1_has_point3D,
+                                   point2D2_has_point3D);
+    if (point2D1_has_point3D && point2D2_has_point3D &&
+        point2D1.Point3DId() == point2D2.Point3DId()) {
+      image_pair_stat.num_tri_corrs += 1;
+    }
+  }
+
+  const auto insertion = image_pair_stats_.emplace(pair_id, image_pair_stat);
+  if (!insertion.second) {
+    return false;
+  }
+
+  class Image& image1 = Image(image_id1);
+  class Image& image2 = Image(image_id2);
+  image1.SetNumObservations(
+      correspondence_graph_->NumObservationsForImage(image_id1));
+  image1.SetNumCorrespondences(
+      correspondence_graph_->NumCorrespondencesForImage(image_id1));
+  image2.SetNumObservations(
+      correspondence_graph_->NumObservationsForImage(image_id2));
+  image2.SetNumCorrespondences(
+      correspondence_graph_->NumCorrespondencesForImage(image_id2));
+
+  for (size_t match_idx = 0; match_idx < matches.size(); ++match_idx) {
+    const FeatureMatch& match = matches[match_idx];
+    if (match_has_point3D[match_idx].first) {
+      image2.IncrementCorrespondenceHasPoint3D(match.point2D_idx2);
+    }
+    if (match_has_point3D[match_idx].second) {
+      image1.IncrementCorrespondenceHasPoint3D(match.point2D_idx1);
+    }
+  }
+
+  return true;
 }
 
 void Reconstruction::AddLidarPoint(const point3D_t& point3D_id, LidarPoint& lidar_point){

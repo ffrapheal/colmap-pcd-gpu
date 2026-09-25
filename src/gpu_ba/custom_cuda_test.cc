@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstddef>
 #include <cstring>
 #include <cstdlib>
 #include <limits>
@@ -20,6 +21,21 @@
 namespace colmap {
 namespace gpu_ba {
 namespace {
+
+static_assert(sizeof(CudaVisualInput) == 184,
+              "CudaVisualInput ABI size changed");
+static_assert(offsetof(CudaVisualInput, point3D_id) == 16,
+              "CudaVisualInput ABI alignment changed");
+static_assert(offsetof(CudaVisualInput, observation) == 168,
+              "CudaVisualInput ABI field layout changed");
+static_assert(sizeof(CudaLidarInput) == 96,
+              "CudaLidarInput ABI size changed");
+static_assert(offsetof(CudaLidarInput, near_zero_threshold) == 88,
+              "CudaLidarInput ABI field layout changed");
+static_assert(sizeof(CudaVisualOutput) == 480,
+              "CudaVisualOutput ABI size changed");
+static_assert(sizeof(CudaLidarOutput) == 48,
+              "CudaLidarOutput ABI size changed");
 
 constexpr double kDeviceControlScalarAtol = 1e-10;
 constexpr double kDeviceControlScalarRtol = 1e-9;

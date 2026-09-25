@@ -2,3 +2,6 @@
 	path = doc/_build/html
 	url = https://github.com/colmap/colmap.github.io.git
 	ignore = all
+[submodule "thirdpart/i3dgs"]
+	path = thirdpart/i3dgs
+	url = https://github.com/graphdeco-inria/i3dgs.git

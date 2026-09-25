@@ -4,6 +4,7 @@
 #include <fstream>
 #include <iostream>
 #include <sstream>
+#include <array>
 #include <map>
 #include <set>
 #include <utility>
@@ -25,11 +26,28 @@
 
 #include "lidar/pt_type.h"
 
+#ifdef GPU_BA_CUDA_ENABLED
+#include "lidar/incremental_causal_lidar_map.h"
+#endif
+
 namespace colmap{
 
 class NonBaStageSink;
 
 namespace lidar{
+
+namespace internal {
+
+bool IntersectCameraRayWithWorldPlane(
+    const Camera& camera,
+    const Eigen::Matrix3d& rotation_cw,
+    const Eigen::Vector3d& translation_cw,
+    const Eigen::Vector2d& image_point,
+    const Eigen::Vector3d& plane_point_world,
+    const Eigen::Vector3d& plane_normal_world,
+    Eigen::Vector3d* intersection_world);
+
+}  // namespace internal
 
 struct PcdProjectionOptions {
   std::string ba_pointcloud_path;
@@ -60,9 +78,43 @@ struct PcdProjectionOptions {
   float submap_width = 1.0;
   float submap_height = 1.0;
   float choose_meter = 40.0;// The z axis length of the pyramid
-  double min_lidar_proj_dist;
+  double min_lidar_proj_dist = 0.0;
 
 };
+
+#ifdef GPU_BA_CUDA_ENABLED
+struct SnapshotProjectionMatch {
+  point3D_t point3D_id = kInvalidPoint3DId;
+  point2D_t point2D_idx = kInvalidPoint2DIdx;
+  std::array<int, 2> scaled_pixel{{0, 0}};
+  PlaneSample plane;
+  VoxelKey plane_key;
+  uint64_t map_version = 0;
+  float camera_distance = 0.0f;
+};
+
+struct SnapshotProjectionAudit {
+  uint64_t map_version = 0;
+  std::string snapshot_sha256;
+  std::string geometry_sha256;
+  size_t snapshot_voxel_count = 0;
+  size_t snapshot_block_count = 0;
+  bool full_snapshot_due_to_distortion = false;
+  LidarAabb projection_aabb;
+  uint64_t input_feature_count = 0;
+  uint64_t in_image_feature_count = 0;
+  uint64_t aabb_visited_block_count = 0;
+  uint64_t candidate_plane_count = 0;
+  uint64_t positive_depth_hit_count = 0;
+  uint64_t axial_depth_hit_count = 0;
+  uint64_t pixel_hit_count = 0;
+  uint64_t coverage_pixel_visit_count = 0;
+  uint64_t feature_coverage_hit_count = 0;
+  uint64_t feature_pixel_hit_count = 0;
+  uint64_t feature_hit_count = 0;
+};
+#endif
+
 class PcdProj{
   public:
     using PointType = LidarPoint;
@@ -98,6 +150,15 @@ class PcdProj{
             const Camera& camera, 
             std::vector<std::pair<Eigen::Vector2d, bool>,Eigen::aligned_allocator<std::pair<Eigen::Vector2d, bool>>>& pt_xys, 
             std::vector<Eigen::Vector3d,Eigen::aligned_allocator<Eigen::Vector3d>>& pt_xyzs);
+#ifdef GPU_BA_CUDA_ENABLED
+    bool ProjectImageToSnapshot(
+        const Image& image,
+        const Camera& camera,
+        const LidarMapSnapshot& snapshot,
+        std::map<point3D_t, SnapshotProjectionMatch>* matches,
+        SnapshotProjectionAudit* audit,
+        std::string* error);
+#endif
     bool HasInitialMeshDepth() const;
     double InitialMeshDepthPnpMaxError() const;
     bool SetInitialImageFromMeshDepth(

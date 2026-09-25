@@ -186,6 +186,12 @@ class FeatureMatcherCache {
 
   void Setup();
 
+  // Incrementally update the cache after the corresponding database rows have
+  // already been written.
+  bool AddCamera(const Camera& camera);
+  bool AddImage(const Image& image, const FeatureKeypoints& keypoints,
+                const FeatureDescriptors& descriptors);
+
   const Camera& GetCamera(const camera_t camera_id) const;
   const Image& GetImage(const image_t image_id) const;
   FeatureKeypointsPtr GetKeypoints(const image_t image_id);
@@ -210,7 +216,7 @@ class FeatureMatcherCache {
  private:
   const size_t cache_size_;
   const Database* database_;
-  std::mutex database_mutex_;
+  mutable std::mutex database_mutex_;
   EIGEN_STL_UMAP(camera_t, Camera) cameras_cache_;
   EIGEN_STL_UMAP(image_t, Image) images_cache_;
   std::unique_ptr<LRUCache<image_t, FeatureKeypointsPtr>> keypoints_cache_;
@@ -346,6 +352,23 @@ class TwoViewGeometryVerifier : public Thread {
 // database should be in an active transaction while calling `Match`.
 class SiftFeatureMatcher {
  public:
+  enum class MatchStatus {
+    COMPUTED,
+    SKIPPED_SELF_MATCH,
+    SKIPPED_DUPLICATE_PAIR,
+    SKIPPED_EXISTING_PAIR,
+    // Keep this last so existing numeric status values remain stable.
+    NOT_PROCESSED,
+  };
+
+  struct MatchResult {
+    image_t image_id1 = kInvalidImageId;
+    image_t image_id2 = kInvalidImageId;
+    MatchStatus status = MatchStatus::NOT_PROCESSED;
+    FeatureMatches matches;
+    TwoViewGeometry two_view_geometry;
+  };
+
   SiftFeatureMatcher(const SiftMatchingOptions& options, Database* database,
                      FeatureMatcherCache* cache);
 
@@ -354,14 +377,39 @@ class SiftFeatureMatcher {
   // Setup the matchers and return if successful.
   bool Setup();
 
+  // Setup the matchers using an explicit positive feature bound. This supports
+  // online matching before any descriptors have been added to the database.
+  bool SetupForMaxNumFeatures(int max_num_features);
+
+  // Return whether matcher setup completed successfully. This query does not
+  // attempt setup or otherwise mutate matcher state.
+  bool IsSetup() const;
+
+  // Return the configured persistence threshold without mutating matcher
+  // state.
+  int MinNumInliers() const;
+
   // Match one batch of multiple image pairs.
   void Match(const std::vector<std::pair<image_t, image_t>>& image_pairs);
 
+  // Match one batch and return one result per submitted pair in input order.
+  // For COMPUTED results, the returned two-view geometry is exactly the value
+  // persisted to the database. Raw matches remain available even when the
+  // legacy minimum-inlier filter persists an empty match matrix.
+  std::vector<MatchResult> MatchWithResults(
+      const std::vector<std::pair<image_t, image_t>>& image_pairs);
+
  private:
+  void MatchInternal(
+      const std::vector<std::pair<image_t, image_t>>& image_pairs,
+      std::vector<MatchResult>* results);
+
   SiftMatchingOptions options_;
   Database* database_;
   FeatureMatcherCache* cache_;
 
+  bool setup_attempted_;
+  int setup_max_num_features_;
   bool is_setup_;
 
   std::vector<std::unique_ptr<FeatureMatcherThread>> matchers_;

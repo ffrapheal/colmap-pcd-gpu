@@ -31,6 +31,7 @@
 
 #include "sfm/incremental_mapper.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cmath>
@@ -38,7 +39,10 @@
 #include <iostream>
 #include <limits>
 #include <map>
+#include <thread>
 
+#include "base/camera_models.h"
+#include "base/pose.h"
 #include "base/projection.h"
 #include "base/triangulation.h"
 #ifdef GPU_BA_CUDA_ENABLED
@@ -51,6 +55,65 @@
 
 namespace colmap {
 namespace {
+
+constexpr double kUnitQuaternionTolerance = 1e-8;
+
+std::atomic<uint64_t> g_next_incremental_mapper_owner_id{0};
+std::atomic<uint64_t> g_next_incremental_mapper_thread_token{0};
+
+uint64_t NextNonzeroAtomicValue(std::atomic<uint64_t>* counter) {
+  uint64_t value = ++(*counter);
+  if (value == 0) value = ++(*counter);
+  return value;
+}
+
+uint64_t CurrentThreadToken() {
+  thread_local const uint64_t token =
+      NextNonzeroAtomicValue(&g_next_incremental_mapper_thread_token);
+  return token;
+}
+
+bool NormalizeQuaternionScaleFirst(const Eigen::Vector4d& qvec,
+                                   Eigen::Vector4d* normalized_qvec) {
+  if (!qvec.allFinite()) return false;
+
+  const double scale = qvec.cwiseAbs().maxCoeff();
+  if (!(scale > 0.0) || !std::isfinite(scale)) return false;
+
+  const Eigen::Vector4d scaled_qvec = qvec / scale;
+  const double scaled_norm = scaled_qvec.norm();
+  if (!(scaled_norm > 0.0) || !std::isfinite(scaled_norm) ||
+      !(scale > std::numeric_limits<double>::epsilon() / scaled_norm)) {
+    return false;
+  }
+
+  *normalized_qvec = scaled_qvec / scaled_norm;
+  return normalized_qvec->allFinite();
+}
+
+bool HasValidCameraDefinition(const Camera& camera) {
+  return camera.Width() > 0 && camera.Height() > 0 &&
+         ExistsCameraModelWithId(camera.ModelId()) && camera.VerifyParams() &&
+         std::all_of(camera.Params().begin(), camera.Params().end(),
+                     [](const double param) { return std::isfinite(param); });
+}
+
+bool HasSameCamera(const Camera& camera1, const Camera& camera2) {
+  return camera1.CameraId() == camera2.CameraId() &&
+         camera1.ModelId() == camera2.ModelId() &&
+         camera1.Width() == camera2.Width() &&
+         camera1.Height() == camera2.Height() &&
+         camera1.Params() == camera2.Params() &&
+         camera1.HasPriorFocalLength() == camera2.HasPriorFocalLength();
+}
+
+template <typename Derived1, typename Derived2>
+bool HasSameVector(const Eigen::MatrixBase<Derived1>& vector1,
+                   const Eigen::MatrixBase<Derived2>& vector2) {
+  return vector1.rows() == vector2.rows() &&
+         vector1.cols() == vector2.cols() &&
+         (vector1.array() == vector2.array()).all();
+}
 
 #ifdef GPU_BA_CUDA_ENABLED
 std::atomic<uint64_t> g_next_gpu_ba_host_store_owner_epoch{0};
@@ -139,6 +202,8 @@ IncrementalMapper::IncrementalMapper(const DatabaseCache* database_cache,
       non_ba_profiler_(non_ba_profiler),
       reconstruction_(nullptr),
       triangulator_(nullptr),
+      mapper_owner_id_(
+          NextNonzeroAtomicValue(&g_next_incremental_mapper_owner_id)),
       num_total_reg_images_(0),
       num_shared_reg_images_(0),
       prev_init_image_pair_id_(kInvalidImagePairId) {}
@@ -155,6 +220,8 @@ void IncrementalMapper::BeginReconstruction(
 #endif
 ) {
   CHECK(reconstruction_ == nullptr);
+  CHECK_EQ(reconstruction_owner_thread_token_.load(std::memory_order_acquire),
+           0);
   reconstruction_ = reconstruction;
   reconstruction_->Load(*database_cache_);
   reconstruction_->SetUp(&database_cache_->CorrespondenceGraph());
@@ -189,10 +256,15 @@ void IncrementalMapper::BeginReconstruction(
   filtered_images_.clear();
   num_reg_trials_.clear();
   mesh_depth_feature_cache_.clear();
+
+  NextNonzeroAtomicValue(&reconstruction_generation_);
+  reconstruction_owner_thread_token_.store(CurrentThreadToken(),
+                                            std::memory_order_release);
 }
 
 void IncrementalMapper::EndReconstruction(const bool discard) {
   CHECK_NOTNULL(reconstruction_);
+  reconstruction_owner_thread_token_.store(0, std::memory_order_release);
 
   if (discard) {
     for (const image_t image_id : reconstruction_->RegImageIds()) {
@@ -556,6 +628,118 @@ bool IncrementalMapper::RegisterNextImageFromPosePrior(
   reconstruction_->RegisterImage(image_id);
   RegisterImageEvent(image_id);
   return true;
+}
+
+IncrementalMapper::KnownPoseRegistrationResult
+IncrementalMapper::RegisterImageFromKnownPose(
+    const image_t image_id,
+    const Eigen::Vector4d& qvec,
+    const Eigen::Vector3d& tvec) {
+  KnownPoseRegistrationResult result;
+  const auto reject = [&result](const KnownPoseRegistrationReason reason) {
+    result.reason = reason;
+    return result;
+  };
+
+  const uint64_t owner_thread_token =
+      reconstruction_owner_thread_token_.load(std::memory_order_acquire);
+  if (owner_thread_token == 0) {
+    return reject(KnownPoseRegistrationReason::SESSION_NOT_ACTIVE);
+  }
+  if (owner_thread_token != CurrentThreadToken()) {
+    return reject(KnownPoseRegistrationReason::WRONG_THREAD);
+  }
+  if (database_cache_ == nullptr || reconstruction_ == nullptr ||
+      triangulator_ == nullptr) {
+    return reject(KnownPoseRegistrationReason::MAPPER_NOT_READY);
+  }
+  if (image_id == kInvalidImageId || image_id >= Database::kMaxNumImages) {
+    return reject(KnownPoseRegistrationReason::INVALID_IMAGE_ID);
+  }
+  if (!reconstruction_->ExistsImage(image_id) ||
+      !database_cache_->ExistsImage(image_id)) {
+    return reject(KnownPoseRegistrationReason::IMAGE_NOT_FOUND);
+  }
+
+  const CorrespondenceGraph& correspondence_graph =
+      database_cache_->CorrespondenceGraph();
+  if (!correspondence_graph.ExistsImage(image_id)) {
+    return reject(KnownPoseRegistrationReason::CACHE_MISMATCH);
+  }
+
+  const Image& image = reconstruction_->Image(image_id);
+  const Image& cached_image = database_cache_->Image(image_id);
+  if (!image.HasCamera() || !cached_image.HasCamera() ||
+      !reconstruction_->ExistsCamera(image.CameraId()) ||
+      !database_cache_->ExistsCamera(cached_image.CameraId())) {
+    return reject(KnownPoseRegistrationReason::CAMERA_NOT_FOUND);
+  }
+
+  const Camera& camera = reconstruction_->Camera(image.CameraId());
+  const Camera& cached_camera =
+      database_cache_->Camera(cached_image.CameraId());
+  if (!HasValidCameraDefinition(camera) ||
+      !HasValidCameraDefinition(cached_camera)) {
+    return reject(KnownPoseRegistrationReason::INVALID_CAMERA);
+  }
+  if (image.ImageId() != image_id || cached_image.ImageId() != image_id ||
+      image.Name() != cached_image.Name() ||
+      image.CameraId() != cached_image.CameraId() ||
+      camera.CameraId() != image.CameraId() ||
+      cached_camera.CameraId() != cached_image.CameraId() ||
+      camera.ModelId() != cached_camera.ModelId() ||
+      camera.Width() != cached_camera.Width() ||
+      camera.Height() != cached_camera.Height() ||
+      camera.HasPriorFocalLength() != cached_camera.HasPriorFocalLength() ||
+      image.NumPoints2D() != cached_image.NumPoints2D() ||
+      image.NumObservations() != cached_image.NumObservations() ||
+      image.NumCorrespondences() != cached_image.NumCorrespondences() ||
+      cached_image.NumObservations() !=
+          correspondence_graph.NumObservationsForImage(image_id) ||
+      cached_image.NumCorrespondences() !=
+          correspondence_graph.NumCorrespondencesForImage(image_id) ||
+      cached_image.IsRegistered()) {
+    return reject(KnownPoseRegistrationReason::CACHE_MISMATCH);
+  }
+  for (point2D_t point2D_idx = 0; point2D_idx < image.NumPoints2D();
+       ++point2D_idx) {
+    if (!HasSameVector(image.Point2D(point2D_idx).XY(),
+                       cached_image.Point2D(point2D_idx).XY())) {
+      return reject(KnownPoseRegistrationReason::CACHE_MISMATCH);
+    }
+  }
+
+  const bool listed_as_registered =
+      std::find(reconstruction_->RegImageIds().begin(),
+                reconstruction_->RegImageIds().end(),
+                image_id) != reconstruction_->RegImageIds().end();
+  if (image.IsRegistered() != listed_as_registered) {
+    return reject(KnownPoseRegistrationReason::CACHE_MISMATCH);
+  }
+  if (image.IsRegistered()) {
+    return reject(KnownPoseRegistrationReason::IMAGE_ALREADY_REGISTERED);
+  }
+  if (!qvec.allFinite() || !tvec.allFinite()) {
+    return reject(KnownPoseRegistrationReason::POSE_NOT_FINITE);
+  }
+
+  Eigen::Vector4d normalized_qvec;
+  if (!NormalizeQuaternionScaleFirst(qvec, &normalized_qvec)) {
+    return reject(KnownPoseRegistrationReason::INVALID_QUATERNION);
+  }
+
+  {
+    Reconstruction::StructureMutationBatch structure_mutation(reconstruction_);
+    Image& mutable_image = reconstruction_->Image(image_id);
+    mutable_image.SetQvec(normalized_qvec);
+    mutable_image.SetTvec(tvec);
+    reconstruction_->RegisterImage(image_id);
+    RegisterImageEvent(image_id);
+  }
+
+  result.status = KnownPoseRegistrationStatus::SUCCESS;
+  result.reason = KnownPoseRegistrationReason::NONE;
+  return result;
 }
 
 const IncrementalMapper::MeshDepthFeatureCache*
@@ -1073,31 +1257,140 @@ bool IncrementalMapper::RegisterNextImage(const Options& options,
 
   CHECK(options.Check());
 
-  Image& image = reconstruction_->Image(image_id);
-  Camera& camera = reconstruction_->Camera(image.CameraId());
-
+  const Image& image = reconstruction_->Image(image_id);
   CHECK(!image.IsRegistered()) << "Image cannot be registered multiple times";
 
   num_reg_trials_[image_id] += 1;
 
-  // Check if enough 2D-3D correspondences.
+  // Preserve the legacy fast rejection for the standard registration path.
   if (image.NumVisiblePoints3D() <
       static_cast<size_t>(options.abs_pose_min_num_inliers)) {
     return false;
   }
 
-    if (if_import_pose_prior_) {
-      auto iter = existed_poses_.find(image_id);
-      if (iter != existed_poses_.end()){
-        std::vector<double> pose = iter -> second;
-        Eigen::Vector4d q_cw;
-        Eigen::Vector3d t_cw;
-        t_cw << pose[0], pose[1], pose[2];
-        q_cw << pose[3], pose[4], pose[5], pose[6];
-        image.SetQvec(q_cw);
-        image.SetTvec(t_cw);
+  const CorrespondenceGraph& correspondence_graph =
+      database_cache_->CorrespondenceGraph();
+  std::vector<image_t> reference_image_ids;
+  reference_image_ids.reserve(reconstruction_->NumRegImages());
+  if (correspondence_graph.ExistsImage(image_id)) {
+    for (const image_t reference_image_id : reconstruction_->RegImageIds()) {
+      if (reference_image_id == image_id ||
+          !reconstruction_->ExistsImage(reference_image_id) ||
+          !database_cache_->ExistsImage(reference_image_id) ||
+          !correspondence_graph.ExistsImage(reference_image_id) ||
+          !reconstruction_->Image(reference_image_id).IsRegistered() ||
+          correspondence_graph.NumCorrespondencesBetweenImages(
+              image_id, reference_image_id) == 0) {
+        continue;
       }
+      reference_image_ids.push_back(reference_image_id);
+    }
+  }
+  ImagePoseEstimation result;
+  return EstimateImagePoseWithReferences(
+             options, image_id, reference_image_ids, &result) &&
+         CommitImageRegistration(result);
+}
 
+bool IncrementalMapper::EstimateImagePoseWithReferences(
+    const Options& options,
+    const image_t image_id,
+    const std::vector<image_t>& reference_image_ids,
+    ImagePoseEstimation* result) {
+  if (result == nullptr) {
+    return false;
+  }
+  *result = ImagePoseEstimation();
+
+  const uint64_t owner_thread_token =
+      reconstruction_owner_thread_token_.load(std::memory_order_acquire);
+  const uint64_t reconstruction_generation =
+      reconstruction_generation_.load(std::memory_order_relaxed);
+  Reconstruction* const active_reconstruction = reconstruction_;
+  if (owner_thread_token == 0 || reconstruction_generation == 0 ||
+      active_reconstruction == nullptr || triangulator_ == nullptr ||
+      database_cache_ == nullptr ||
+      reconstruction_->NumRegImages() < 2 || !options.Check() ||
+      !reconstruction_->ExistsImage(image_id) ||
+      !database_cache_->ExistsImage(image_id)) {
+    return false;
+  }
+
+  const CorrespondenceGraph& correspondence_graph =
+      database_cache_->CorrespondenceGraph();
+  if (!correspondence_graph.ExistsImage(image_id)) {
+    return false;
+  }
+
+  const Image& image = reconstruction_->Image(image_id);
+  const Image& cached_image = database_cache_->Image(image_id);
+  if (image.ImageId() != image_id || cached_image.ImageId() != image_id ||
+      image.IsRegistered() || image.NumPoints2D() != cached_image.NumPoints2D() ||
+      image.CameraId() != cached_image.CameraId() ||
+      !reconstruction_->ExistsCamera(image.CameraId()) ||
+      !database_cache_->ExistsCamera(image.CameraId()) ||
+      reference_image_ids.empty()) {
+    return false;
+  }
+
+  std::unordered_set<image_t> reference_image_id_set;
+  reference_image_id_set.reserve(reference_image_ids.size());
+  for (const image_t reference_image_id : reference_image_ids) {
+    if (reference_image_id == image_id ||
+        !reconstruction_->ExistsImage(reference_image_id) ||
+        !database_cache_->ExistsImage(reference_image_id) ||
+        !correspondence_graph.ExistsImage(reference_image_id)) {
+      return false;
+    }
+    const Image& reference_image =
+        reconstruction_->Image(reference_image_id);
+    const Image& cached_reference_image =
+        database_cache_->Image(reference_image_id);
+    if (reference_image.ImageId() != reference_image_id ||
+        cached_reference_image.ImageId() != reference_image_id ||
+        !reference_image.IsRegistered() ||
+        reference_image.NumPoints2D() !=
+            cached_reference_image.NumPoints2D() ||
+        reference_image.CameraId() != cached_reference_image.CameraId() ||
+        !reconstruction_->ExistsCamera(reference_image.CameraId()) ||
+        !database_cache_->ExistsCamera(reference_image.CameraId())) {
+      return false;
+    }
+    reference_image_id_set.insert(reference_image_id);
+  }
+
+  const Eigen::Vector4d input_qvec = image.Qvec();
+  const Eigen::Vector3d input_tvec = image.Tvec();
+  const Camera input_camera = reconstruction_->Camera(image.CameraId());
+  const bool structure_journal_enabled =
+      reconstruction_->StructureJournalEnabled();
+  const uint64_t structure_owner_epoch =
+      reconstruction_->StructureOwnerEpoch();
+  const uint64_t structure_revision = reconstruction_->StructureRevision();
+  const size_t num_images = reconstruction_->NumImages();
+  const size_t num_reg_images = reconstruction_->NumRegImages();
+  const size_t num_points3D = reconstruction_->NumPoints3D();
+  const auto num_reg_images_it =
+      num_reg_images_per_camera_.find(image.CameraId());
+  const size_t target_camera_num_reg_images =
+      num_reg_images_it == num_reg_images_per_camera_.end()
+          ? 0
+          : num_reg_images_it->second;
+
+  Eigen::Vector4d qvec = input_qvec;
+  Eigen::Vector3d tvec = input_tvec;
+  Camera camera = input_camera;
+
+  if (if_import_pose_prior_) {
+    const auto pose_it = existed_poses_.find(image_id);
+    if (pose_it != existed_poses_.end()) {
+      const std::vector<double>& pose = pose_it->second;
+      if (pose.size() < 7) {
+        return false;
+      }
+      tvec << pose[0], pose[1], pose[2];
+      qvec << pose[3], pose[4], pose[5], pose[6];
+    }
   }
 
   //////////////////////////////////////////////////////////////////////////////
@@ -1105,10 +1398,7 @@ bool IncrementalMapper::RegisterNextImage(const Options& options,
   //////////////////////////////////////////////////////////////////////////////
 
   
-  const CorrespondenceGraph& correspondence_graph =
-      database_cache_->CorrespondenceGraph();
-
-  std::vector<std::pair<point2D_t, point3D_t>> tri_corrs;
+  std::vector<ImagePoseCorrespondence> tri_corrs;
   std::vector<Eigen::Vector2d> tri_points2D;
   std::vector<Eigen::Vector3d> tri_points3D;
 
@@ -1124,10 +1414,17 @@ bool IncrementalMapper::RegisterNextImage(const Options& options,
       corr_point3D_ids.clear();
       for (const auto& corr :
            correspondence_graph.FindCorrespondences(image_id, point2D_idx)) {
-        const Image& corr_image = reconstruction_->Image(corr.image_id);
-        // If this image hasn't been registered, ignore this image
-        if (!corr_image.IsRegistered()) {
+        if (reference_image_id_set.count(corr.image_id) == 0) {
           continue;
+        }
+        const Image& corr_image = reconstruction_->Image(corr.image_id);
+        const Image& cached_corr_image = database_cache_->Image(corr.image_id);
+        if (corr.point2D_idx >= corr_image.NumPoints2D() ||
+            corr.point2D_idx >= cached_corr_image.NumPoints2D() ||
+            corr_image.CameraId() != cached_corr_image.CameraId() ||
+            !reconstruction_->ExistsCamera(corr_image.CameraId()) ||
+            !database_cache_->ExistsCamera(corr_image.CameraId())) {
+          return false;
         }
         const Point2D& corr_point2D = corr_image.Point2D(corr.point2D_idx);
         if (!corr_point2D.HasPoint3D()) {
@@ -1137,6 +1434,9 @@ bool IncrementalMapper::RegisterNextImage(const Options& options,
         // Avoid duplicate correspondences.
         if (corr_point3D_ids.count(corr_point2D.Point3DId()) > 0) {
           continue;
+        }
+        if (!reconstruction_->ExistsPoint3D(corr_point2D.Point3DId())) {
+          return false;
         }
         const Camera& corr_camera =
             reconstruction_->Camera(corr_image.CameraId());
@@ -1151,7 +1451,12 @@ bool IncrementalMapper::RegisterNextImage(const Options& options,
         const Point3D& point3D =
             reconstruction_->Point3D(corr_point2D.Point3DId());
 
-        tri_corrs.emplace_back(point2D_idx, corr_point2D.Point3DId());
+        ImagePoseCorrespondence tri_corr;
+        tri_corr.point2D_idx = point2D_idx;
+        tri_corr.point3D_id = corr_point2D.Point3DId();
+        tri_corr.reference_image_id = corr.image_id;
+        tri_corr.reference_point2D_idx = corr.point2D_idx;
+        tri_corrs.push_back(tri_corr);
         corr_point3D_ids.insert(corr_point2D.Point3DId());
         tri_points2D.push_back(point2D.XY());
         tri_points3D.push_back(point3D.XYZ());
@@ -1192,7 +1497,7 @@ bool IncrementalMapper::RegisterNextImage(const Options& options,
   abs_pose_options.ransac_options.confidence = 0.99999;
 
   AbsolutePoseRefinementOptions abs_pose_refinement_options;
-  if (num_reg_images_per_camera_[image.CameraId()] > 0) {
+  if (target_camera_num_reg_images > 0) {
     // Camera already refined from another image with the same camera.
     if (camera.HasBogusParams(options.min_focal_length_ratio,
                               options.max_focal_length_ratio,
@@ -1230,20 +1535,42 @@ bool IncrementalMapper::RegisterNextImage(const Options& options,
   size_t num_inliers;
   std::vector<char> inlier_mask;
 
+  result->mapper_owner_id = mapper_owner_id_;
+  result->reconstruction_generation = reconstruction_generation;
+  result->reconstruction = active_reconstruction;
+  result->image_id = image_id;
+  result->camera_id = image.CameraId();
+  result->structure_journal_enabled = structure_journal_enabled;
+  result->structure_owner_epoch = structure_owner_epoch;
+  result->structure_revision = structure_revision;
+  result->num_images = num_images;
+  result->num_reg_images = num_reg_images;
+  result->num_points3D = num_points3D;
+  result->input_qvec = input_qvec;
+  result->input_tvec = input_tvec;
+  result->input_camera = input_camera;
+  result->target_camera_num_reg_images = target_camera_num_reg_images;
+  result->abs_pose_min_num_inliers =
+      static_cast<size_t>(options.abs_pose_min_num_inliers);
+  result->input_points2D = tri_points2D;
+  result->input_points3D = tri_points3D;
+
   {
     NonBaStageScope pose(
         non_ba_profiler_, NonBaStageId::kRegisterAbsolutePose,
         tri_points2D.size());
     const bool success = EstimateAbsolutePose(
-        abs_pose_options, tri_points2D, tri_points3D, &image.Qvec(),
-        &image.Tvec(), &camera, &num_inliers, &inlier_mask);
+        abs_pose_options, tri_points2D, tri_points3D, &qvec, &tvec, &camera,
+        &num_inliers, &inlier_mask);
     pose.SetOutputItems(success ? num_inliers : 0);
     if (!success) {
+      *result = ImagePoseEstimation();
       return false;
     }
   }
 
   if (num_inliers < static_cast<size_t>(options.abs_pose_min_num_inliers)) {
+    *result = ImagePoseEstimation();
     return false;
   }
 
@@ -1256,36 +1583,307 @@ bool IncrementalMapper::RegisterNextImage(const Options& options,
         non_ba_profiler_, NonBaStageId::kRegisterPoseRefine, num_inliers);
     const bool success = RefineAbsolutePose(
         abs_pose_refinement_options, inlier_mask, tri_points2D, tri_points3D,
-        &image.Qvec(), &image.Tvec(), &camera);
+        &qvec, &tvec, &camera);
     refine.SetOutputItems(success ? num_inliers : 0);
     if (!success) {
+      *result = ImagePoseEstimation();
       return false;
     }
   }
 
-  //////////////////////////////////////////////////////////////////////////////
-  // Continue tracks
-  //////////////////////////////////////////////////////////////////////////////
+  Eigen::Vector4d normalized_qvec;
+  if (!tvec.allFinite() ||
+      !NormalizeQuaternionScaleFirst(qvec, &normalized_qvec) ||
+      !ExistsCameraModelWithId(camera.ModelId()) || !camera.VerifyParams()) {
+    *result = ImagePoseEstimation();
+    return false;
+  }
+  for (const double param : camera.Params()) {
+    if (!std::isfinite(param)) {
+      *result = ImagePoseEstimation();
+      return false;
+    }
+  }
+  qvec = normalized_qvec;
+
+  result->camera = std::move(camera);
+  result->qvec = qvec;
+  result->tvec = tvec;
+  result->correspondences = std::move(tri_corrs);
+  result->inlier_mask = std::move(inlier_mask);
+  result->num_inliers = num_inliers;
+  result->min_focal_length_ratio = options.min_focal_length_ratio;
+  result->max_focal_length_ratio = options.max_focal_length_ratio;
+  result->max_extra_param = options.max_extra_param;
+  result->is_valid = true;
+  return true;
+}
+
+bool IncrementalMapper::CommitImageRegistration(
+    const ImagePoseEstimation& result) {
+  const uint64_t owner_thread_token =
+      reconstruction_owner_thread_token_.load(std::memory_order_acquire);
+  if (owner_thread_token == 0 ||
+      result.mapper_owner_id != mapper_owner_id_ ||
+      result.reconstruction_generation !=
+          reconstruction_generation_.load(std::memory_order_relaxed) ||
+      result.reconstruction != reconstruction_ || reconstruction_ == nullptr ||
+      triangulator_ == nullptr) {
+    return false;
+  }
+
+  const double qvec_norm = result.qvec.norm();
+  if (reconstruction_ == nullptr || database_cache_ == nullptr ||
+      reconstruction_->NumRegImages() < 2 ||
+      !result.is_valid || !reconstruction_->ExistsImage(result.image_id) ||
+      !reconstruction_->ExistsCamera(result.camera_id) ||
+      !database_cache_->ExistsImage(result.image_id) ||
+      !database_cache_->ExistsCamera(result.camera_id) ||
+      result.correspondences.size() != result.inlier_mask.size() ||
+      result.correspondences.size() != result.input_points2D.size() ||
+      result.correspondences.size() != result.input_points3D.size() ||
+      result.num_inliers < result.abs_pose_min_num_inliers ||
+      result.num_inliers == 0 || !result.qvec.allFinite() ||
+      !result.tvec.allFinite() || !std::isfinite(qvec_norm) ||
+      std::abs(qvec_norm - 1.0) > kUnitQuaternionTolerance ||
+      !std::isfinite(result.min_focal_length_ratio) ||
+      !std::isfinite(result.max_focal_length_ratio) ||
+      !std::isfinite(result.max_extra_param) ||
+      result.min_focal_length_ratio < 0.0 ||
+      result.max_focal_length_ratio < result.min_focal_length_ratio ||
+      result.max_extra_param < 0.0 ||
+      result.camera.CameraId() != result.camera_id ||
+      result.input_camera.CameraId() != result.camera_id ||
+      !ExistsCameraModelWithId(result.camera.ModelId()) ||
+      !ExistsCameraModelWithId(result.input_camera.ModelId())) {
+    return false;
+  }
+  if (!result.camera.VerifyParams() || !result.input_camera.VerifyParams() ||
+      result.camera.ModelId() != result.input_camera.ModelId() ||
+      result.camera.Width() != result.input_camera.Width() ||
+      result.camera.Height() != result.input_camera.Height() ||
+      result.camera.HasPriorFocalLength() !=
+          result.input_camera.HasPriorFocalLength()) {
+    return false;
+  }
+
+  if (reconstruction_->NumImages() != result.num_images ||
+      reconstruction_->NumRegImages() != result.num_reg_images ||
+      reconstruction_->NumPoints3D() != result.num_points3D ||
+      reconstruction_->StructureJournalEnabled() !=
+          result.structure_journal_enabled ||
+      (result.structure_journal_enabled &&
+       (reconstruction_->StructureOwnerEpoch() !=
+            result.structure_owner_epoch ||
+        reconstruction_->StructureRevision() != result.structure_revision))) {
+    return false;
+  }
+
+  const Image& image = reconstruction_->Image(result.image_id);
+  const Camera& camera = reconstruction_->Camera(result.camera_id);
+  const Image& cached_image = database_cache_->Image(result.image_id);
+  if (image.ImageId() != result.image_id || image.IsRegistered() ||
+      image.CameraId() != result.camera_id ||
+      cached_image.ImageId() != result.image_id ||
+      cached_image.CameraId() != result.camera_id ||
+      image.NumPoints2D() != cached_image.NumPoints2D() ||
+      camera.CameraId() != result.camera_id ||
+      !HasSameVector(image.Qvec(), result.input_qvec) ||
+      !HasSameVector(image.Tvec(), result.input_tvec) ||
+      !HasSameCamera(camera, result.input_camera)) {
+    return false;
+  }
+
+  const auto num_reg_images_it =
+      num_reg_images_per_camera_.find(result.camera_id);
+  const size_t num_reg_images =
+      num_reg_images_it == num_reg_images_per_camera_.end()
+          ? 0
+          : num_reg_images_it->second;
+  if (num_reg_images != result.target_camera_num_reg_images) {
+    return false;
+  }
+
+  for (const double param : result.camera.Params()) {
+    if (!std::isfinite(param)) {
+      return false;
+    }
+  }
+  if (result.camera.HasBogusParams(result.min_focal_length_ratio,
+                                   result.max_focal_length_ratio,
+                                   result.max_extra_param)) {
+    return false;
+  }
+
+  const CorrespondenceGraph& correspondence_graph =
+      database_cache_->CorrespondenceGraph();
+  if (!correspondence_graph.ExistsImage(result.image_id)) {
+    return false;
+  }
+
+  size_t num_inliers = 0;
+  std::unordered_set<point2D_t> inlier_point2D_idxs;
+  std::unordered_set<point3D_t> inlier_point3D_ids;
+  std::unordered_map<image_pair_t, size_t> pending_num_tri_corrs;
+  inlier_point2D_idxs.reserve(result.num_inliers);
+  inlier_point3D_ids.reserve(result.num_inliers);
+  pending_num_tri_corrs.reserve(result.num_inliers);
+  for (size_t i = 0; i < result.inlier_mask.size(); ++i) {
+    if (result.inlier_mask[i] != 0 && result.inlier_mask[i] != 1) {
+      return false;
+    }
+    if (result.inlier_mask[i] == 0) {
+      continue;
+    }
+    ++num_inliers;
+    const ImagePoseCorrespondence& corr = result.correspondences[i];
+    if (corr.point2D_idx >= image.NumPoints2D() ||
+        corr.point2D_idx >= cached_image.NumPoints2D() ||
+        !inlier_point2D_idxs.insert(corr.point2D_idx).second ||
+        !inlier_point3D_ids.insert(corr.point3D_id).second ||
+        image.Point2D(corr.point2D_idx).HasPoint3D() ||
+        !reconstruction_->ExistsPoint3D(corr.point3D_id) ||
+        corr.reference_image_id == result.image_id ||
+        !reconstruction_->ExistsImage(corr.reference_image_id) ||
+        !database_cache_->ExistsImage(corr.reference_image_id) ||
+        !correspondence_graph.ExistsImage(corr.reference_image_id)) {
+      return false;
+    }
+    const Image& reference_image =
+        reconstruction_->Image(corr.reference_image_id);
+    const Image& cached_reference_image =
+        database_cache_->Image(corr.reference_image_id);
+    if (reference_image.ImageId() != corr.reference_image_id ||
+        cached_reference_image.ImageId() != corr.reference_image_id ||
+        !reference_image.IsRegistered() ||
+        reference_image.NumPoints2D() !=
+            cached_reference_image.NumPoints2D() ||
+        reference_image.CameraId() != cached_reference_image.CameraId() ||
+        !reconstruction_->ExistsCamera(reference_image.CameraId()) ||
+        !database_cache_->ExistsCamera(reference_image.CameraId()) ||
+        corr.reference_point2D_idx >= reference_image.NumPoints2D() ||
+        corr.reference_point2D_idx >= cached_reference_image.NumPoints2D()) {
+      return false;
+    }
+    const Point2D& reference_point2D =
+        reference_image.Point2D(corr.reference_point2D_idx);
+    if (!reference_point2D.HasPoint3D() ||
+        reference_point2D.Point3DId() != corr.point3D_id) {
+      return false;
+    }
+    const Point3D& point3D = reconstruction_->Point3D(corr.point3D_id);
+    if (!HasSameVector(image.Point2D(corr.point2D_idx).XY(),
+                       result.input_points2D[i]) ||
+        !HasSameVector(point3D.XYZ(), result.input_points3D[i]) ||
+        std::any_of(point3D.Track().Elements().begin(),
+                    point3D.Track().Elements().end(),
+                    [&result](const TrackElement& track_el) {
+                      return track_el.image_id == result.image_id;
+                    })) {
+      return false;
+    }
+    const auto& live_correspondences =
+        correspondence_graph.FindCorrespondences(result.image_id,
+                                                   corr.point2D_idx);
+    for (const CorrespondenceGraph::Correspondence& edge :
+         live_correspondences) {
+      if (edge.image_id == result.image_id ||
+          !correspondence_graph.ExistsImage(edge.image_id) ||
+          !reconstruction_->ExistsImage(edge.image_id) ||
+          !database_cache_->ExistsImage(edge.image_id)) {
+        return false;
+      }
+
+      const Image& edge_image = reconstruction_->Image(edge.image_id);
+      const Image& cached_edge_image = database_cache_->Image(edge.image_id);
+      if (edge_image.ImageId() != edge.image_id ||
+          cached_edge_image.ImageId() != edge.image_id ||
+          edge.point2D_idx >= edge_image.NumPoints2D() ||
+          edge.point2D_idx >= cached_edge_image.NumPoints2D()) {
+        return false;
+      }
+
+      const point2D_t graph_num_observations =
+          correspondence_graph.NumObservationsForImage(edge.image_id);
+      const point2D_t graph_num_correspondences =
+          correspondence_graph.NumCorrespondencesForImage(edge.image_id);
+      if (edge_image.NumObservations() != graph_num_observations ||
+          edge_image.NumCorrespondences() != graph_num_correspondences ||
+          cached_edge_image.NumObservations() != graph_num_observations ||
+          cached_edge_image.NumCorrespondences() != graph_num_correspondences) {
+        return false;
+      }
+
+      const image_pair_t pair_id =
+          Database::ImagePairToPairId(result.image_id, edge.image_id);
+      const size_t graph_num_total_corrs = static_cast<size_t>(
+          correspondence_graph.NumCorrespondencesBetweenImages(
+              result.image_id, edge.image_id));
+      if (!reconstruction_->ExistsImagePair(pair_id)) {
+        return false;
+      }
+      const Reconstruction::ImagePairStat& image_pair =
+          reconstruction_->ImagePair(pair_id);
+      if (image_pair.num_total_corrs != graph_num_total_corrs ||
+          image_pair.num_tri_corrs > image_pair.num_total_corrs) {
+        return false;
+      }
+
+      const Point2D& target_point2D = image.Point2D(corr.point2D_idx);
+      const Point2D& edge_point2D = edge_image.Point2D(edge.point2D_idx);
+      if ((target_point2D.HasPoint3D() &&
+           !reconstruction_->ExistsPoint3D(target_point2D.Point3DId())) ||
+          (edge_point2D.HasPoint3D() &&
+           !reconstruction_->ExistsPoint3D(edge_point2D.Point3DId()))) {
+        return false;
+      }
+      if (edge_point2D.HasPoint3D() &&
+          edge_point2D.Point3DId() == corr.point3D_id) {
+        ++pending_num_tri_corrs[pair_id];
+      }
+    }
+    const bool has_live_edge =
+        std::any_of(live_correspondences.begin(), live_correspondences.end(),
+                    [&corr](const CorrespondenceGraph::Correspondence& edge) {
+                      return edge.image_id == corr.reference_image_id &&
+                             edge.point2D_idx == corr.reference_point2D_idx;
+                    });
+    if (!has_live_edge) {
+      return false;
+    }
+  }
+  if (num_inliers != result.num_inliers ||
+      num_inliers < result.abs_pose_min_num_inliers) {
+    return false;
+  }
+  for (const auto& pending : pending_num_tri_corrs) {
+    const Reconstruction::ImagePairStat& image_pair =
+        reconstruction_->ImagePair(pending.first);
+    if (pending.second > image_pair.num_total_corrs - image_pair.num_tri_corrs) {
+      return false;
+    }
+  }
 
   {
+    Reconstruction::StructureMutationBatch structure_mutation(reconstruction_);
     NonBaStageScope commit(
-        non_ba_profiler_, NonBaStageId::kRegisterCommit, num_inliers);
-    reconstruction_->RegisterImage(image_id);
-    RegisterImageEvent(image_id);
+        non_ba_profiler_, NonBaStageId::kRegisterCommit, result.num_inliers);
+    reconstruction_->Camera(result.camera_id).SetParams(result.camera.Params());
+    Image& mutable_image = reconstruction_->Image(result.image_id);
+    mutable_image.SetQvec(result.qvec);
+    mutable_image.SetTvec(result.tvec);
+    reconstruction_->RegisterImage(result.image_id);
+    RegisterImageEvent(result.image_id);
 
     size_t committed = 0;
-    for (size_t i = 0; i < inlier_mask.size(); ++i) {
-      if (inlier_mask[i]) {
-        const point2D_t point2D_idx = tri_corrs[i].first;
-        const Point2D& point2D = image.Point2D(point2D_idx);
-        if (!point2D.HasPoint3D()) {
-          const point3D_t point3D_id = tri_corrs[i].second;
-          const TrackElement track_el(image_id, point2D_idx);
-          reconstruction_->AddObservation(point3D_id, track_el);
-          triangulator_->AddModifiedPoint3D(point3D_id);
-          if (non_ba_profiler_ != nullptr) {
-            ++committed;
-          }
+    for (size_t i = 0; i < result.inlier_mask.size(); ++i) {
+      if (result.inlier_mask[i] == 1) {
+        const ImagePoseCorrespondence& corr = result.correspondences[i];
+        const TrackElement track_el(result.image_id, corr.point2D_idx);
+        reconstruction_->AddObservation(corr.point3D_id, track_el);
+        triangulator_->AddModifiedPoint3D(corr.point3D_id);
+        if (non_ba_profiler_ != nullptr) {
+          ++committed;
         }
       }
     }

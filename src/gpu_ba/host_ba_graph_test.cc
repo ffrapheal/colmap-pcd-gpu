@@ -1,9 +1,12 @@
 #define TEST_NAME "gpu_ba/host_ba_graph"
 #include "util/testing.h"
 
+#include <algorithm>
 #include <cmath>
+#include <memory>
 #include <string>
 
+#include "gpu_ba/active_solve_view.h"
 #include "gpu_ba/custom_cuda.h"
 #include "gpu_ba/host_ba_graph.h"
 
@@ -121,6 +124,144 @@ BaSolveIntent MakeIntent(const CatalogReadLease& lease) {
   return intent;
 }
 
+NativeBaOnlineLidarIdentity MakeOnlineLidarIdentity() {
+  NativeBaOnlineLidarIdentity identity;
+  identity.valid = true;
+  identity.trigger_image_id = 20;
+  identity.map_version = 15;
+  identity.max_scan_index = 15;
+  identity.snapshot_sha256.fill(0x11);
+  identity.geometry_sha256.fill(0x22);
+  identity.association_sha256.fill(0x33);
+  return identity;
+}
+
+BaSolveIntent MakeOnlineIntent(const CatalogReadLease& lease) {
+  BaSolveIntent intent = MakeIntent(lease);
+  intent.visual_observation_scope =
+      NativeBaVisualObservationScope::kActiveImagesOnly;
+  intent.lidar.online_lidar_identity = MakeOnlineLidarIdentity();
+  intent.lidar.lidar_map_generation =
+      intent.lidar.online_lidar_identity.map_version;
+  intent.lidar.match_config_generation = intent.config.config_generation;
+  intent.lidar.constraints.clear();
+  LidarConstraintRecord lidar;
+  lidar.point_slot = 0;
+  lidar.constraint_slot = 0;
+  lidar.physical_identity = 1;
+  lidar.association_id = 0;
+  lidar.owner_image_id = 20;
+  lidar.owner_point2D_idx = 0;
+  lidar.lidar_type = 1;
+  lidar.frozen_point3D_xyz = {{1.0, 2.0, 3.0}};
+  lidar.plane = {{0.0, 0.0, 1.0, -3.0}};
+  lidar.lidar_xyz = {{1.0, 2.0, 3.0}};
+  lidar.weight = 2.0;
+  lidar.search_range = 0.2;
+  lidar.point_state_generation = 9;
+  intent.lidar.constraints.push_back(lidar);
+  intent.source_insertion_order = {
+      {ResidualKind::kVisual, 0}, {ResidualKind::kLidar, 0}};
+  return intent;
+}
+
+std::shared_ptr<PreparedSelectionPlan> CopyPreparedPlan(
+    const NativeHostSolveView& view) {
+  std::shared_ptr<PreparedSelectionPlan> plan =
+      std::make_shared<PreparedSelectionPlan>();
+  plan->publication_id = 1;
+  plan->slot_namespace_epoch = view.catalog.slot_namespace_epoch();
+  plan->visual_observation_scope = view.identity.visual_observation_scope;
+  plan->online_lidar_identity = view.identity.online_lidar_identity;
+  plan->active_camera_slots = view.ActiveCameraSlots();
+  plan->active_image_slots = view.ActiveImageSlots();
+  plan->boundary_image_slots = view.BoundaryImageSlots();
+  plan->active_point_slots = view.ActivePointSlots();
+  plan->visual_observation_slots = view.VisualObservationSlots();
+  plan->fixed = view.Fixed();
+  plan->lidar_constraints = view.LidarConstraints();
+  plan->residual_ordinals = view.ResidualOrdinals();
+  plan->parameter_ordinals = view.ParameterOrdinals();
+  plan->residual_block_count = view.ResidualBlockCount();
+  plan->scalar_residual_count = view.ScalarResidualCount();
+  plan->ambient_parameter_count = view.AmbientParameterCount();
+  plan->effective_parameter_count = view.EffectiveParameterCount();
+  return plan;
+}
+
+BOOST_AUTO_TEST_CASE(NativeHostAbiAndLegacyDefaultsRemainStable) {
+  BOOST_CHECK_EQUAL(kNativeHostSolveViewAbiVersion, 2);
+  BOOST_CHECK_EQUAL(kHostBaGraphAbiVersion, 2);
+  BOOST_CHECK_EQUAL(kMapperStaticCatalogAbiVersion, 2);
+  BOOST_CHECK_EQUAL(kIndexedActiveSolveAbiVersion, 1);
+  BOOST_CHECK_EQUAL(kSnapshotSchemaVersion, 1);
+
+  const NativeBaSolveIntent native_intent;
+  const BaSolveIntent slot_intent;
+  const NativeHostSolveViewIdentity view_identity;
+  BOOST_CHECK(native_intent.visual_observation_scope ==
+              NativeBaVisualObservationScope::
+                  kLegacyExplicitPointTrackExpansion);
+  BOOST_CHECK(slot_intent.visual_observation_scope ==
+              NativeBaVisualObservationScope::
+                  kLegacyExplicitPointTrackExpansion);
+  BOOST_CHECK(view_identity.visual_observation_scope ==
+              NativeBaVisualObservationScope::
+                  kLegacyExplicitPointTrackExpansion);
+  BOOST_CHECK(!native_intent.online_lidar_identity.valid);
+  BOOST_CHECK(!slot_intent.lidar.online_lidar_identity.valid);
+  BOOST_CHECK(!view_identity.online_lidar_identity.valid);
+  BOOST_CHECK(IsCanonicalNativeBaLegacyLidarIdentity(
+      native_intent.online_lidar_identity));
+  BOOST_CHECK(IsCanonicalNativeBaLegacyLidarIdentity(
+      slot_intent.lidar.online_lidar_identity));
+  BOOST_CHECK(IsCanonicalNativeBaLegacyLidarIdentity(
+      view_identity.online_lidar_identity));
+  BOOST_CHECK(IsCanonicalNativeBaLegacyLidarConstraint(
+      NativeBaLidarConstraint()));
+  BOOST_CHECK(IsCanonicalNativeBaLegacyLidarConstraint(
+      LidarConstraintRecord()));
+}
+
+BOOST_AUTO_TEST_CASE(OnlineLidarIdentityRequiresEveryDigest) {
+  NativeBaOnlineLidarIdentity identity = MakeOnlineLidarIdentity();
+  BOOST_REQUIRE(IsValidNativeBaOnlineLidarIdentity(identity));
+
+  identity.snapshot_sha256.fill(0);
+  BOOST_CHECK(!IsValidNativeBaOnlineLidarIdentity(identity));
+  identity = MakeOnlineLidarIdentity();
+  identity.geometry_sha256.fill(0);
+  BOOST_CHECK(!IsValidNativeBaOnlineLidarIdentity(identity));
+  identity = MakeOnlineLidarIdentity();
+  identity.association_sha256.fill(0);
+  BOOST_CHECK(!IsValidNativeBaOnlineLidarIdentity(identity));
+  identity = MakeOnlineLidarIdentity();
+  identity.snapshot_sha256.fill(0);
+  identity.geometry_sha256.fill(0);
+  identity.association_sha256.fill(0);
+  BOOST_CHECK(!IsValidNativeBaOnlineLidarIdentity(identity));
+
+  NativeBaOnlineLidarIdentity legacy;
+  BOOST_REQUIRE(IsCanonicalNativeBaLegacyLidarIdentity(legacy));
+  legacy.trigger_image_id = 20;
+  BOOST_CHECK(!IsCanonicalNativeBaLegacyLidarIdentity(legacy));
+  legacy = NativeBaOnlineLidarIdentity();
+  legacy.map_version = 1;
+  BOOST_CHECK(!IsCanonicalNativeBaLegacyLidarIdentity(legacy));
+  legacy = NativeBaOnlineLidarIdentity();
+  legacy.max_scan_index = 1;
+  BOOST_CHECK(!IsCanonicalNativeBaLegacyLidarIdentity(legacy));
+  legacy = NativeBaOnlineLidarIdentity();
+  legacy.snapshot_sha256[0] = 1;
+  BOOST_CHECK(!IsCanonicalNativeBaLegacyLidarIdentity(legacy));
+  legacy = NativeBaOnlineLidarIdentity();
+  legacy.geometry_sha256[0] = 1;
+  BOOST_CHECK(!IsCanonicalNativeBaLegacyLidarIdentity(legacy));
+  legacy = NativeBaOnlineLidarIdentity();
+  legacy.association_sha256[0] = 1;
+  BOOST_CHECK(!IsCanonicalNativeBaLegacyLidarIdentity(legacy));
+}
+
 BOOST_AUTO_TEST_CASE(ColdBuildLeaseAndNativeView) {
   HostBaGraphStore store(101);
   HostBaGraphUpdateResult update;
@@ -156,12 +297,25 @@ BOOST_AUTO_TEST_CASE(ColdBuildLeaseAndNativeView) {
   BOOST_CHECK_EQUAL(view.active_point_slots.size(), 1);
   BOOST_CHECK_EQUAL(view.lidar.constraints.size(), 1);
   BOOST_CHECK_EQUAL(view.residual_ordinals.size(), 3);
+  BOOST_CHECK(view.identity.visual_observation_scope ==
+              NativeBaVisualObservationScope::
+                  kLegacyExplicitPointTrackExpansion);
+  BOOST_CHECK(!view.identity.online_lidar_identity.valid);
+  BOOST_CHECK(!view.lidar.online_lidar_identity.valid);
   BOOST_CHECK(view.residual_ordinals[0].kind == ResidualKind::kVisual);
   BOOST_CHECK(view.residual_ordinals[1].kind == ResidualKind::kVisual);
   BOOST_CHECK(view.residual_ordinals[2].kind == ResidualKind::kLidar);
   for (size_t i = 0; i < view.residual_ordinals.size(); ++i) {
     BOOST_CHECK_EQUAL(view.residual_ordinals[i].source_insertion_index, i);
     BOOST_CHECK_EQUAL(view.residual_ordinals[i].execution_ordinal, i);
+  }
+  for (size_t i = 0; i < 2; ++i) {
+    BOOST_CHECK_EQUAL(view.residual_ordinals[i].association_id,
+                      kBaGraphInvalidAssociationId);
+    BOOST_CHECK_EQUAL(view.residual_ordinals[i].owner_image_id,
+                      kBaGraphInvalidSlot);
+    BOOST_CHECK_EQUAL(view.residual_ordinals[i].owner_point2D_idx,
+                      kBaGraphInvalidSlot);
   }
   BOOST_CHECK_NE(view.residual_ordinals[0].physical_identity,
                  view.residual_ordinals[0].source_insertion_index);
@@ -661,6 +815,268 @@ BOOST_AUTO_TEST_CASE(NonemptyResidualSelectionRequiresExplicitSourceOrder) {
   BOOST_CHECK(rejected({{ResidualKind::kLidar, 0},
                         {ResidualKind::kVisual, 1},
                         {ResidualKind::kVisual, 0}}));
+}
+
+BOOST_AUTO_TEST_CASE(ActiveImagesOnlyDoesNotExpandExplicitPointTracks) {
+  HostBaGraphStore store(101);
+  HostBaGraphUpdateResult update;
+  std::string error;
+  BOOST_REQUIRE_MESSAGE(store.ColdBuild(MakeGraph(), &update, &error), error);
+  const CatalogReadLease lease = store.AcquireReadLease();
+  const DenseActiveState state = MakeState();
+  NativeHostSolveMaterializer materializer;
+
+  BaSolveIntent legacy_intent = MakeIntent(lease);
+  NativeHostSolveView legacy_view;
+  ActiveStateBuffer legacy_state;
+  NativeHostSolvePreparationRuntime legacy_runtime;
+  BOOST_REQUIRE_MESSAGE(materializer.Materialize(
+                            lease, legacy_intent, state, &legacy_view,
+                            &legacy_state, &legacy_runtime, &error),
+                        error);
+  BOOST_REQUIRE_EQUAL(legacy_view.visual_observation_slots.size(), 2);
+  BOOST_REQUIRE_EQUAL(legacy_view.boundary_image_slots.size(), 1);
+
+  BaSolveIntent active_only_intent = MakeOnlineIntent(lease);
+  NativeHostSolveView active_only_view;
+  ActiveStateBuffer active_only_state;
+  NativeHostSolvePreparationRuntime active_only_runtime;
+  BOOST_REQUIRE_MESSAGE(materializer.Materialize(
+                            lease, active_only_intent, state,
+                            &active_only_view, &active_only_state,
+                            &active_only_runtime, &error),
+                        error);
+  BOOST_CHECK(active_only_view.identity.visual_observation_scope ==
+              NativeBaVisualObservationScope::kActiveImagesOnly);
+  BOOST_CHECK(active_only_view.boundary_image_slots.empty());
+  BOOST_REQUIRE_EQUAL(active_only_view.visual_observation_slots.size(), 1);
+  BOOST_CHECK_EQUAL(active_only_view.visual_observation_slots.front(), 0);
+  BOOST_REQUIRE_EQUAL(active_only_view.fixed.points.size(), 1);
+  BOOST_CHECK_EQUAL(active_only_view.fixed.points.front().constant, 0);
+  BOOST_CHECK(active_only_view.active_point_slots ==
+              legacy_view.active_point_slots);
+}
+
+BOOST_AUTO_TEST_CASE(SlotProvenanceScopeAndLegacyStateFailClosed) {
+  HostBaGraphStore store(101);
+  HostBaGraphUpdateResult update;
+  std::string error;
+  BOOST_REQUIRE_MESSAGE(store.ColdBuild(MakeGraph(), &update, &error), error);
+  const CatalogReadLease lease = store.AcquireReadLease();
+  const DenseActiveState state = MakeState();
+  NativeHostSolveMaterializer materializer;
+  const auto rejected = [&](const BaSolveIntent& candidate) {
+    NativeHostSolveView failed_view;
+    ActiveStateBuffer failed_state;
+    NativeHostSolvePreparationRuntime failed_runtime;
+    error.clear();
+    BOOST_CHECK(!materializer.Materialize(
+        lease, candidate, state, &failed_view, &failed_state,
+        &failed_runtime, &error));
+    BOOST_CHECK(!error.empty());
+    BOOST_CHECK(!failed_view.catalog.valid());
+    BOOST_CHECK(failed_state.points.empty());
+  };
+
+  BaSolveIntent candidate = MakeIntent(lease);
+  candidate.visual_observation_scope =
+      NativeBaVisualObservationScope::kActiveImagesOnly;
+  rejected(candidate);
+
+  candidate = MakeOnlineIntent(lease);
+  candidate.visual_observation_scope =
+      NativeBaVisualObservationScope::kLegacyExplicitPointTrackExpansion;
+  rejected(candidate);
+
+  candidate = MakeOnlineIntent(lease);
+  ++candidate.lidar.lidar_map_generation;
+  rejected(candidate);
+  candidate = MakeOnlineIntent(lease);
+  ++candidate.lidar.match_config_generation;
+  rejected(candidate);
+  candidate = MakeOnlineIntent(lease);
+  candidate.lidar.constraints[0].physical_identity = 0;
+  rejected(candidate);
+  candidate = MakeOnlineIntent(lease);
+  candidate.lidar.constraints[0].physical_identity = 2;
+  rejected(candidate);
+
+  candidate = MakeIntent(lease);
+  candidate.lidar.constraints[0].association_id = 0;
+  rejected(candidate);
+  candidate = MakeIntent(lease);
+  candidate.lidar.constraints[0].owner_image_id = 20;
+  candidate.lidar.constraints[0].owner_point2D_idx = 0;
+  rejected(candidate);
+  candidate = MakeIntent(lease);
+  candidate.lidar.constraints[0].frozen_point3D_xyz[0] = 1.0;
+  rejected(candidate);
+}
+
+BOOST_AUTO_TEST_CASE(OnlineIdentitySurvivesAnEmptyConstraintSet) {
+  HostBaGraphStore store(101);
+  HostBaGraphUpdateResult update;
+  std::string error;
+  BOOST_REQUIRE_MESSAGE(store.ColdBuild(MakeGraph(), &update, &error), error);
+  const CatalogReadLease lease = store.AcquireReadLease();
+  const DenseActiveState state = MakeState();
+  BaSolveIntent intent = MakeOnlineIntent(lease);
+  intent.lidar.constraints.clear();
+  intent.source_insertion_order = {{ResidualKind::kVisual, 0}};
+  NativeHostSolveMaterializer materializer;
+  NativeHostSolveView view;
+  ActiveStateBuffer active_state;
+  NativeHostSolvePreparationRuntime runtime;
+  BOOST_REQUIRE_MESSAGE(materializer.Materialize(
+                            lease, intent, state, &view, &active_state,
+                            &runtime, &error),
+                        error);
+  BOOST_CHECK(view.LidarConstraints().empty());
+  BOOST_CHECK(SameNativeBaOnlineLidarIdentity(
+      view.identity.online_lidar_identity, MakeOnlineLidarIdentity()));
+  BOOST_CHECK(SameNativeBaOnlineLidarIdentity(
+      view.lidar.online_lidar_identity, MakeOnlineLidarIdentity()));
+  BOOST_CHECK(IsValidNativeBaLidarScopeIdentity(
+      view.identity.visual_observation_scope,
+      view.identity.online_lidar_identity));
+  BOOST_CHECK(ValidateNativeHostSolveView(view, active_state, &error));
+}
+
+BOOST_AUTO_TEST_CASE(LegacyViewAndPreparedPlanRejectResidualProvenance) {
+  HostBaGraphStore store(101);
+  HostBaGraphUpdateResult update;
+  std::string error;
+  BOOST_REQUIRE_MESSAGE(store.ColdBuild(MakeGraph(), &update, &error), error);
+  const CatalogReadLease lease = store.AcquireReadLease();
+  const DenseActiveState state = MakeState();
+  NativeHostSolveMaterializer materializer;
+  NativeHostSolveView view;
+  ActiveStateBuffer active_state;
+  NativeHostSolvePreparationRuntime runtime;
+  BOOST_REQUIRE_MESSAGE(materializer.Materialize(
+                            lease, MakeIntent(lease), state, &view,
+                            &active_state, &runtime, &error),
+                        error);
+  BOOST_REQUIRE_EQUAL(view.lidar.constraints.size(), 1);
+  BOOST_REQUIRE_EQUAL(view.residual_ordinals.size(), 3);
+  const auto rejected = [&](const NativeHostSolveView& candidate) {
+    error.clear();
+    BOOST_CHECK(!ValidateNativeHostSolveView(candidate, active_state, &error));
+    BOOST_CHECK(!error.empty());
+  };
+
+  NativeHostSolveView candidate = view;
+  candidate.lidar.constraints[0].association_id = 0;
+  candidate.residual_ordinals[2].association_id = 0;
+  rejected(candidate);
+  candidate = view;
+  candidate.lidar.constraints[0].owner_image_id = 20;
+  candidate.lidar.constraints[0].owner_point2D_idx = 0;
+  candidate.residual_ordinals[2].owner_image_id = 20;
+  candidate.residual_ordinals[2].owner_point2D_idx = 0;
+  rejected(candidate);
+  candidate = view;
+  candidate.lidar.constraints[0].frozen_point3D_xyz[1] = 2.0;
+  rejected(candidate);
+
+  candidate = view;
+  candidate.identity.online_lidar_identity.trigger_image_id = 20;
+  candidate.lidar.online_lidar_identity.trigger_image_id = 20;
+  rejected(candidate);
+
+  candidate = view;
+  std::shared_ptr<PreparedSelectionPlan> plan = CopyPreparedPlan(candidate);
+  plan->lidar_constraints[0].association_id = 0;
+  plan->residual_ordinals[2].association_id = 0;
+  candidate.prepared_plan = plan;
+  rejected(candidate);
+}
+
+BOOST_AUTO_TEST_CASE(OnlineProvenanceValidationRejectsTampering) {
+  HostBaGraphStore store(101);
+  HostBaGraphUpdateResult update;
+  std::string error;
+  BOOST_REQUIRE_MESSAGE(store.ColdBuild(MakeGraph(), &update, &error), error);
+  const CatalogReadLease lease = store.AcquireReadLease();
+  const DenseActiveState state = MakeState();
+  NativeHostSolveMaterializer materializer;
+  NativeHostSolveView view;
+  ActiveStateBuffer active_state;
+  NativeHostSolvePreparationRuntime runtime;
+  BOOST_REQUIRE_MESSAGE(materializer.Materialize(
+                            lease, MakeOnlineIntent(lease), state, &view,
+                            &active_state, &runtime, &error),
+                        error);
+  BOOST_REQUIRE_MESSAGE(ValidateNativeHostSolveView(view, active_state, &error),
+                        error);
+  BOOST_REQUIRE_EQUAL(view.residual_ordinals.size(), 2);
+  BOOST_REQUIRE_EQUAL(view.lidar.constraints.size(), 1);
+  BOOST_CHECK(SameNativeBaOnlineLidarIdentity(
+      view.identity.online_lidar_identity, MakeOnlineLidarIdentity()));
+  const ResidualOrdinal& lidar_ordinal = view.residual_ordinals[1];
+  BOOST_CHECK_EQUAL(lidar_ordinal.association_id, 0);
+  BOOST_CHECK_EQUAL(lidar_ordinal.owner_image_id, 20);
+  BOOST_CHECK_EQUAL(lidar_ordinal.owner_point2D_idx, 0);
+
+  const auto rejected = [&](NativeHostSolveView candidate) {
+    error.clear();
+    BOOST_CHECK(!ValidateNativeHostSolveView(candidate, active_state, &error));
+    BOOST_CHECK(!error.empty());
+  };
+  NativeHostSolveView candidate = view;
+  candidate.residual_ordinals[1].association_id = 1;
+  rejected(candidate);
+  candidate = view;
+  candidate.residual_ordinals[1].owner_image_id = 21;
+  rejected(candidate);
+  candidate = view;
+  candidate.lidar.constraints[0].frozen_point3D_xyz[0] += 1.0;
+  rejected(candidate);
+  candidate = view;
+  ++candidate.identity.lidar_map_generation;
+  candidate.lidar.lidar_map_generation =
+      candidate.identity.lidar_map_generation;
+  rejected(candidate);
+  candidate = view;
+  ++candidate.identity.lidar_match_config_generation;
+  candidate.lidar.match_config_generation =
+      candidate.identity.lidar_match_config_generation;
+  rejected(candidate);
+  candidate = view;
+  candidate.lidar.constraints[0].physical_identity = 0;
+  candidate.residual_ordinals[1].physical_identity = 0;
+  rejected(candidate);
+  candidate = view;
+  candidate.lidar.constraints[0].physical_identity = 2;
+  candidate.residual_ordinals[1].physical_identity = 2;
+  rejected(candidate);
+
+  candidate = view;
+  std::shared_ptr<PreparedSelectionPlan> plan = CopyPreparedPlan(candidate);
+  candidate.prepared_plan = plan;
+  BOOST_REQUIRE_MESSAGE(ValidateNativeHostSolveView(candidate, active_state,
+                                                    &error),
+                        error);
+  plan->visual_observation_scope =
+      NativeBaVisualObservationScope::kLegacyExplicitPointTrackExpansion;
+  rejected(candidate);
+  plan->visual_observation_scope =
+      NativeBaVisualObservationScope::kActiveImagesOnly;
+  plan->online_lidar_identity.association_sha256[0] ^= 0xff;
+  rejected(candidate);
+
+  BaSolveIntent frozen_mismatch = MakeOnlineIntent(lease);
+  frozen_mismatch.lidar.constraints[0].frozen_point3D_xyz[2] += 0.5;
+  NativeHostSolveView failed_view = view;
+  ActiveStateBuffer failed_state = active_state;
+  NativeHostSolvePreparationRuntime failed_runtime = runtime;
+  error.clear();
+  BOOST_CHECK(!materializer.Materialize(
+      lease, frozen_mismatch, state, &failed_view, &failed_state,
+      &failed_runtime, &error));
+  BOOST_CHECK(!failed_view.catalog.valid());
+  BOOST_CHECK(failed_view.residual_ordinals.empty());
+  BOOST_CHECK(failed_state.points.empty());
 }
 
 }  // namespace

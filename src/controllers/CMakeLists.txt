@@ -36,4 +36,11 @@ COLMAP_ADD_SOURCES(
     bundle_adjustment.h bundle_adjustment.cc
     hierarchical_mapper.h hierarchical_mapper.cc
     incremental_mapper.h incremental_mapper.cc
+    online_i3dgs_mapper.h online_i3dgs_mapper.cc
+    online_mapper_frontend.h online_mapper_frontend.cc
+    online_mapper_state.h online_mapper_state.cc
 )
+
+COLMAP_ADD_TEST(online_mapper_frontend_test online_mapper_frontend_test.cc)
+COLMAP_ADD_TEST(online_i3dgs_mapper_test online_i3dgs_mapper_test.cc)
+COLMAP_ADD_TEST(online_mapper_state_test online_mapper_state_test.cc)

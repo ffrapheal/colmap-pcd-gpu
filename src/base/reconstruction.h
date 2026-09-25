@@ -32,8 +32,11 @@
 #ifndef COLMAP_SRC_BASE_RECONSTRUCTION_H_
 #define COLMAP_SRC_BASE_RECONSTRUCTION_H_
 
+#include <cstdint>
 #include <deque>
+#include <memory>
 #include <string>
+#include <thread>
 #include <tuple>
 #include <unordered_map>
 #include <unordered_set>
@@ -60,6 +63,40 @@ struct PlyPoint;
 struct RANSACOptions;
 class DatabaseCache;
 class CorrespondenceGraph;
+class ReconstructionTransaction;
+
+struct ReconstructionCanonicalVersion {
+  uint64_t structure_owner_epoch = 0;
+  uint64_t structure_revision = 0;
+  uint64_t publish_version = 0;
+  uintptr_t correspondence_graph_identity = 0;
+
+  bool operator==(const ReconstructionCanonicalVersion& other) const;
+  bool operator!=(const ReconstructionCanonicalVersion& other) const;
+};
+
+enum class ReconstructionTransactionStatus {
+  SUCCESS,
+  WRONG_THREAD,
+  NULL_TRANSACTION,
+  INVALID_TRANSACTION,
+  MUTATION_IN_PROGRESS,
+  STALE_CANONICAL_VERSION,
+  PUBLISH_VERSION_EXHAUSTED,
+  CORRESPONDENCE_GRAPH_MISMATCH,
+  STRUCTURE_JOURNAL_MISMATCH,
+};
+
+struct ReconstructionTransactionResult {
+  ReconstructionTransactionStatus status =
+      ReconstructionTransactionStatus::INVALID_TRANSACTION;
+  std::string detail;
+  ReconstructionCanonicalVersion canonical_version;
+
+  bool IsSuccess() const {
+    return status == ReconstructionTransactionStatus::SUCCESS;
+  }
+};
 
 enum class ReconstructionStructureEventKind : uint8_t {
   kImageRegistrationChanged = 0,
@@ -155,6 +192,27 @@ class Reconstruction {
   inline uint64_t OldestRetainedStructureRevision() const;
   inline bool StructureJournalEnabled() const;
 
+  // Transactional online-BA state is confined to the thread that constructed
+  // this Reconstruction. Legacy Reconstruction access remains unchanged.
+  bool IsTransactionOwnerThread() const noexcept;
+  ReconstructionCanonicalVersion CanonicalVersion() const noexcept;
+
+  // Creates a detached candidate without using Reconstruction assignment.
+  // Candidate preparation may allocate, but never mutates canonical state.
+  ReconstructionTransactionResult CreateTransactionSnapshot(
+      ReconstructionTransaction* transaction) const;
+  ReconstructionTransactionResult PrepareTransactionCommit(
+      ReconstructionTransaction* transaction) const;
+  ReconstructionTransactionResult ValidatePreparedTransaction(
+      const ReconstructionTransaction& transaction) const;
+  ReconstructionTransactionResult CommitTransaction(
+      ReconstructionTransaction* transaction);
+
+  // Precondition: ValidatePreparedTransaction succeeded and no owner-thread
+  // operation ran afterwards. Publication only swaps preallocated state.
+  void CommitPreparedTransaction(
+      ReconstructionTransaction* transaction) noexcept;
+
   // Get number of objects.
   inline size_t NumCameras() const;
   inline size_t NumImages() const;
@@ -203,8 +261,9 @@ class Reconstruction {
   // Load data from given `DatabaseCache`.
   void Load(const DatabaseCache& database_cache);
 
-  // Setup all relevant data structures before reconstruction. Note the
-  // correspondence graph object must live until `TearDown` is called.
+  // Setup all relevant data structures before reconstruction. The
+  // correspondence graph object, and any DatabaseCache that owns it, must
+  // outlive reconstruction use until `TearDown` is called.
   void SetUp(const CorrespondenceGraph* correspondence_graph);
 
   // Finalize the Reconstruction after the reconstruction has finished.
@@ -221,6 +280,16 @@ class Reconstruction {
 
   // Add new image.
   void AddImage(class Image image);
+
+  // Add one unregistered image from the live database cache without resetting
+  // existing reconstruction state. The cache must own the graph passed to
+  // `SetUp` and obey its lifetime contract above.
+  bool AddImageFromDatabaseCache(const DatabaseCache& database_cache,
+                                 const image_t image_id);
+
+  // Synchronize one verified image pair already present in the live graph.
+  bool AddImagePairFromCorrespondenceGraph(const image_t image_id1,
+                                           const image_t image_id2);
 
   void AddLidarPoint(const point3D_t& point3D_id, LidarPoint& lidar_point);
   void AddLidarPointInGlobal(const point3D_t& point3D_id, LidarPoint& lidar_point);
@@ -478,6 +547,7 @@ class Reconstruction {
 
  private:
   friend class StructureMutationBatch;
+  friend class ReconstructionTransaction;
 
   bool BeginStructureMutationBatch(bool suppress_nested_events);
   void FinishStructureMutationBatch(bool outer, bool commit);
@@ -485,6 +555,10 @@ class Reconstruction {
   void RecordStructureEvent(ReconstructionStructureEvent event,
                             bool force = false);
   void PublishStructureBatch();
+  ReconstructionTransactionResult ValidateTransaction(
+      const ReconstructionTransaction& transaction,
+      bool require_prepared) const;
+  std::unique_ptr<Reconstruction> CloneForTransaction() const;
 
   size_t FilterPoints3DWithSmallTriangulationAngle(
       const double min_tri_angle,
@@ -546,6 +620,42 @@ class Reconstruction {
   std::vector<ReconstructionStructureEvent> pending_structure_events_;
   std::deque<ReconstructionStructureBatch> structure_journal_;
 
+  std::thread::id transaction_owner_thread_id_;
+  uint64_t canonical_publish_version_ = 0;
+
+};
+
+// Move-only holder for one detached Reconstruction candidate. Mutable access
+// invalidates prior preparation so callers must prepare again before publish.
+class ReconstructionTransaction {
+ public:
+  ReconstructionTransaction() noexcept;
+  ~ReconstructionTransaction();
+  ReconstructionTransaction(ReconstructionTransaction&& other) noexcept;
+  ReconstructionTransaction& operator=(
+      ReconstructionTransaction&& other) noexcept;
+
+  ReconstructionTransaction(const ReconstructionTransaction&) = delete;
+  ReconstructionTransaction& operator=(const ReconstructionTransaction&) =
+      delete;
+
+  bool HasCandidate() const noexcept;
+  bool IsPrepared() const noexcept;
+  Reconstruction* MutableCandidate() noexcept;
+  const Reconstruction* Candidate() const noexcept;
+  ReconstructionCanonicalVersion ExpectedVersion() const noexcept;
+
+ private:
+  friend class Reconstruction;
+
+  void Reset() noexcept;
+
+  std::unique_ptr<Reconstruction> candidate_;
+  const Reconstruction* canonical_ = nullptr;
+  const CorrespondenceGraph* correspondence_graph_ = nullptr;
+  std::thread::id owner_thread_id_;
+  ReconstructionCanonicalVersion expected_version_;
+  bool prepared_ = false;
 };
 
 ////////////////////////////////////////////////////////////////////////////////

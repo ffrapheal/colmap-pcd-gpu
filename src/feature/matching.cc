@@ -31,8 +31,13 @@
 
 #include "feature/matching.h"
 
+#include <algorithm>
+#include <cmath>
 #include <fstream>
+#include <limits>
 #include <numeric>
+#include <unordered_map>
+#include <unordered_set>
 
 #include "SiftGPU/SiftGPU.h"
 #include "base/gps.h"
@@ -43,6 +48,39 @@
 
 namespace colmap {
 namespace {
+
+bool HasSameCameraMetadata(const Camera& camera1, const Camera& camera2) {
+  return camera1.CameraId() == camera2.CameraId() &&
+         camera1.ModelId() == camera2.ModelId() &&
+         camera1.Width() == camera2.Width() &&
+         camera1.Height() == camera2.Height() &&
+         camera1.HasPriorFocalLength() == camera2.HasPriorFocalLength() &&
+         camera1.Params() == camera2.Params();
+}
+
+bool HasSamePersistedValue(const double value1, const double value2) {
+  return value1 == value2 || (std::isnan(value1) && std::isnan(value2));
+}
+
+bool HasSameImageMetadata(const Image& image1, const Image& image2) {
+  if (image1.ImageId() != image2.ImageId() ||
+      image1.CameraId() != image2.CameraId() ||
+      image1.Name() != image2.Name()) {
+    return false;
+  }
+
+  for (size_t i = 0; i < 4; ++i) {
+    if (!HasSamePersistedValue(image1.QvecPrior(i), image2.QvecPrior(i))) {
+      return false;
+    }
+  }
+  for (size_t i = 0; i < 3; ++i) {
+    if (!HasSamePersistedValue(image1.TvecPrior(i), image2.TvecPrior(i))) {
+      return false;
+    }
+  }
+  return true;
+}
 
 void PrintElapsedTime(const Timer& timer) {
   std::cout << StringPrintf(" in %.3fs", timer.ElapsedSeconds()) << std::endl;
@@ -231,35 +269,96 @@ void FeatureMatcherCache::Setup() {
     images_cache_.emplace(image.ImageId(), image);
   }
 
+  const size_t feature_cache_size = std::max<size_t>(1, cache_size_);
   keypoints_cache_ = std::make_unique<LRUCache<image_t, FeatureKeypointsPtr>>(
-      cache_size_, [this](const image_t image_id) {
+      feature_cache_size, [this](const image_t image_id) {
         return std::make_shared<FeatureKeypoints>(
             database_->ReadKeypoints(image_id));
       });
 
   descriptors_cache_ =
       std::make_unique<LRUCache<image_t, FeatureDescriptorsPtr>>(
-          cache_size_, [this](const image_t image_id) {
+          feature_cache_size, [this](const image_t image_id) {
             return std::make_shared<FeatureDescriptors>(
                 database_->ReadDescriptors(image_id));
           });
 
+  const size_t exists_cache_size =
+      std::max(feature_cache_size, images.size());
   keypoints_exists_cache_ = std::make_unique<LRUCache<image_t, bool>>(
-      images.size(), [this](const image_t image_id) {
+      exists_cache_size, [this](const image_t image_id) {
         return database_->ExistsKeypoints(image_id);
       });
 
   descriptors_exists_cache_ = std::make_unique<LRUCache<image_t, bool>>(
-      images.size(), [this](const image_t image_id) {
+      exists_cache_size, [this](const image_t image_id) {
         return database_->ExistsDescriptors(image_id);
       });
 }
 
+bool FeatureMatcherCache::AddCamera(const Camera& camera) {
+  std::unique_lock<std::mutex> lock(database_mutex_);
+  const camera_t camera_id = camera.CameraId();
+  if (camera_id == kInvalidCameraId ||
+      cameras_cache_.count(camera_id) > 0 ||
+      !database_->ExistsCamera(camera_id)) {
+    return false;
+  }
+
+  Camera persisted_camera = database_->ReadCamera(camera_id);
+  if (!HasSameCameraMetadata(camera, persisted_camera)) {
+    return false;
+  }
+  return cameras_cache_
+      .emplace(camera_id, std::move(persisted_camera))
+      .second;
+}
+
+bool FeatureMatcherCache::AddImage(const Image& image,
+                                   const FeatureKeypoints& keypoints,
+                                   const FeatureDescriptors& descriptors) {
+  CHECK(keypoints_cache_);
+  CHECK(descriptors_cache_);
+  CHECK(keypoints_exists_cache_);
+  CHECK(descriptors_exists_cache_);
+
+  std::unique_lock<std::mutex> lock(database_mutex_);
+  const image_t image_id = image.ImageId();
+  if (image_id == kInvalidImageId || image_id >= Database::kMaxNumImages ||
+      image.CameraId() == kInvalidCameraId ||
+      cameras_cache_.count(image.CameraId()) == 0 ||
+      images_cache_.count(image_id) > 0 ||
+      keypoints.size() != static_cast<size_t>(descriptors.rows()) ||
+      !database_->ExistsImage(image_id) ||
+      !database_->ExistsKeypoints(image_id) ||
+      !database_->ExistsDescriptors(image_id) ||
+      database_->NumKeypointsForImage(image_id) != keypoints.size() ||
+      database_->NumDescriptorsForImage(image_id) !=
+          static_cast<size_t>(descriptors.rows())) {
+    return false;
+  }
+
+  Image persisted_image = database_->ReadImage(image_id);
+  if (!HasSameImageMetadata(image, persisted_image) ||
+      !images_cache_.emplace(image_id, std::move(persisted_image)).second) {
+    return false;
+  }
+  keypoints_cache_->Set(
+      image_id, std::make_shared<FeatureKeypoints>(keypoints));
+  descriptors_cache_->Set(
+      image_id, std::make_shared<FeatureDescriptors>(descriptors));
+  keypoints_exists_cache_->Set(image_id, true);
+  descriptors_exists_cache_->Set(image_id, true);
+  return true;
+}
+
 const Camera& FeatureMatcherCache::GetCamera(const camera_t camera_id) const {
+  std::unique_lock<std::mutex> lock(database_mutex_);
   return cameras_cache_.at(camera_id);
 }
 
 const Image& FeatureMatcherCache::GetImage(const image_t image_id) const {
+  std::unique_lock<std::mutex> lock(database_mutex_);
   return images_cache_.at(image_id);
 }
 
@@ -281,6 +380,7 @@ FeatureMatches FeatureMatcherCache::GetMatches(const image_t image_id1,
 }
 
 std::vector<image_t> FeatureMatcherCache::GetImageIds() const {
+  std::unique_lock<std::mutex> lock(database_mutex_);
   std::vector<image_t> image_ids;
   image_ids.reserve(images_cache_.size());
   for (const auto& image : images_cache_) {
@@ -657,7 +757,12 @@ void TwoViewGeometryVerifier::Run() {
 SiftFeatureMatcher::SiftFeatureMatcher(const SiftMatchingOptions& options,
                                        Database* database,
                                        FeatureMatcherCache* cache)
-    : options_(options), database_(database), cache_(cache), is_setup_(false) {
+    : options_(options),
+      database_(database),
+      cache_(cache),
+      setup_attempted_(false),
+      setup_max_num_features_(0),
+      is_setup_(false) {
   CHECK(options_.Check());
 
   const int num_threads = GetEffectiveNumThreads(options_.num_threads);
@@ -760,7 +865,28 @@ SiftFeatureMatcher::~SiftFeatureMatcher() {
 }
 
 bool SiftFeatureMatcher::Setup() {
-  const int max_num_features = CHECK_NOTNULL(database_)->MaxNumDescriptors();
+  if (setup_attempted_) {
+    return is_setup_;
+  }
+
+  const size_t max_num_features =
+      CHECK_NOTNULL(database_)->MaxNumDescriptors();
+  if (max_num_features == 0) {
+    return false;
+  }
+  CHECK_LE(max_num_features,
+           static_cast<size_t>(std::numeric_limits<int>::max()));
+  return SetupForMaxNumFeatures(static_cast<int>(max_num_features));
+}
+
+bool SiftFeatureMatcher::SetupForMaxNumFeatures(const int max_num_features) {
+  CHECK_GT(max_num_features, 0);
+  if (setup_attempted_) {
+    return max_num_features == setup_max_num_features_ && is_setup_;
+  }
+  setup_attempted_ = true;
+  setup_max_num_features_ = max_num_features;
+
   options_.max_num_matches =
       std::min(options_.max_num_matches, max_num_features);
 
@@ -795,12 +921,36 @@ bool SiftFeatureMatcher::Setup() {
   return true;
 }
 
+bool SiftFeatureMatcher::IsSetup() const { return is_setup_; }
+
+int SiftFeatureMatcher::MinNumInliers() const {
+  return options_.min_num_inliers;
+}
+
 void SiftFeatureMatcher::Match(
     const std::vector<std::pair<image_t, image_t>>& image_pairs) {
+  MatchInternal(image_pairs, nullptr);
+}
+
+std::vector<SiftFeatureMatcher::MatchResult>
+SiftFeatureMatcher::MatchWithResults(
+    const std::vector<std::pair<image_t, image_t>>& image_pairs) {
+  std::vector<MatchResult> results;
+  MatchInternal(image_pairs, &results);
+  return results;
+}
+
+void SiftFeatureMatcher::MatchInternal(
+    const std::vector<std::pair<image_t, image_t>>& image_pairs,
+    std::vector<MatchResult>* results) {
   CHECK_NOTNULL(database_);
   CHECK_NOTNULL(cache_);
   CHECK(is_setup_);
 
+  if (results != nullptr) {
+    results->clear();
+    results->resize(image_pairs.size());
+  }
   if (image_pairs.empty()) {
     return;
   }
@@ -811,11 +961,26 @@ void SiftFeatureMatcher::Match(
 
   std::unordered_set<image_pair_t> image_pair_ids;
   image_pair_ids.reserve(image_pairs.size());
+  std::unordered_map<image_pair_t, size_t> result_indices;
+  if (results != nullptr) {
+    result_indices.reserve(image_pairs.size());
+  }
 
   size_t num_outputs = 0;
-  for (const auto& image_pair : image_pairs) {
+  for (size_t i = 0; i < image_pairs.size(); ++i) {
+    const auto& image_pair = image_pairs[i];
+    MatchResult* result = nullptr;
+    if (results != nullptr) {
+      result = &(*results)[i];
+      result->image_id1 = image_pair.first;
+      result->image_id2 = image_pair.second;
+    }
+
     // Avoid self-matches.
     if (image_pair.first == image_pair.second) {
+      if (result != nullptr) {
+        result->status = MatchStatus::SKIPPED_SELF_MATCH;
+      }
       continue;
     }
 
@@ -823,6 +988,9 @@ void SiftFeatureMatcher::Match(
     const image_pair_t pair_id =
         Database::ImagePairToPairId(image_pair.first, image_pair.second);
     if (image_pair_ids.count(pair_id) > 0) {
+      if (result != nullptr) {
+        result->status = MatchStatus::SKIPPED_DUPLICATE_PAIR;
+      }
       continue;
     }
 
@@ -834,9 +1002,16 @@ void SiftFeatureMatcher::Match(
         cache_->ExistsInlierMatches(image_pair.first, image_pair.second);
 
     if (exists_matches && exists_inlier_matches) {
+      if (result != nullptr) {
+        result->status = MatchStatus::SKIPPED_EXISTING_PAIR;
+      }
       continue;
     }
 
+    if (result != nullptr) {
+      result->status = MatchStatus::COMPUTED;
+      CHECK(result_indices.emplace(pair_id, i).second);
+    }
     num_outputs += 1;
 
     // If only one of the matches or inlier matches exist, we recompute them
@@ -871,17 +1046,30 @@ void SiftFeatureMatcher::Match(
     auto& output = output_job.Data();
 
     if (output.matches.size() < static_cast<size_t>(options_.min_num_inliers)) {
-      output.matches = {};
+      cache_->WriteMatches(output.image_id1, output.image_id2,
+                           FeatureMatches());
+    } else {
+      cache_->WriteMatches(output.image_id1, output.image_id2, output.matches);
     }
 
     if (output.two_view_geometry.inlier_matches.size() <
         static_cast<size_t>(options_.min_num_inliers)) {
       output.two_view_geometry = TwoViewGeometry();
     }
-
-    cache_->WriteMatches(output.image_id1, output.image_id2, output.matches);
     cache_->WriteTwoViewGeometry(output.image_id1, output.image_id2,
                                  output.two_view_geometry);
+
+    if (results != nullptr) {
+      const image_pair_t pair_id =
+          Database::ImagePairToPairId(output.image_id1, output.image_id2);
+      const auto result_it = result_indices.find(pair_id);
+      CHECK(result_it != result_indices.end());
+      auto& result = (*results)[result_it->second];
+      CHECK_EQ(result.image_id1, output.image_id1);
+      CHECK_EQ(result.image_id2, output.image_id2);
+      result.matches = std::move(output.matches);
+      result.two_view_geometry = std::move(output.two_view_geometry);
+    }
   }
 
   CHECK_EQ(output_queue_.Size(), 0);

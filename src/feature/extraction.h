@@ -32,6 +32,10 @@
 #ifndef COLMAP_SRC_FEATURE_EXTRACTION_H_
 #define COLMAP_SRC_FEATURE_EXTRACTION_H_
 
+#include <memory>
+#include <string>
+#include <thread>
+
 #include "base/database.h"
 #include "base/image_reader.h"
 #include "feature/sift.h"
@@ -39,6 +43,59 @@
 #include "util/threading.h"
 
 namespace colmap {
+
+struct SingleImageFeatureExtractionResult {
+  bool success = false;
+  std::string rejection_reason;
+};
+
+// Synchronous single-image extraction interface. Implementations are owned and
+// invoked by one control thread; they are intentionally not thread-safe.
+class SingleImageFeatureExtractor {
+ public:
+  virtual ~SingleImageFeatureExtractor() = default;
+
+  virtual SingleImageFeatureExtractionResult Setup() = 0;
+  virtual SingleImageFeatureExtractionResult Extract(
+      const Camera& camera, Bitmap* bitmap, const Bitmap* frame_mask,
+      FeatureKeypoints* keypoints, FeatureDescriptors* descriptors) = 0;
+  virtual bool IsSetup() const = 0;
+  virtual size_t SetupCount() const = 0;
+  virtual size_t ExtractCount() const = 0;
+  virtual bool UsesCuda() const = 0;
+};
+
+// Persistent CUDA SIFT extractor for strict online single-frame processing.
+// Construction, Setup, Extract, and destruction must happen on one thread.
+class PersistentCudaSiftFeatureExtractor : public SingleImageFeatureExtractor {
+ public:
+  explicit PersistentCudaSiftFeatureExtractor(
+      const SiftExtractionOptions& sift_options,
+      std::shared_ptr<const Bitmap> camera_mask = nullptr);
+  ~PersistentCudaSiftFeatureExtractor() override;
+
+  SingleImageFeatureExtractionResult Setup() override;
+  SingleImageFeatureExtractionResult Extract(
+      const Camera& camera, Bitmap* bitmap, const Bitmap* frame_mask,
+      FeatureKeypoints* keypoints, FeatureDescriptors* descriptors) override;
+  bool IsSetup() const override;
+  size_t SetupCount() const override;
+  size_t ExtractCount() const override;
+  bool UsesCuda() const override;
+
+ private:
+  SingleImageFeatureExtractionResult Reject(const std::string& reason) const;
+  bool IsControlThread() const;
+
+  const SiftExtractionOptions sift_options_;
+  const std::shared_ptr<const Bitmap> camera_mask_;
+  const std::thread::id control_thread_id_;
+  std::unique_ptr<SiftGPU> sift_gpu_;
+  bool is_setup_ = false;
+  bool uses_cuda_ = false;
+  size_t setup_count_ = 0;
+  size_t extract_count_ = 0;
+};
 
 namespace internal {
 

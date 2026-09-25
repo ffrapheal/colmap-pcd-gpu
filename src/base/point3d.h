@@ -80,7 +80,7 @@ class Point3D {
   inline Eigen::Vector3d LidarXYZ() const;
 
   inline void AddGlobalOptNum();
-  inline const int GlobalOptNum();
+  inline int GlobalOptNum() const;
 
   inline const bool IfInSphere() const;
   inline bool& IfInSphere();
@@ -157,7 +157,7 @@ void Point3D::AddGlobalOptNum(){
   global_opt_num_ +=1;
 }
 
-const int Point3D::GlobalOptNum(){
+int Point3D::GlobalOptNum() const {
   return global_opt_num_;
 }
 const bool Point3D::IfInSphere() const {

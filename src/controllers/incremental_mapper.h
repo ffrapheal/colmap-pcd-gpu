@@ -220,6 +220,9 @@ struct IncrementalMapperOptions {
   // Whether to use PBA in global bundle adjustment.
   bool ba_global_use_pba = false;
 
+  // Whether to run global bundle adjustment during incremental mapping.
+  bool ba_global_enabled = true;
+
   // The GPU index for PBA bundle adjustment.
   int ba_global_pba_gpu_index = -1;
 

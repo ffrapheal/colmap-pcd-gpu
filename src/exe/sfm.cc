@@ -39,6 +39,9 @@
 #include "controllers/bundle_adjustment.h"
 #include "controllers/hierarchical_mapper.h"
 #include "exe/gui.h"
+#ifdef GPU_BA_CUDA_ENABLED
+#include "exe/online_i3dgs_replay.h"
+#endif
 #include "sfm/nonba_profiler.h"
 #include "util/misc.h"
 #include "util/opengl_utils.h"
@@ -276,6 +279,42 @@ int RunMapper(int argc, char** argv) {
 
   return EXIT_SUCCESS;
 }
+
+#ifdef GPU_BA_CUDA_ENABLED
+int RunOnlineI3dgsMapper(int argc, char** argv) {
+  std::string sealed_artifact;
+  std::string output_path;
+  size_t max_frames = 0;
+  size_t ba_window_size = 20;
+
+  OptionManager options;
+  options.AddRequiredOption("sealed_artifact", &sealed_artifact);
+  options.AddRequiredOption("output_path", &output_path);
+  options.AddDefaultOption("max_frames", &max_frames);
+  options.AddDefaultOption("ba_window_size", &ba_window_size);
+  options.Parse(argc, argv);
+
+  OnlineI3dgsReplayOptions replay_options;
+  replay_options.sealed_artifact = sealed_artifact;
+  replay_options.output_path = output_path;
+  replay_options.max_frames = max_frames;
+  replay_options.ba_window_size = ba_window_size;
+  replay_options.executable_path = argv[0];
+  const OnlineI3dgsReplayResult result = RunOnlineI3dgsReplay(
+      replay_options, CreateOnlineI3dgsControllerFactory());
+  if (!result.IsSuccess()) {
+    std::cerr << "ERROR: online i3dgs replay failed: " << result.error
+              << std::endl;
+    return EXIT_FAILURE;
+  }
+  std::cout << (result.status == OnlineI3dgsReplayStatus::COMPLETED
+                    ? "COMPLETED"
+                    : "SMOKE_COMPLETED")
+            << ": processed " << result.processed_frame_count << " frame(s)"
+            << std::endl;
+  return EXIT_SUCCESS;
+}
+#endif
 
 int RunHierarchicalMapper(int argc, char** argv) {
   HierarchicalMapperController::Options hierarchical_options;

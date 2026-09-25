@@ -48,6 +48,9 @@ int RunAutomaticReconstructor(int argc, char** argv);
 int RunBundleAdjuster(int argc, char** argv);
 int RunColorExtractor(int argc, char** argv);
 int RunMapper(int argc, char** argv);
+#ifdef GPU_BA_CUDA_ENABLED
+int RunOnlineI3dgsMapper(int argc, char** argv);
+#endif
 int RunHierarchicalMapper(int argc, char** argv);
 int RunPointFiltering(int argc, char** argv);
 int RunPointTriangulator(int argc, char** argv);

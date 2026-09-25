@@ -31,12 +31,26 @@
 
 #include "base/correspondence_graph.h"
 
+#include <algorithm>
 #include <unordered_set>
 
 #include "base/pose.h"
 #include "util/string.h"
 
 namespace colmap {
+namespace {
+
+bool HasCorrespondenceToImage(
+    const std::vector<CorrespondenceGraph::Correspondence>& correspondences,
+    const image_t image_id) {
+  return std::any_of(
+      correspondences.begin(), correspondences.end(),
+      [image_id](const CorrespondenceGraph::Correspondence& correspondence) {
+        return correspondence.image_id == image_id;
+      });
+}
+
+}  // namespace
 
 CorrespondenceGraph::CorrespondenceGraph() {}
 
@@ -52,13 +66,10 @@ CorrespondenceGraph::NumCorrespondencesBetweenImages() const {
 }
 
 void CorrespondenceGraph::Finalize() {
+  RecomputeNumObservations();
   for (auto it = images_.begin(); it != images_.end();) {
-    it->second.num_observations = 0;
     for (auto& corr : it->second.corrs) {
       corr.shrink_to_fit();
-      if (corr.size() > 0) {
-        it->second.num_observations += 1;
-      }
     }
     if (it->second.num_observations == 0) {
       images_.erase(it++);
@@ -66,67 +77,126 @@ void CorrespondenceGraph::Finalize() {
       ++it;
     }
   }
+  observation_counts_are_current_ = true;
 }
 
 void CorrespondenceGraph::AddImage(const image_t image_id,
                                    const size_t num_points) {
-  CHECK(!ExistsImage(image_id));
-  images_[image_id].corrs.resize(num_points);
+  const AddImageResult result = TryAddImage(image_id, num_points);
+  CHECK(result.IsSuccess()) << "Cannot add image_id=" << image_id;
+}
+
+CorrespondenceGraph::AddImageResult CorrespondenceGraph::TryAddImage(
+    const image_t image_id, const size_t num_points) {
+  AddImageResult result;
+  if (image_id == kInvalidImageId || image_id >= Database::kMaxNumImages) {
+    result.status = AddImageStatus::INVALID_IMAGE_ID;
+    return result;
+  }
+  if (ExistsImage(image_id)) {
+    result.status = AddImageStatus::DUPLICATE_IMAGE;
+    return result;
+  }
+
+  Image image;
+  image.corrs.resize(num_points);
+  const auto insertion = images_.emplace(image_id, std::move(image));
+  if (!insertion.second) {
+    result.status = AddImageStatus::DUPLICATE_IMAGE;
+  }
+  return result;
 }
 
 void CorrespondenceGraph::AddCorrespondences(const image_t image_id1,
                                              const image_t image_id2,
                                              const FeatureMatches& matches) {
+  if (image_id1 != image_id2) {
+    images_.at(image_id1);
+    images_.at(image_id2);
+  }
+  AddCorrespondencesImpl(image_id1, image_id2, matches,
+                         ExistingPairMode::APPEND, false);
+}
+
+CorrespondenceGraph::AddCorrespondencesResult
+CorrespondenceGraph::TryAddCorrespondences(const image_t image_id1,
+                                           const image_t image_id2,
+                                           const FeatureMatches& matches) {
+  return AddCorrespondencesImpl(image_id1, image_id2, matches,
+                                ExistingPairMode::REJECT, true);
+}
+
+CorrespondenceGraph::AddCorrespondencesResult
+CorrespondenceGraph::AddCorrespondencesImpl(
+    const image_t image_id1, const image_t image_id2,
+    const FeatureMatches& matches,
+    const ExistingPairMode existing_pair_mode,
+    const bool initialize_observation_counts) {
+  AddCorrespondencesResult result;
+  result.num_input_matches = matches.size();
+  result.num_rejected_matches = matches.size();
+
   // Avoid self-matches - should only happen, if user provides custom matches.
   if (image_id1 == image_id2) {
+    result.status = AddCorrespondencesStatus::SELF_MATCH;
     std::cout << "WARNING: Cannot use self-matches for image_id=" << image_id1
               << std::endl;
-    return;
+    return result;
+  }
+
+  if (!ExistsImage(image_id1) || !ExistsImage(image_id2)) {
+    result.status = AddCorrespondencesStatus::IMAGE_NOT_FOUND;
+    std::cout << "WARNING: Cannot add correspondences for missing image pair "
+              << image_id1 << " - " << image_id2 << std::endl;
+    return result;
   }
 
   // Corresponding images.
   struct Image& image1 = images_.at(image_id1);
   struct Image& image2 = images_.at(image_id2);
 
-  // Store number of correspondences for each image to find good initial pair.
-  image1.num_correspondences += matches.size();
-  image2.num_correspondences += matches.size();
-
-  // Set the number of all correspondences for this image pair. Further below,
-  // we will make sure that only unique correspondences are counted.
   const image_pair_t pair_id =
       Database::ImagePairToPairId(image_id1, image_id2);
-  auto& image_pair = image_pairs_[pair_id];
-  image_pair.num_correspondences += static_cast<point2D_t>(matches.size());
+  const auto image_pair_it = image_pairs_.find(pair_id);
+  const bool image_pair_exists = image_pair_it != image_pairs_.end();
+  if (existing_pair_mode == ExistingPairMode::REJECT && image_pair_exists) {
+    result.status = AddCorrespondencesStatus::DUPLICATE_IMAGE_PAIR;
+    std::cout << "WARNING: Cannot add duplicate image pair " << image_id1
+              << " - " << image_id2 << std::endl;
+    return result;
+  }
 
   // Store all matches in correspondence graph data structure. This data-
   // structure uses more memory than storing the raw match matrices, but is
   // significantly more efficient when updating the correspondences in case an
   // observation is triangulated.
 
+  const size_t max_num_valid_matches =
+      std::min(matches.size(),
+               std::min(image1.corrs.size(), image2.corrs.size()));
+  FeatureMatches valid_matches;
+  valid_matches.reserve(max_num_valid_matches);
+  std::unordered_set<point2D_t> point2D_indices1;
+  std::unordered_set<point2D_t> point2D_indices2;
+  point2D_indices1.reserve(std::min(matches.size(), image1.corrs.size()));
+  point2D_indices2.reserve(std::min(matches.size(), image2.corrs.size()));
+
   for (const auto& match : matches) {
     const bool valid_idx1 = match.point2D_idx1 < image1.corrs.size();
     const bool valid_idx2 = match.point2D_idx2 < image2.corrs.size();
 
     if (valid_idx1 && valid_idx2) {
-      auto& corrs1 = image1.corrs[match.point2D_idx1];
-      auto& corrs2 = image2.corrs[match.point2D_idx2];
-
-      const bool duplicate1 =
-          std::find_if(corrs1.begin(), corrs1.end(),
-                       [image_id2](const Correspondence& corr) {
-                         return corr.image_id == image_id2;
-                       }) != corrs1.end();
-      const bool duplicate2 =
-          std::find_if(corrs2.begin(), corrs2.end(),
-                       [image_id1](const Correspondence& corr) {
-                         return corr.image_id == image_id1;
-                       }) != corrs2.end();
-
-      if (duplicate1 || duplicate2) {
-        image1.num_correspondences -= 1;
-        image2.num_correspondences -= 1;
-        image_pair.num_correspondences -= 1;
+      const bool duplicate_existing =
+          image_pair_exists &&
+          (HasCorrespondenceToImage(image1.corrs[match.point2D_idx1],
+                                    image_id2) ||
+           HasCorrespondenceToImage(image2.corrs[match.point2D_idx2],
+                                    image_id1));
+      const bool duplicate_in_batch =
+          point2D_indices1.count(match.point2D_idx1) > 0 ||
+          point2D_indices2.count(match.point2D_idx2) > 0;
+      if (duplicate_existing || duplicate_in_batch) {
+        result.num_duplicate_matches += 1;
         std::cout << StringPrintf(
                          "WARNING: Duplicate correspondence between "
                          "point2D_idx=%d in image_id=%d and point2D_idx=%d in "
@@ -135,13 +205,12 @@ void CorrespondenceGraph::AddCorrespondences(const image_t image_id1,
                          image_id2)
                   << std::endl;
       } else {
-        corrs1.emplace_back(image_id2, match.point2D_idx2);
-        corrs2.emplace_back(image_id1, match.point2D_idx1);
+        point2D_indices1.insert(match.point2D_idx1);
+        point2D_indices2.insert(match.point2D_idx2);
+        valid_matches.push_back(match);
       }
     } else {
-      image1.num_correspondences -= 1;
-      image2.num_correspondences -= 1;
-      image_pair.num_correspondences -= 1;
+      result.num_invalid_matches += 1;
       if (!valid_idx1) {
         std::cout
             << StringPrintf(
@@ -155,6 +224,72 @@ void CorrespondenceGraph::AddCorrespondences(const image_t image_id1,
                    "WARNING: point2D_idx=%d in image_id=%d does not exist",
                    match.point2D_idx2, image_id2)
             << std::endl;
+      }
+    }
+  }
+
+  if (valid_matches.empty()) {
+    if (existing_pair_mode == ExistingPairMode::APPEND) {
+      image_pairs_.emplace(pair_id, ImagePair());
+    }
+    result.status = AddCorrespondencesStatus::NO_VALID_CORRESPONDENCES;
+    return result;
+  }
+
+  for (const auto& match : valid_matches) {
+    auto& corrs1 = image1.corrs[match.point2D_idx1];
+    auto& corrs2 = image2.corrs[match.point2D_idx2];
+    corrs1.reserve(corrs1.size() + 1);
+    corrs2.reserve(corrs2.size() + 1);
+  }
+
+  ImagePair* image_pair = nullptr;
+  if (image_pair_exists) {
+    image_pair = &image_pair_it->second;
+  } else {
+    image_pair =
+        &image_pairs_.emplace(pair_id, ImagePair()).first->second;
+  }
+
+  if (initialize_observation_counts && !observation_counts_are_current_) {
+    RecomputeNumObservations();
+    observation_counts_are_current_ = true;
+    result.observation_counts_recomputed = true;
+  }
+
+  for (const auto& match : valid_matches) {
+    auto& corrs1 = image1.corrs[match.point2D_idx1];
+    auto& corrs2 = image2.corrs[match.point2D_idx2];
+    const bool first_observation1 = corrs1.empty();
+    const bool first_observation2 = corrs2.empty();
+    corrs1.emplace_back(image_id2, match.point2D_idx2);
+    corrs2.emplace_back(image_id1, match.point2D_idx1);
+    if (observation_counts_are_current_) {
+      if (first_observation1) {
+        image1.num_observations += 1;
+      }
+      if (first_observation2) {
+        image2.num_observations += 1;
+      }
+    }
+  }
+
+  const point2D_t num_added_matches =
+      static_cast<point2D_t>(valid_matches.size());
+  image1.num_correspondences += num_added_matches;
+  image2.num_correspondences += num_added_matches;
+  image_pair->num_correspondences += num_added_matches;
+  result.num_added_matches = valid_matches.size();
+  result.num_rejected_matches -= valid_matches.size();
+  return result;
+}
+
+void CorrespondenceGraph::RecomputeNumObservations() {
+  for (auto& image : images_) {
+    image.second.num_observations = 0;
+    for (const auto& corrs : image.second.corrs) {
+      if (!corrs.empty()) {
+        image.second.num_observations += 1;
       }
     }
   }

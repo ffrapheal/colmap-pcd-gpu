@@ -44,6 +44,7 @@
 #include "base/correspondence_graph.h"
 #include "base/database.h"
 #include "base/image.h"
+#include "feature/types.h"
 #include "util/alignment.h"
 #include "util/types.h"
 
@@ -51,8 +52,13 @@ namespace colmap {
 
 // A class that caches the contents of the database in memory, used to quickly
 // create new reconstruction instances when multiple models are reconstructed.
+// Mutating calls are not internally synchronized.
 class DatabaseCache {
  public:
+  using AddImageResult = ::colmap::CorrespondenceGraph::AddImageResult;
+  using AddCorrespondencesResult =
+      ::colmap::CorrespondenceGraph::AddCorrespondencesResult;
+
   DatabaseCache();
 
   // Get number of objects.
@@ -80,6 +86,17 @@ class DatabaseCache {
   void AddCamera(class Camera camera);
   void AddImage(class Image image);
 
+  // Incrementally add an image and its extracted features without exposing a
+  // mutable correspondence graph. The image's camera identifier is preserved;
+  // its camera must be added separately. Duplicate identifiers are rejected.
+  AddImageResult AddImageWithKeypoints(class Image image,
+                                       const FeatureKeypoints& keypoints);
+
+  // Incrementally add one verified image pair and synchronize image statistics.
+  AddCorrespondencesResult AddVerifiedCorrespondences(
+      const image_t image_id1, const image_t image_id2,
+      const FeatureMatches& matches);
+
   /** Load cameras, images, features, and matches from database.
    * @param database              Source database from which to load data.
    * @param min_num_matches       Only load image pairs with a minimum numberof matches.
@@ -95,6 +112,11 @@ class DatabaseCache {
   const class Image* FindImageWithName(const std::string& name) const;
 
  private:
+  AddImageResult ValidateNewImageId(const image_t image_id) const;
+  AddImageResult AddImageInternal(class Image image);
+  void SynchronizeImageStatistics(const image_t image_id);
+  void SynchronizeAllImageStatistics();
+
   class CorrespondenceGraph correspondence_graph_;
 
   EIGEN_STL_UMAP(camera_t, class Camera) cameras_;

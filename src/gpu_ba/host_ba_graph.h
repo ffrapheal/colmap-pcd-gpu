@@ -30,8 +30,9 @@ struct CudaFullLmOptions;
 class DeviceBaProblemStoreHandle;
 
 constexpr uint32_t kHostBaGraphAbiVersion = 2;
-constexpr uint32_t kNativeHostSolveViewAbiVersion = 1;
+constexpr uint32_t kNativeHostSolveViewAbiVersion = 2;
 constexpr uint32_t kBaGraphInvalidSlot = 0xffffffffu;
+constexpr uint64_t kBaGraphInvalidAssociationId = 0xffffffffffffffffull;
 
 template <typename T>
 struct BaArrayView {
@@ -261,6 +262,32 @@ enum class CudaPreparedSelectionCacheMode : uint8_t {
   kEnabled = 1,
 };
 
+enum class NativeBaVisualObservationScope : uint8_t {
+  kLegacyExplicitPointTrackExpansion = 0,
+  kActiveImagesOnly = 1,
+};
+
+struct NativeBaOnlineLidarIdentity {
+  bool valid = false;
+  uint32_t trigger_image_id = kBaGraphInvalidSlot;
+  uint64_t map_version = 0;
+  uint64_t max_scan_index = 0;
+  std::array<uint8_t, 32> snapshot_sha256{};
+  std::array<uint8_t, 32> geometry_sha256{};
+  std::array<uint8_t, 32> association_sha256{};
+};
+
+bool IsValidNativeBaOnlineLidarIdentity(
+    const NativeBaOnlineLidarIdentity& identity) noexcept;
+bool IsCanonicalNativeBaLegacyLidarIdentity(
+    const NativeBaOnlineLidarIdentity& identity) noexcept;
+bool IsValidNativeBaLidarScopeIdentity(
+    NativeBaVisualObservationScope scope,
+    const NativeBaOnlineLidarIdentity& identity) noexcept;
+bool SameNativeBaOnlineLidarIdentity(
+    const NativeBaOnlineLidarIdentity& lhs,
+    const NativeBaOnlineLidarIdentity& rhs) noexcept;
+
 struct NativeCudaResolvedConfig {
   bool resolved = false;
   bool performance_mode = false;
@@ -334,8 +361,12 @@ struct LidarConstraintRecord {
   // Stable identity within the selected LiDAR constraint generation. This is
   // not the solve-local source insertion index.
   uint64_t physical_identity = 0;
+  uint64_t association_id = kBaGraphInvalidAssociationId;
+  uint32_t owner_image_id = kBaGraphInvalidSlot;
+  uint32_t owner_point2D_idx = kBaGraphInvalidSlot;
   uint8_t lidar_type = 0;
   uint8_t padding[3]{};
+  std::array<double, 3> frozen_point3D_xyz{{0.0, 0.0, 0.0}};
   std::array<double, 4> plane{{0.0, 0.0, 0.0, 0.0}};
   std::array<double, 3> lidar_xyz{{0.0, 0.0, 0.0}};
   double weight = 0.0;
@@ -343,9 +374,13 @@ struct LidarConstraintRecord {
   uint64_t point_state_generation = 0;
 };
 
+bool IsCanonicalNativeBaLegacyLidarConstraint(
+    const LidarConstraintRecord& constraint) noexcept;
+
 struct LidarConstraintSelection {
   uint64_t lidar_map_generation = 0;
   uint64_t match_config_generation = 0;
+  NativeBaOnlineLidarIdentity online_lidar_identity;
   std::vector<LidarConstraintRecord> constraints;
 };
 
@@ -377,13 +412,20 @@ struct NativeBaLidarConstraint {
   uint64_t point3D_id = 0;
   uint32_t constraint_slot = kBaGraphInvalidSlot;
   uint64_t physical_identity = 0;
+  uint64_t association_id = kBaGraphInvalidAssociationId;
+  uint32_t owner_image_id = kBaGraphInvalidSlot;
+  uint32_t owner_point2D_idx = kBaGraphInvalidSlot;
   uint8_t lidar_type = 0;
   uint8_t padding[3]{};
+  std::array<double, 3> frozen_point3D_xyz{{0.0, 0.0, 0.0}};
   std::array<double, 4> plane{{0.0, 0.0, 0.0, 0.0}};
   std::array<double, 3> lidar_xyz{{0.0, 0.0, 0.0}};
   double weight = 0.0;
   double search_range = 0.0;
 };
+
+bool IsCanonicalNativeBaLegacyLidarConstraint(
+    const NativeBaLidarConstraint& constraint) noexcept;
 
 struct NativeBaSolveIntent {
   uint32_t abi_version = kNativeHostSolveViewAbiVersion;
@@ -392,6 +434,8 @@ struct NativeBaSolveIntent {
   uint64_t expected_topology_revision = 0;
   uint64_t selection_revision = 0;
   BaKind kind = BaKind::kLocal;
+  NativeBaVisualObservationScope visual_observation_scope =
+      NativeBaVisualObservationScope::kLegacyExplicitPointTrackExpansion;
   NativeCudaResolvedConfig config;
   // Order is semantically significant and is the source-insertion image order.
   std::vector<uint32_t> active_image_ids;
@@ -405,6 +449,7 @@ struct NativeBaSolveIntent {
   std::vector<NativeBaPointPolicy> point_policies;
   uint64_t lidar_map_generation = 0;
   uint64_t lidar_match_config_generation = 0;
+  NativeBaOnlineLidarIdentity online_lidar_identity;
   std::vector<NativeBaLidarConstraint> lidar_constraints;
 };
 
@@ -415,6 +460,8 @@ struct BaSolveIntent {
   uint64_t catalog_generation = 0;
   uint64_t selection_revision = 0;
   BaKind kind = BaKind::kLocal;
+  NativeBaVisualObservationScope visual_observation_scope =
+      NativeBaVisualObservationScope::kLegacyExplicitPointTrackExpansion;
   NativeCudaResolvedConfig config;
   std::vector<uint32_t> active_image_slots;
   std::vector<uint32_t> active_visual_observation_slots;
@@ -526,6 +573,9 @@ struct ResidualOrdinal {
   // Stable physical identity is audit/catalog identity only. It is never
   // written into CudaVisualInput::source_index.
   uint64_t physical_identity = 0;
+  uint64_t association_id = kBaGraphInvalidAssociationId;
+  uint32_t owner_image_id = kBaGraphInvalidSlot;
+  uint32_t owner_point2D_idx = kBaGraphInvalidSlot;
   ResidualKind kind = ResidualKind::kVisual;
   uint32_t source_slot = kBaGraphInvalidSlot;
 };
@@ -584,12 +634,18 @@ struct NativeHostSolveViewIdentity {
   uint64_t config_generation = 0;
   uint64_t lidar_map_generation = 0;
   uint64_t lidar_match_config_generation = 0;
+  NativeBaVisualObservationScope visual_observation_scope =
+      NativeBaVisualObservationScope::kLegacyExplicitPointTrackExpansion;
+  NativeBaOnlineLidarIdentity online_lidar_identity;
 };
 
 struct PreparedSelectionPlan {
   uint64_t publication_id = 0;
   uint64_t slot_namespace_epoch = 0;
   uint64_t host_resident_bytes = 0;
+  NativeBaVisualObservationScope visual_observation_scope =
+      NativeBaVisualObservationScope::kLegacyExplicitPointTrackExpansion;
+  NativeBaOnlineLidarIdentity online_lidar_identity;
   std::vector<uint32_t> active_camera_slots;
   std::vector<uint32_t> active_image_slots;
   std::vector<uint32_t> boundary_image_slots;

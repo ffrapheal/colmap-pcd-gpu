@@ -125,6 +125,9 @@ int main(int argc, char** argv) {
   commands.emplace_back("image_undistorter_standalone",
                         &RunImageUndistorterStandalone);
   commands.emplace_back("mapper", &RunMapper);
+#ifdef GPU_BA_CUDA_ENABLED
+  commands.emplace_back("online_i3dgs_mapper", &RunOnlineI3dgsMapper);
+#endif
   commands.emplace_back("matches_importer", &RunMatchesImporter);
   commands.emplace_back("model_aligner", &RunModelAligner);
   commands.emplace_back("model_analyzer", &RunModelAnalyzer);

@@ -90,6 +90,22 @@ size_t IncrementalTriangulator::TriangulateImage(const Options& options,
   // Try to triangulate all image observations.
   for (point2D_t point2D_idx = 0; point2D_idx < image.NumPoints2D();
        ++point2D_idx) {
+    const Point2D& point2D = image.Point2D(point2D_idx);
+    if (options.max_transitivity == 1) {
+      bool can_change_track = false;
+      for (const auto& correspondence :
+           correspondence_graph_->FindCorrespondences(image_id, point2D_idx)) {
+        const Image& other_image =
+            reconstruction_->Image(correspondence.image_id);
+        if (other_image.IsRegistered() &&
+            (!point2D.HasPoint3D() ||
+             !other_image.Point2D(correspondence.point2D_idx).HasPoint3D())) {
+          can_change_track = true;
+          break;
+        }
+      }
+      if (!can_change_track) continue;
+    }
     const size_t num_triangulated =
         Find(options, image_id, point2D_idx,
              static_cast<size_t>(options.max_transitivity), &corrs_data);
@@ -97,7 +113,6 @@ size_t IncrementalTriangulator::TriangulateImage(const Options& options,
       continue;
     }
 
-    const Point2D& point2D = image.Point2D(point2D_idx);
     ref_corr_data.point2D_idx = point2D_idx;
     ref_corr_data.point2D = &point2D;
 
@@ -188,10 +203,11 @@ size_t IncrementalTriangulator::CompleteImage(const Options& options,
     for (size_t i = 0; i < corrs_data.size(); ++i) {
       const CorrData& corr_data = corrs_data[i];
       point_data[i].point = corr_data.point2D->XY();
-      point_data[i].point_normalized =
-          corr_data.camera->ImageToWorld(point_data[i].point);
-      pose_data[i].proj_matrix = corr_data.image->ProjectionMatrix();
-      pose_data[i].proj_center = corr_data.image->ProjectionCenter();
+      point_data[i].point_normalized = CachedImageToWorld(corr_data);
+      const ImageGeometry& geometry =
+          CachedImageGeometry(corr_data.image_id, *corr_data.image);
+      pose_data[i].proj_matrix = geometry.projection_matrix;
+      pose_data[i].proj_center = geometry.projection_center;
       pose_data[i].camera = corr_data.camera;
     }
 
@@ -414,8 +430,46 @@ void IncrementalTriangulator::ClearModifiedPoints3D() {
 
 void IncrementalTriangulator::ClearCaches() {
   camera_has_bogus_params_.clear();
+  normalized_point_cache_.clear();
+  image_geometry_cache_.clear();
   merge_trials_.clear();
   found_corrs_.clear();
+}
+
+const Eigen::Vector2d& IncrementalTriangulator::CachedImageToWorld(
+    const CorrData& corr_data) {
+  auto cache_it = normalized_point_cache_.find(corr_data.image_id);
+  if (cache_it == normalized_point_cache_.end()) {
+    NormalizedPointCache cache;
+    cache.values.resize(corr_data.image->NumPoints2D());
+    cache.valid.resize(corr_data.image->NumPoints2D(), false);
+    cache_it = normalized_point_cache_
+                   .emplace(corr_data.image_id, std::move(cache))
+                   .first;
+  }
+
+  NormalizedPointCache& cache = cache_it->second;
+  CHECK_LT(corr_data.point2D_idx, cache.values.size());
+  if (!cache.valid[corr_data.point2D_idx]) {
+    cache.values[corr_data.point2D_idx] =
+        corr_data.camera->ImageToWorld(corr_data.point2D->XY());
+    cache.valid[corr_data.point2D_idx] = true;
+  }
+  return cache.values[corr_data.point2D_idx];
+}
+
+const IncrementalTriangulator::ImageGeometry&
+IncrementalTriangulator::CachedImageGeometry(
+    const image_t image_id, const Image& image) {
+  auto cache_it = image_geometry_cache_.find(image_id);
+  if (cache_it == image_geometry_cache_.end()) {
+    ImageGeometry geometry;
+    geometry.projection_matrix = image.ProjectionMatrix();
+    geometry.projection_center = image.ProjectionCenter();
+    cache_it =
+        image_geometry_cache_.emplace(image_id, std::move(geometry)).first;
+  }
+  return cache_it->second;
 }
 
 size_t IncrementalTriangulator::Find(const Options& options,
@@ -497,10 +551,11 @@ size_t IncrementalTriangulator::Create(
   for (size_t i = 0; i < create_corrs_data.size(); ++i) {
     const CorrData& corr_data = create_corrs_data[i];
     point_data[i].point = corr_data.point2D->XY();
-    point_data[i].point_normalized =
-        corr_data.camera->ImageToWorld(point_data[i].point);
-    pose_data[i].proj_matrix = corr_data.image->ProjectionMatrix();
-    pose_data[i].proj_center = corr_data.image->ProjectionCenter();
+    point_data[i].point_normalized = CachedImageToWorld(corr_data);
+    const ImageGeometry& geometry =
+        CachedImageGeometry(corr_data.image_id, *corr_data.image);
+    pose_data[i].proj_matrix = geometry.projection_matrix;
+    pose_data[i].proj_center = geometry.projection_center;
     pose_data[i].camera = corr_data.camera;
   }
 
@@ -563,6 +618,8 @@ size_t IncrementalTriangulator::Continue(
 
   double best_angle_error = std::numeric_limits<double>::max();
   size_t best_idx = std::numeric_limits<size_t>::max();
+  const Eigen::Vector2d& point_normalized =
+      CachedImageToWorld(ref_corr_data);
 
   for (size_t idx = 0; idx < corrs_data.size(); ++idx) {
     const CorrData& corr_data = corrs_data[idx];
@@ -573,9 +630,9 @@ size_t IncrementalTriangulator::Continue(
     const Point3D& point3D =
         reconstruction_->Point3D(corr_data.point2D->Point3DId());
 
-    const double angle_error = CalculateAngularError(
-        ref_corr_data.point2D->XY(), point3D.XYZ(), ref_corr_data.image->Qvec(),
-        ref_corr_data.image->Tvec(), *ref_corr_data.camera);
+    const double angle_error = CalculateNormalizedAngularError(
+        point_normalized, point3D.XYZ(), ref_corr_data.image->Qvec(),
+        ref_corr_data.image->Tvec());
     if (angle_error < best_angle_error) {
       best_angle_error = angle_error;
       best_idx = idx;

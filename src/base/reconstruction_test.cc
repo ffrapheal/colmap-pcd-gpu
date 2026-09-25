@@ -34,9 +34,13 @@
 
 #include "base/camera_models.h"
 #include "base/correspondence_graph.h"
+#include "base/database_cache.h"
 #include "base/pose.h"
 #include "base/reconstruction.h"
 #include "base/similarity_transform.h"
+
+#include <thread>
+#include <utility>
 
 using namespace colmap;
 
@@ -63,6 +67,31 @@ void GenerateReconstruction(const image_t num_images,
   }
 
   reconstruction->SetUp(correspondence_graph);
+}
+
+Camera MakeIncrementalCamera(const camera_t camera_id,
+                             const size_t width = 10,
+                             const size_t height = 10) {
+  Camera camera;
+  camera.SetCameraId(camera_id);
+  camera.InitializeWithId(SimplePinholeCameraModel::model_id, 10, width,
+                          height);
+  return camera;
+}
+
+Image MakeIncrementalImage(const image_t image_id, const camera_t camera_id,
+                           const size_t num_points2D = 3) {
+  Image image;
+  image.SetImageId(image_id);
+  image.SetCameraId(camera_id);
+  image.SetName("image" + std::to_string(image_id));
+  std::vector<Eigen::Vector2d> points2D;
+  points2D.reserve(num_points2D);
+  for (size_t idx = 0; idx < num_points2D; ++idx) {
+    points2D.emplace_back(idx + 1, idx + 1);
+  }
+  image.SetPoints2D(points2D);
+  return image;
 }
 
 BOOST_AUTO_TEST_CASE(TestEmpty) {
@@ -107,6 +136,510 @@ BOOST_AUTO_TEST_CASE(TestAddImage) {
   BOOST_CHECK_EQUAL(reconstruction.NumRegImages(), 0);
   BOOST_CHECK_EQUAL(reconstruction.NumPoints3D(), 0);
   BOOST_CHECK_EQUAL(reconstruction.NumImagePairs(), 0);
+}
+
+static_assert(
+    noexcept(std::declval<Reconstruction&>().CommitPreparedTransaction(
+        std::declval<ReconstructionTransaction*>())),
+    "prepared Reconstruction publication must be noexcept");
+
+BOOST_AUTO_TEST_CASE(TestTransactionPublishesCandidateAndJournalAtomically) {
+  Reconstruction reconstruction;
+  CorrespondenceGraph correspondence_graph;
+  GenerateReconstruction(2, &reconstruction, &correspondence_graph);
+  reconstruction.BeginStructureJournal(701, 16);
+  const ReconstructionCanonicalVersion before =
+      reconstruction.CanonicalVersion();
+
+  ReconstructionTransaction transaction;
+  BOOST_REQUIRE(
+      reconstruction.CreateTransactionSnapshot(&transaction).IsSuccess());
+  Reconstruction* candidate = transaction.MutableCandidate();
+  BOOST_REQUIRE(candidate != nullptr);
+  candidate->Image(1).SetTvec(Eigen::Vector3d(1.0, 2.0, 3.0));
+  Track track;
+  track.AddElement(1, 0);
+  const point3D_t point3D_id =
+      candidate->AddPoint3D(Eigen::Vector3d(4.0, 5.0, 6.0), track);
+
+  BOOST_CHECK_EQUAL(reconstruction.NumPoints3D(), 0);
+  BOOST_CHECK(reconstruction.Image(1).Tvec() == Eigen::Vector3d::Zero());
+  BOOST_REQUIRE(
+      reconstruction.PrepareTransactionCommit(&transaction).IsSuccess());
+  BOOST_REQUIRE(
+      reconstruction.ValidatePreparedTransaction(transaction).IsSuccess());
+  reconstruction.CommitPreparedTransaction(&transaction);
+
+  BOOST_CHECK(!transaction.HasCandidate());
+  BOOST_CHECK_EQUAL(reconstruction.NumPoints3D(), 1);
+  BOOST_CHECK(reconstruction.Point3D(point3D_id).XYZ() ==
+              Eigen::Vector3d(4.0, 5.0, 6.0));
+  BOOST_CHECK(reconstruction.Image(1).Tvec() ==
+              Eigen::Vector3d(1.0, 2.0, 3.0));
+  BOOST_CHECK_EQUAL(reconstruction.StructureOwnerEpoch(),
+                    before.structure_owner_epoch);
+  BOOST_CHECK_EQUAL(reconstruction.StructureRevision(),
+                    before.structure_revision + 1);
+  BOOST_CHECK_EQUAL(reconstruction.CanonicalVersion().publish_version,
+                    before.publish_version + 1);
+  BOOST_CHECK_EQUAL(
+      reconstruction.CanonicalVersion().correspondence_graph_identity,
+      before.correspondence_graph_identity);
+
+  const ReconstructionStructureReadResult journal =
+      reconstruction.ReadStructureEventsSince(before.structure_owner_epoch,
+                                               before.structure_revision);
+  BOOST_REQUIRE(journal.complete);
+  BOOST_CHECK(!journal.gap);
+  BOOST_REQUIRE_EQUAL(journal.batches.size(), 1);
+  BOOST_REQUIRE_EQUAL(journal.batches.front().events.size(), 1);
+  BOOST_CHECK(journal.batches.front().events.front().kind ==
+              ReconstructionStructureEventKind::kPointAdded);
+  BOOST_CHECK_EQUAL(journal.batches.front().events.front().point3D_id,
+                    point3D_id);
+
+  reconstruction.DeleteObservation(1, 0);
+  BOOST_CHECK_EQUAL(reconstruction.NumPoints3D(), 0);
+  reconstruction.EndStructureJournal();
+}
+
+BOOST_AUTO_TEST_CASE(TestTransactionFailureLeavesCanonicalUntouched) {
+  Reconstruction reconstruction;
+  CorrespondenceGraph correspondence_graph;
+  GenerateReconstruction(1, &reconstruction, &correspondence_graph);
+  reconstruction.BeginStructureJournal(702, 8);
+  const ReconstructionCanonicalVersion before =
+      reconstruction.CanonicalVersion();
+
+  ReconstructionTransaction wrong_thread_transaction;
+  ReconstructionTransactionResult wrong_thread_result;
+  std::thread worker([&]() {
+    wrong_thread_result = reconstruction.CreateTransactionSnapshot(
+        &wrong_thread_transaction);
+  });
+  worker.join();
+  BOOST_CHECK(wrong_thread_result.status ==
+              ReconstructionTransactionStatus::WRONG_THREAD);
+  BOOST_CHECK(!wrong_thread_transaction.HasCandidate());
+
+  ReconstructionTransaction transaction;
+  BOOST_REQUIRE(
+      reconstruction.CreateTransactionSnapshot(&transaction).IsSuccess());
+  Reconstruction* candidate = transaction.MutableCandidate();
+  BOOST_REQUIRE(candidate != nullptr);
+  candidate->Image(1).SetTvec(Eigen::Vector3d(9.0, 8.0, 7.0));
+  candidate->EndStructureJournal();
+
+  const ReconstructionTransactionResult result =
+      reconstruction.PrepareTransactionCommit(&transaction);
+  BOOST_CHECK(result.status ==
+              ReconstructionTransactionStatus::STRUCTURE_JOURNAL_MISMATCH);
+  BOOST_CHECK(reconstruction.CanonicalVersion() == before);
+  BOOST_CHECK(reconstruction.Image(1).Tvec() == Eigen::Vector3d::Zero());
+  const ReconstructionStructureReadResult journal =
+      reconstruction.ReadStructureEventsSince(before.structure_owner_epoch,
+                                               before.structure_revision);
+  BOOST_CHECK(journal.complete);
+  BOOST_CHECK(journal.batches.empty());
+  reconstruction.EndStructureJournal();
+}
+
+BOOST_AUTO_TEST_CASE(TestTransactionDetectsCanonicalVersionDrift) {
+  Reconstruction reconstruction;
+  CorrespondenceGraph correspondence_graph;
+  GenerateReconstruction(1, &reconstruction, &correspondence_graph);
+  reconstruction.BeginStructureJournal(703, 8);
+  const ReconstructionCanonicalVersion before =
+      reconstruction.CanonicalVersion();
+
+  ReconstructionTransaction transaction;
+  BOOST_REQUIRE(
+      reconstruction.CreateTransactionSnapshot(&transaction).IsSuccess());
+  Reconstruction* candidate = transaction.MutableCandidate();
+  BOOST_REQUIRE(candidate != nullptr);
+  candidate->Image(1).SetTvec(Eigen::Vector3d(3.0, 2.0, 1.0));
+  reconstruction.MarkStructureUnknown("canonical drift");
+
+  const ReconstructionTransactionResult result =
+      reconstruction.PrepareTransactionCommit(&transaction);
+  BOOST_CHECK(result.status ==
+              ReconstructionTransactionStatus::STALE_CANONICAL_VERSION);
+  BOOST_CHECK(reconstruction.Image(1).Tvec() == Eigen::Vector3d::Zero());
+  BOOST_CHECK_EQUAL(reconstruction.CanonicalVersion().publish_version,
+                    before.publish_version);
+  BOOST_CHECK_EQUAL(reconstruction.StructureRevision(),
+                    before.structure_revision + 1);
+  const ReconstructionStructureReadResult journal =
+      reconstruction.ReadStructureEventsSince(before.structure_owner_epoch,
+                                               before.structure_revision);
+  BOOST_REQUIRE_EQUAL(journal.batches.size(), 1);
+  BOOST_CHECK(journal.batches.front().events.front().reason ==
+              "canonical drift");
+  reconstruction.EndStructureJournal();
+}
+
+BOOST_AUTO_TEST_CASE(TestIncrementalImageAndPairSynchronization) {
+  DatabaseCache database_cache;
+  Reconstruction reconstruction;
+  reconstruction.Load(database_cache);
+  reconstruction.SetUp(&database_cache.CorrespondenceGraph());
+
+  const Camera camera = MakeIncrementalCamera(1);
+  database_cache.AddCamera(camera);
+  database_cache.AddImage(MakeIncrementalImage(1, camera.CameraId()));
+
+  BOOST_CHECK(reconstruction.AddImageFromDatabaseCache(database_cache, 1));
+  BOOST_CHECK_EQUAL(reconstruction.NumCameras(), 1);
+  BOOST_CHECK_EQUAL(reconstruction.NumImages(), 1);
+  BOOST_CHECK_EQUAL(reconstruction.Image(1).NumPoints2D(), 3);
+  BOOST_CHECK_EQUAL(reconstruction.Image(1).Point2D(1).X(), 2);
+  BOOST_CHECK_EQUAL(reconstruction.Image(1).Point2D(1).Y(), 2);
+  BOOST_CHECK_EQUAL(reconstruction.Image(1).NumObservations(), 0);
+  BOOST_CHECK_EQUAL(reconstruction.Image(1).NumCorrespondences(), 0);
+  BOOST_CHECK(!reconstruction.AddImageFromDatabaseCache(database_cache, 1));
+  BOOST_CHECK_EQUAL(reconstruction.NumCameras(), 1);
+  BOOST_CHECK_EQUAL(reconstruction.NumImages(), 1);
+
+  reconstruction.RegisterImage(1);
+  Track track;
+  track.AddElement(1, 0);
+  const point3D_t point3D_id =
+      reconstruction.AddPoint3D(Eigen::Vector3d::Zero(), track);
+
+  database_cache.AddImage(MakeIncrementalImage(2, camera.CameraId()));
+  BOOST_CHECK(reconstruction.AddImageFromDatabaseCache(database_cache, 2));
+
+  const FeatureMatches raw_matches = {
+      FeatureMatch(0, 0), FeatureMatch(0, 1), FeatureMatch(1, 1),
+      FeatureMatch(1, 1), FeatureMatch(3, 2)};
+  const auto add_pair_result =
+      database_cache.AddVerifiedCorrespondences(1, 2, raw_matches);
+  BOOST_REQUIRE(add_pair_result.IsSuccess());
+  BOOST_CHECK_EQUAL(add_pair_result.num_added_matches, 2);
+  BOOST_CHECK_EQUAL(add_pair_result.num_rejected_matches, 3);
+
+  const FeatureMatches accepted_matches =
+      database_cache.CorrespondenceGraph()
+          .FindCorrespondencesBetweenImages(1, 2);
+  BOOST_REQUIRE_EQUAL(accepted_matches.size(), 2);
+  BOOST_CHECK_EQUAL(accepted_matches[0].point2D_idx1, 0);
+  BOOST_CHECK_EQUAL(accepted_matches[0].point2D_idx2, 0);
+  BOOST_CHECK_EQUAL(accepted_matches[1].point2D_idx1, 1);
+  BOOST_CHECK_EQUAL(accepted_matches[1].point2D_idx2, 1);
+
+  BOOST_CHECK(reconstruction.AddImagePairFromCorrespondenceGraph(1, 2));
+  BOOST_CHECK_EQUAL(reconstruction.NumImagePairs(), 1);
+  BOOST_CHECK_EQUAL(reconstruction.ImagePair(1, 2).num_total_corrs, 2);
+  BOOST_CHECK_EQUAL(reconstruction.ImagePair(1, 2).num_tri_corrs, 0);
+  BOOST_CHECK_EQUAL(reconstruction.Image(1).NumObservations(), 2);
+  BOOST_CHECK_EQUAL(reconstruction.Image(1).NumCorrespondences(), 2);
+  BOOST_CHECK_EQUAL(reconstruction.Image(2).NumObservations(), 2);
+  BOOST_CHECK_EQUAL(reconstruction.Image(2).NumCorrespondences(), 2);
+  BOOST_CHECK_EQUAL(reconstruction.Image(1).NumVisiblePoints3D(), 0);
+  BOOST_CHECK_EQUAL(reconstruction.Image(2).NumVisiblePoints3D(), 1);
+  BOOST_CHECK_EQUAL(
+      database_cache.CorrespondenceGraph().NumObservationsForImage(1), 2);
+  BOOST_CHECK_EQUAL(
+      database_cache.CorrespondenceGraph().NumCorrespondencesForImage(1), 2);
+  BOOST_CHECK_EQUAL(
+      database_cache.CorrespondenceGraph().NumObservationsForImage(2), 2);
+  BOOST_CHECK_EQUAL(
+      database_cache.CorrespondenceGraph().NumCorrespondencesForImage(2), 2);
+
+  database_cache.AddImage(MakeIncrementalImage(3, camera.CameraId()));
+  BOOST_CHECK(reconstruction.AddImageFromDatabaseCache(database_cache, 3));
+  BOOST_CHECK(!reconstruction.AddImagePairFromCorrespondenceGraph(2, 1));
+  BOOST_CHECK(!reconstruction.AddImagePairFromCorrespondenceGraph(1, 1));
+  BOOST_CHECK(!reconstruction.AddImagePairFromCorrespondenceGraph(1, 99));
+  BOOST_CHECK(!reconstruction.AddImagePairFromCorrespondenceGraph(2, 3));
+  BOOST_CHECK_EQUAL(reconstruction.NumImagePairs(), 1);
+  BOOST_CHECK_EQUAL(reconstruction.ImagePair(1, 2).num_total_corrs, 2);
+  BOOST_CHECK_EQUAL(reconstruction.ImagePair(1, 2).num_tri_corrs, 0);
+  BOOST_CHECK_EQUAL(reconstruction.Image(1).NumObservations(), 2);
+  BOOST_CHECK_EQUAL(reconstruction.Image(1).NumCorrespondences(), 2);
+  BOOST_CHECK_EQUAL(reconstruction.Image(1).NumVisiblePoints3D(), 0);
+  BOOST_CHECK_EQUAL(reconstruction.Image(2).NumObservations(), 2);
+  BOOST_CHECK_EQUAL(reconstruction.Image(2).NumCorrespondences(), 2);
+  BOOST_CHECK_EQUAL(reconstruction.Image(2).NumVisiblePoints3D(), 1);
+
+  reconstruction.RegisterImage(2);
+  reconstruction.AddObservation(point3D_id, TrackElement(2, 0));
+  BOOST_CHECK_EQUAL(reconstruction.ImagePair(1, 2).num_tri_corrs, 1);
+  BOOST_CHECK_EQUAL(reconstruction.Image(1).NumVisiblePoints3D(), 1);
+  BOOST_CHECK_EQUAL(reconstruction.Image(2).NumVisiblePoints3D(), 1);
+}
+
+BOOST_AUTO_TEST_CASE(TestIncrementalPairStartsWithTriangulatedMatch) {
+  DatabaseCache database_cache;
+  Reconstruction reconstruction;
+  reconstruction.Load(database_cache);
+  reconstruction.SetUp(&database_cache.CorrespondenceGraph());
+
+  const Camera camera = MakeIncrementalCamera(1);
+  database_cache.AddCamera(camera);
+  database_cache.AddImage(MakeIncrementalImage(1, camera.CameraId()));
+  database_cache.AddImage(MakeIncrementalImage(2, camera.CameraId()));
+  BOOST_REQUIRE(reconstruction.AddImageFromDatabaseCache(database_cache, 1));
+  BOOST_REQUIRE(reconstruction.AddImageFromDatabaseCache(database_cache, 2));
+  reconstruction.RegisterImage(1);
+  reconstruction.RegisterImage(2);
+
+  Track track;
+  track.AddElement(1, 0);
+  track.AddElement(2, 0);
+  reconstruction.AddPoint3D(Eigen::Vector3d::Zero(), track);
+
+  const auto add_pair_result = database_cache.AddVerifiedCorrespondences(
+      1, 2, {FeatureMatch(0, 0)});
+  BOOST_REQUIRE(add_pair_result.IsSuccess());
+  BOOST_CHECK(reconstruction.AddImagePairFromCorrespondenceGraph(1, 2));
+  BOOST_CHECK_EQUAL(reconstruction.ImagePair(1, 2).num_total_corrs, 1);
+  BOOST_CHECK_EQUAL(reconstruction.ImagePair(1, 2).num_tri_corrs, 1);
+  BOOST_CHECK_EQUAL(reconstruction.Image(1).NumVisiblePoints3D(), 1);
+  BOOST_CHECK_EQUAL(reconstruction.Image(2).NumVisiblePoints3D(), 1);
+}
+
+BOOST_AUTO_TEST_CASE(TestIncrementalImageSynchronizationRejectsInvalidInput) {
+  {
+    DatabaseCache database_cache;
+    const Camera camera = MakeIncrementalCamera(1);
+    database_cache.AddCamera(camera);
+    database_cache.AddImage(MakeIncrementalImage(1, camera.CameraId()));
+
+    Reconstruction reconstruction;
+    BOOST_CHECK(!reconstruction.AddImageFromDatabaseCache(database_cache, 1));
+    BOOST_CHECK_EQUAL(reconstruction.NumCameras(), 0);
+    BOOST_CHECK_EQUAL(reconstruction.NumImages(), 0);
+
+    CorrespondenceGraph other_correspondence_graph;
+    reconstruction.SetUp(&other_correspondence_graph);
+    BOOST_CHECK(!reconstruction.AddImageFromDatabaseCache(database_cache, 1));
+    BOOST_CHECK_EQUAL(reconstruction.NumCameras(), 0);
+    BOOST_CHECK_EQUAL(reconstruction.NumImages(), 0);
+  }
+
+  {
+    DatabaseCache database_cache;
+    Reconstruction reconstruction;
+    reconstruction.Load(database_cache);
+    reconstruction.SetUp(&database_cache.CorrespondenceGraph());
+    BOOST_CHECK(!reconstruction.AddImageFromDatabaseCache(database_cache, 1));
+    BOOST_CHECK_EQUAL(reconstruction.NumCameras(), 0);
+    BOOST_CHECK_EQUAL(reconstruction.NumImages(), 0);
+
+    Image image;
+    image.SetImageId(1);
+    image.SetPoints2D(std::vector<Eigen::Vector2d>(1));
+    database_cache.AddImage(image);
+    BOOST_CHECK(!reconstruction.AddImageFromDatabaseCache(database_cache, 1));
+    BOOST_CHECK_EQUAL(reconstruction.NumCameras(), 0);
+    BOOST_CHECK_EQUAL(reconstruction.NumImages(), 0);
+  }
+
+  {
+    DatabaseCache database_cache;
+    Reconstruction reconstruction;
+    reconstruction.Load(database_cache);
+    reconstruction.SetUp(&database_cache.CorrespondenceGraph());
+
+    Camera invalid_camera;
+    invalid_camera.SetCameraId(1);
+    database_cache.AddCamera(invalid_camera);
+    database_cache.AddImage(MakeIncrementalImage(1, 1));
+    BOOST_CHECK(!reconstruction.AddImageFromDatabaseCache(database_cache, 1));
+    BOOST_CHECK_EQUAL(reconstruction.NumCameras(), 0);
+    BOOST_CHECK_EQUAL(reconstruction.NumImages(), 0);
+  }
+
+  {
+    DatabaseCache database_cache;
+    Reconstruction reconstruction;
+    reconstruction.Load(database_cache);
+    reconstruction.SetUp(&database_cache.CorrespondenceGraph());
+
+    const Camera camera = MakeIncrementalCamera(1);
+    database_cache.AddCamera(camera);
+    database_cache.AddImage(MakeIncrementalImage(1, camera.CameraId()));
+    database_cache.Image(1).SetRegistered(true);
+    BOOST_CHECK(!reconstruction.AddImageFromDatabaseCache(database_cache, 1));
+    BOOST_CHECK_EQUAL(reconstruction.NumCameras(), 0);
+    BOOST_CHECK_EQUAL(reconstruction.NumImages(), 0);
+  }
+
+  {
+    DatabaseCache database_cache;
+    Reconstruction reconstruction;
+    reconstruction.Load(database_cache);
+    reconstruction.SetUp(&database_cache.CorrespondenceGraph());
+
+    const Camera camera = MakeIncrementalCamera(1);
+    database_cache.AddCamera(camera);
+    database_cache.AddImage(MakeIncrementalImage(1, camera.CameraId()));
+    Camera mismatched_camera = camera;
+    mismatched_camera.SetWidth(camera.Width() + 1);
+    reconstruction.AddCamera(mismatched_camera);
+
+    BOOST_CHECK(!reconstruction.AddImageFromDatabaseCache(database_cache, 1));
+    BOOST_CHECK_EQUAL(reconstruction.NumCameras(), 1);
+    BOOST_CHECK_EQUAL(reconstruction.NumImages(), 0);
+    BOOST_CHECK_EQUAL(reconstruction.Camera(1).Width(), camera.Width() + 1);
+  }
+}
+
+BOOST_AUTO_TEST_CASE(
+    TestIncrementalImageSynchronizationRejectsStalePoint3DState) {
+  {
+    DatabaseCache database_cache;
+    Reconstruction reconstruction;
+    reconstruction.Load(database_cache);
+    reconstruction.SetUp(&database_cache.CorrespondenceGraph());
+
+    const Camera camera = MakeIncrementalCamera(1);
+    database_cache.AddCamera(camera);
+    Image image = MakeIncrementalImage(1, camera.CameraId());
+    image.SetPoint3DForPoint2D(0, 7);
+    image.Point2D(0).SetPoint3DId(kInvalidPoint3DId);
+    BOOST_REQUIRE_EQUAL(image.NumPoints3D(), 1);
+    BOOST_REQUIRE(!image.Point2D(0).HasPoint3D());
+    database_cache.AddImage(std::move(image));
+
+    BOOST_CHECK(!reconstruction.AddImageFromDatabaseCache(database_cache, 1));
+    BOOST_CHECK_EQUAL(reconstruction.NumCameras(), 0);
+    BOOST_CHECK_EQUAL(reconstruction.NumImages(), 0);
+  }
+
+  {
+    DatabaseCache database_cache;
+    Reconstruction reconstruction;
+    reconstruction.Load(database_cache);
+    reconstruction.SetUp(&database_cache.CorrespondenceGraph());
+
+    const Camera camera = MakeIncrementalCamera(1);
+    database_cache.AddCamera(camera);
+    Image image = MakeIncrementalImage(1, camera.CameraId());
+    image.Point2D(0).SetPoint3DId(7);
+    BOOST_REQUIRE_EQUAL(image.NumPoints3D(), 0);
+    BOOST_REQUIRE(image.Point2D(0).HasPoint3D());
+    database_cache.AddImage(std::move(image));
+
+    BOOST_CHECK(!reconstruction.AddImageFromDatabaseCache(database_cache, 1));
+    BOOST_CHECK_EQUAL(reconstruction.NumCameras(), 0);
+    BOOST_CHECK_EQUAL(reconstruction.NumImages(), 0);
+  }
+}
+
+BOOST_AUTO_TEST_CASE(
+    TestIncrementalImageSynchronizationRejectsStaleVisiblePointState) {
+  DatabaseCache database_cache;
+  Reconstruction reconstruction;
+  reconstruction.Load(database_cache);
+  reconstruction.SetUp(&database_cache.CorrespondenceGraph());
+
+  const Camera camera = MakeIncrementalCamera(1);
+  database_cache.AddCamera(camera);
+  Image image = MakeIncrementalImage(1, camera.CameraId());
+  image.SetNumObservations(1);
+  image.SetUp(camera);
+  image.IncrementCorrespondenceHasPoint3D(0);
+  BOOST_REQUIRE_EQUAL(image.NumPoints3D(), 0);
+  BOOST_REQUIRE_EQUAL(image.NumVisiblePoints3D(), 1);
+  database_cache.AddImage(std::move(image));
+
+  BOOST_CHECK(!reconstruction.AddImageFromDatabaseCache(database_cache, 1));
+  BOOST_CHECK_EQUAL(reconstruction.NumCameras(), 0);
+  BOOST_CHECK_EQUAL(reconstruction.NumImages(), 0);
+}
+
+BOOST_AUTO_TEST_CASE(TestIncrementalPairSynchronizationRejectsMissingGraph) {
+  {
+    const Camera camera = MakeIncrementalCamera(1);
+    Reconstruction reconstruction;
+    reconstruction.AddCamera(camera);
+    reconstruction.AddImage(MakeIncrementalImage(1, camera.CameraId()));
+    reconstruction.AddImage(MakeIncrementalImage(2, camera.CameraId()));
+
+    BOOST_CHECK(!reconstruction.AddImagePairFromCorrespondenceGraph(1, 2));
+    BOOST_CHECK_EQUAL(reconstruction.NumImagePairs(), 0);
+    BOOST_CHECK_EQUAL(reconstruction.Image(1).NumVisiblePoints3D(), 0);
+    BOOST_CHECK_EQUAL(reconstruction.Image(2).NumVisiblePoints3D(), 0);
+
+    CorrespondenceGraph correspondence_graph;
+    correspondence_graph.AddImage(1, 3);
+    reconstruction.SetUp(&correspondence_graph);
+    BOOST_CHECK(!reconstruction.AddImagePairFromCorrespondenceGraph(1, 2));
+    BOOST_CHECK_EQUAL(reconstruction.NumImagePairs(), 0);
+    BOOST_CHECK_EQUAL(reconstruction.Image(1).NumObservations(), 0);
+    BOOST_CHECK_EQUAL(reconstruction.Image(2).NumObservations(), 0);
+    BOOST_CHECK_EQUAL(reconstruction.Image(1).NumVisiblePoints3D(), 0);
+    BOOST_CHECK_EQUAL(reconstruction.Image(2).NumVisiblePoints3D(), 0);
+  }
+
+  {
+    const Camera camera = MakeIncrementalCamera(1);
+    Reconstruction reconstruction;
+    reconstruction.AddCamera(camera);
+    reconstruction.AddImage(MakeIncrementalImage(1, camera.CameraId(), 1));
+    reconstruction.AddImage(MakeIncrementalImage(2, camera.CameraId(), 1));
+
+    CorrespondenceGraph correspondence_graph;
+    correspondence_graph.AddImage(1, 2);
+    correspondence_graph.AddImage(2, 2);
+    BOOST_REQUIRE(correspondence_graph
+                      .TryAddCorrespondences(1, 2, {FeatureMatch(1, 1)})
+                      .IsSuccess());
+    reconstruction.SetUp(&correspondence_graph);
+
+    BOOST_CHECK(!reconstruction.AddImagePairFromCorrespondenceGraph(1, 2));
+    BOOST_CHECK_EQUAL(reconstruction.NumImagePairs(), 0);
+    BOOST_CHECK_EQUAL(reconstruction.Image(1).NumObservations(), 0);
+    BOOST_CHECK_EQUAL(reconstruction.Image(2).NumObservations(), 0);
+    BOOST_CHECK_EQUAL(reconstruction.Image(1).NumVisiblePoints3D(), 0);
+    BOOST_CHECK_EQUAL(reconstruction.Image(2).NumVisiblePoints3D(), 0);
+  }
+}
+
+BOOST_AUTO_TEST_CASE(
+    TestIncrementalPairSynchronizationRejectsDanglingPoint3D) {
+  DatabaseCache database_cache;
+  Reconstruction reconstruction;
+  reconstruction.Load(database_cache);
+  reconstruction.SetUp(&database_cache.CorrespondenceGraph());
+
+  const Camera camera = MakeIncrementalCamera(1);
+  database_cache.AddCamera(camera);
+  database_cache.AddImage(MakeIncrementalImage(1, camera.CameraId()));
+  database_cache.AddImage(MakeIncrementalImage(2, camera.CameraId()));
+  BOOST_REQUIRE(reconstruction.AddImageFromDatabaseCache(database_cache, 1));
+  BOOST_REQUIRE(reconstruction.AddImageFromDatabaseCache(database_cache, 2));
+
+  const auto add_pair_result = database_cache.AddVerifiedCorrespondences(
+      1, 2, {FeatureMatch(0, 0)});
+  BOOST_REQUIRE(add_pair_result.IsSuccess());
+  reconstruction.Image(1).SetPoint3DForPoint2D(0, 7);
+  BOOST_REQUIRE(!reconstruction.ExistsPoint3D(7));
+
+  const point2D_t image1_num_observations =
+      reconstruction.Image(1).NumObservations();
+  const point2D_t image1_num_correspondences =
+      reconstruction.Image(1).NumCorrespondences();
+  const point2D_t image2_num_observations =
+      reconstruction.Image(2).NumObservations();
+  const point2D_t image2_num_correspondences =
+      reconstruction.Image(2).NumCorrespondences();
+
+  BOOST_CHECK(!reconstruction.AddImagePairFromCorrespondenceGraph(1, 2));
+  BOOST_CHECK(!reconstruction.ExistsImagePair(1, 2));
+  BOOST_CHECK_EQUAL(reconstruction.NumImagePairs(), 0);
+  BOOST_CHECK_EQUAL(reconstruction.Image(1).NumObservations(),
+                    image1_num_observations);
+  BOOST_CHECK_EQUAL(reconstruction.Image(1).NumCorrespondences(),
+                    image1_num_correspondences);
+  BOOST_CHECK_EQUAL(reconstruction.Image(2).NumObservations(),
+                    image2_num_observations);
+  BOOST_CHECK_EQUAL(reconstruction.Image(2).NumCorrespondences(),
+                    image2_num_correspondences);
+  BOOST_CHECK_EQUAL(reconstruction.Image(1).NumVisiblePoints3D(), 0);
+  BOOST_CHECK_EQUAL(reconstruction.Image(2).NumVisiblePoints3D(), 0);
 }
 
 BOOST_AUTO_TEST_CASE(TestAddPoint3D) {

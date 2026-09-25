@@ -33,31 +33,47 @@ set(FOLDER_NAME "exe")
 if(IS_MSVC)
     add_compile_options("/bigobj")
 endif()
-set(GPU_BA_EXE_SOURCES)
+set(EXE_SOURCES
+    feature.h feature.cc
+    sfm.h sfm.cc
+)
+
+set(ONLINE_I3DGS_REPLAY_SOURCES)
+if(GPU_BA_CUDA_ENABLED)
+    find_library(ONLINE_I3DGS_JSONCPP_LIBRARY NAMES jsoncpp)
+    if(NOT ONLINE_I3DGS_JSONCPP_LIBRARY)
+        message(FATAL_ERROR "online_i3dgs_mapper requires JsonCpp")
+    endif()
+    list(APPEND ONLINE_I3DGS_REPLAY_SOURCES
+        online_i3dgs_replay.h online_i3dgs_replay.cc)
+endif()
+
 if(GPU_BA_ENABLED)
-    list(APPEND GPU_BA_EXE_SOURCES gpu_ba.cc)
+    list(APPEND EXE_SOURCES gpu_ba.h gpu_ba.cc)
 endif()
 
 COLMAP_ADD_EXECUTABLE(colmap_exe
     colmap.cc
     database.cc
-    feature.cc
+    ${EXE_SOURCES}
+    ${ONLINE_I3DGS_REPLAY_SOURCES}
     gui.cc
     image.cc
     model.cc
     mvs.cc
-    sfm.cc
-    vocab_tree.cc
-    ${GPU_BA_EXE_SOURCES})
+    vocab_tree.cc)
 set_target_properties(colmap_exe PROPERTIES OUTPUT_NAME colmap)
 if(GPU_BA_CUDA_ENABLED)
-    target_link_libraries(colmap_exe gpu_ba_custom_cuda)
+    target_link_libraries(colmap_exe
+        gpu_ba_custom_cuda
+        ${ONLINE_I3DGS_JSONCPP_LIBRARY})
+    COLMAP_ADD_TEST(online_i3dgs_replay_test
+        online_i3dgs_replay_test.cc
+        online_i3dgs_replay.cc)
+    if(TESTS_ENABLED)
+        target_link_libraries(online_i3dgs_replay_test
+            ${ONLINE_I3DGS_JSONCPP_LIBRARY})
+    endif()
 endif()
 
-COLMAP_ADD_SOURCES(
-    feature.h feature.cc
-    sfm.h sfm.cc
-)
-if(GPU_BA_ENABLED)
-    COLMAP_ADD_SOURCES(gpu_ba.h gpu_ba.cc)
-endif()
+COLMAP_ADD_SOURCES(${EXE_SOURCES})

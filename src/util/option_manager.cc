@@ -656,6 +656,8 @@ void OptionManager::AddMapperOptions() {
                               &mapper->ba_local_max_num_iterations);
   AddAndRegisterDefaultOption("Mapper.ba_global_use_pba",
                               &mapper->ba_global_use_pba);
+  AddAndRegisterDefaultOption("Mapper.ba_global_enabled",
+                              &mapper->ba_global_enabled);
   AddAndRegisterDefaultOption("Mapper.ba_global_pba_gpu_index",
                               &mapper->ba_global_pba_gpu_index);
   AddAndRegisterDefaultOption("Mapper.ba_global_images_ratio",

@@ -48,10 +48,35 @@ void DatabaseCache::AddCamera(class Camera camera) {
 }
 
 void DatabaseCache::AddImage(class Image image) {
-  const image_t image_id = image.ImageId();
-  CHECK(!ExistsImage(image_id));
-  correspondence_graph_.AddImage(image_id, image.NumPoints2D());
-  images_.emplace(image_id, std::move(image));
+  const AddImageResult result = AddImageInternal(std::move(image));
+  CHECK(result.IsSuccess()) << "Cannot add image to database cache";
+}
+
+DatabaseCache::AddImageResult DatabaseCache::AddImageWithKeypoints(
+    class Image image, const FeatureKeypoints& keypoints) {
+  const AddImageResult validation = ValidateNewImageId(image.ImageId());
+  if (!validation.IsSuccess()) {
+    return validation;
+  }
+  image.SetPoints2D(FeatureKeypointsToPointsVector(keypoints));
+  image.SetNumObservations(0);
+  image.SetNumCorrespondences(0);
+  return AddImageInternal(std::move(image));
+}
+
+DatabaseCache::AddCorrespondencesResult
+DatabaseCache::AddVerifiedCorrespondences(const image_t image_id1,
+                                          const image_t image_id2,
+                                          const FeatureMatches& matches) {
+  AddCorrespondencesResult result = correspondence_graph_.TryAddCorrespondences(
+      image_id1, image_id2, matches);
+  if (result.observation_counts_recomputed) {
+    SynchronizeAllImageStatistics();
+  } else if (result.IsSuccess()) {
+    SynchronizeImageStatistics(image_id1);
+    SynchronizeImageStatistics(image_id2);
+  }
+  return result;
 }
 
 void DatabaseCache::Load(const Database& database, const size_t min_num_matches,
@@ -197,18 +222,67 @@ void DatabaseCache::Load(const Database& database, const size_t min_num_matches,
   correspondence_graph_.Finalize();
 
   // Set number of observations and correspondences per image.
-  for (auto& image : images_) {
-    
-    image.second.SetNumObservations(
-        correspondence_graph_.NumObservationsForImage(image.first));
-    // Get the number of correspondences per image.
-    image.second.SetNumCorrespondences(
-        correspondence_graph_.NumCorrespondencesForImage(image.first));
-  }
+  SynchronizeAllImageStatistics();
 
   std::cout << StringPrintf(" in %.3fs (ignored %d)", timer.ElapsedSeconds(),
                             num_ignored_image_pairs)
             << std::endl;
+}
+
+DatabaseCache::AddImageResult DatabaseCache::ValidateNewImageId(
+    const image_t image_id) const {
+  AddImageResult result;
+  if (image_id == kInvalidImageId || image_id >= Database::kMaxNumImages) {
+    result.status = CorrespondenceGraph::AddImageStatus::INVALID_IMAGE_ID;
+  } else if (ExistsImage(image_id)) {
+    result.status = CorrespondenceGraph::AddImageStatus::DUPLICATE_IMAGE;
+  }
+  return result;
+}
+
+DatabaseCache::AddImageResult DatabaseCache::AddImageInternal(
+    class Image image) {
+  const image_t image_id = image.ImageId();
+  const AddImageResult validation = ValidateNewImageId(image_id);
+  if (!validation.IsSuccess()) {
+    return validation;
+  }
+
+  const auto insertion = images_.emplace(image_id, std::move(image));
+  if (!insertion.second) {
+    AddImageResult result;
+    result.status = CorrespondenceGraph::AddImageStatus::DUPLICATE_IMAGE;
+    return result;
+  }
+
+  AddImageResult result;
+  try {
+    result = correspondence_graph_.TryAddImage(
+        image_id, insertion.first->second.NumPoints2D());
+  } catch (...) {
+    images_.erase(insertion.first);
+    throw;
+  }
+  if (!result.IsSuccess()) {
+    images_.erase(insertion.first);
+  }
+  return result;
+}
+
+void DatabaseCache::SynchronizeImageStatistics(const image_t image_id) {
+  auto image_it = images_.find(image_id);
+  CHECK(image_it != images_.end());
+  CHECK(correspondence_graph_.ExistsImage(image_id));
+  image_it->second.SetNumObservations(
+      correspondence_graph_.NumObservationsForImage(image_id));
+  image_it->second.SetNumCorrespondences(
+      correspondence_graph_.NumCorrespondencesForImage(image_id));
+}
+
+void DatabaseCache::SynchronizeAllImageStatistics() {
+  for (const auto& image : images_) {
+    SynchronizeImageStatistics(image.first);
+  }
 }
 
 const class Image* DatabaseCache::FindImageWithName(

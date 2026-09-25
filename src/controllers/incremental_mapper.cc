@@ -856,7 +856,8 @@ void IncrementalMapperController::Reconstruct(
         break;
       }
 
-      if (!AdjustGlobalBundle(*options_, &mapper, 0)) {
+      if (options_->ba_global_enabled &&
+          !AdjustGlobalBundle(*options_, &mapper, 0)) {
         if (options_->init_image_id1 == -1 || options_->init_image_id2 == -1) {
           std::cout << "  => Initial pair BA failed; trying the next "
                        "geometrically valid pair."
@@ -991,14 +992,15 @@ void IncrementalMapperController::Reconstruct(
             mapper.EndReconstruction(false);
             return;
           }
-          if (reconstruction.NumRegImages() >=
+          if (options_->ba_global_enabled &&
+              (reconstruction.NumRegImages() >=
                   options_->ba_global_images_ratio * ba_prev_num_reg_images ||
               reconstruction.NumRegImages() >=
                   options_->ba_global_images_freq + ba_prev_num_reg_images ||
               reconstruction.NumPoints3D() >=
                   options_->ba_global_points_ratio * ba_prev_num_points ||
               reconstruction.NumPoints3D() >=
-                  options_->ba_global_points_freq + ba_prev_num_points) {
+                  options_->ba_global_points_freq + ba_prev_num_points)) {
             if (!IterativeGlobalRefinement(*options_, &mapper)) {
               ba_failed_.store(true);
               mapper.EndReconstruction(false);
@@ -1051,7 +1053,8 @@ void IncrementalMapperController::Reconstruct(
       // If no image could be registered, try a single final global iterative
       // bundle adjustment and try again to register one image. If this fails
       // once, then exit the incremental mapping.
-      if (!reg_next_success && prev_reg_next_success) {
+      if (options_->ba_global_enabled && !reg_next_success &&
+          prev_reg_next_success) {
         reg_next_success = true;
         prev_reg_next_success = false;
         if (!IterativeGlobalRefinement(*options_, &mapper)) {
@@ -1071,7 +1074,7 @@ void IncrementalMapperController::Reconstruct(
     }
 
     // Only run final global BA, if last incremental BA was not global.
-    if (reconstruction.NumRegImages() >= 2 &&
+    if (options_->ba_global_enabled && reconstruction.NumRegImages() >= 2 &&
         reconstruction.NumRegImages() != ba_prev_num_reg_images &&
         reconstruction.NumPoints3D() != ba_prev_num_points) {
       if (!IterativeGlobalRefinement(*options_, &mapper)) {

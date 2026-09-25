@@ -2603,6 +2603,8 @@ struct DeviceBaProblemStoreView {
 };
 
 constexpr uint32_t kDeviceBaProblemStoreAbiVersion = 1;
+static_assert(kDeviceBaProblemStoreAbiVersion == 1,
+              "device BA problem store ABI changed");
 
 struct DeviceBaProblemStoreAllocation {
   int device = -1;
@@ -10962,7 +10964,10 @@ bool SameNativeIdentity(const NativeHostSolveViewIdentity& lhs,
          lhs.config_generation == rhs.config_generation &&
          lhs.lidar_map_generation == rhs.lidar_map_generation &&
          lhs.lidar_match_config_generation ==
-             rhs.lidar_match_config_generation;
+             rhs.lidar_match_config_generation &&
+         lhs.visual_observation_scope == rhs.visual_observation_scope &&
+         SameNativeBaOnlineLidarIdentity(lhs.online_lidar_identity,
+                                         rhs.online_lidar_identity);
 }
 
 template <typename State>
@@ -11021,6 +11026,16 @@ const LidarConstraintRecord* NativeLidarConstraint(
   for (const LidarConstraintRecord& value : view.LidarConstraints())
     if (value.constraint_slot == slot) return &value;
   return nullptr;
+}
+
+bool NativeLidarOrdinalMatchesConstraint(
+    const ResidualOrdinal& ordinal,
+    const LidarConstraintRecord& constraint) noexcept {
+  return ordinal.source_slot == constraint.constraint_slot &&
+         ordinal.physical_identity == constraint.physical_identity &&
+         ordinal.association_id == constraint.association_id &&
+         ordinal.owner_image_id == constraint.owner_image_id &&
+         ordinal.owner_point2D_idx == constraint.owner_point2D_idx;
 }
 
 bool NativeBundleIdentityReady(const NativeHostSolveView& view,
@@ -11124,7 +11139,7 @@ bool BuildCudaLayerAInputs(const NativeHostSolveView& view,
       const LidarConstraintRecord* constraint =
           NativeLidarConstraint(view, ordinal.source_slot);
       if (constraint == nullptr ||
-          ordinal.physical_identity != constraint->physical_identity) {
+          !NativeLidarOrdinalMatchesConstraint(ordinal, *constraint)) {
         *error = "native LiDAR ordinal references a missing constraint";
         return false;
       }
@@ -11717,7 +11732,7 @@ bool BuildNativeIndexedKernelInput(const NativeHostSolveView& view,
     } else {
       const auto found = lidar_by_slot.find(ordinal.source_slot);
       if (found == lidar_by_slot.end() ||
-          ordinal.physical_identity != found->second->physical_identity ||
+          !NativeLidarOrdinalMatchesConstraint(ordinal, *found->second) ||
           scratch->point_entity.Get(found->second->point_slot) < 0) {
         *error = "native indexed LiDAR binding is incomplete";
         return false;
@@ -12259,6 +12274,8 @@ bool PrepareNativeIndexedKernelInput(
 }
 
 constexpr uint32_t kDevicePreparedSelectionAbiVersion = 1;
+static_assert(kDevicePreparedSelectionAbiVersion == 1,
+              "device prepared selection ABI changed");
 constexpr size_t kDevicePreparedSelectionMaxEntries = 4;
 constexpr uint64_t kDevicePreparedSelectionMaxBudget = 256ull << 20;
 

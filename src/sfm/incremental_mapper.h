@@ -32,6 +32,7 @@
 #ifndef COLMAP_SRC_SFM_INCREMENTAL_MAPPER_H_
 #define COLMAP_SRC_SFM_INCREMENTAL_MAPPER_H_
 
+#include <atomic>
 #include <cassert>
 #include <unordered_map>
 #include <vector>
@@ -185,6 +186,76 @@ class IncrementalMapper {
     size_t num_adjusted_observations = 0;
   };
 
+  enum class KnownPoseRegistrationStatus {
+    SUCCESS,
+    REJECTED,
+  };
+
+  enum class KnownPoseRegistrationReason {
+    NONE,
+    SESSION_NOT_ACTIVE,
+    WRONG_THREAD,
+    MAPPER_NOT_READY,
+    INVALID_IMAGE_ID,
+    IMAGE_NOT_FOUND,
+    CAMERA_NOT_FOUND,
+    INVALID_CAMERA,
+    CACHE_MISMATCH,
+    IMAGE_ALREADY_REGISTERED,
+    POSE_NOT_FINITE,
+    INVALID_QUATERNION,
+  };
+
+  struct KnownPoseRegistrationResult {
+    KnownPoseRegistrationStatus status =
+        KnownPoseRegistrationStatus::REJECTED;
+    KnownPoseRegistrationReason reason = KnownPoseRegistrationReason::NONE;
+
+    bool IsSuccess() const {
+      return status == KnownPoseRegistrationStatus::SUCCESS;
+    }
+  };
+
+  struct ImagePoseCorrespondence {
+    point2D_t point2D_idx = kInvalidPoint2DIdx;
+    point3D_t point3D_id = kInvalidPoint3DId;
+    image_t reference_image_id = kInvalidImageId;
+    point2D_t reference_point2D_idx = kInvalidPoint2DIdx;
+  };
+
+  struct ImagePoseEstimation {
+    EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+
+    uint64_t mapper_owner_id = 0;
+    uint64_t reconstruction_generation = 0;
+    const Reconstruction* reconstruction = nullptr;
+    image_t image_id = kInvalidImageId;
+    camera_t camera_id = kInvalidCameraId;
+    bool structure_journal_enabled = false;
+    uint64_t structure_owner_epoch = 0;
+    uint64_t structure_revision = 0;
+    size_t num_images = 0;
+    size_t num_reg_images = 0;
+    size_t num_points3D = 0;
+    Eigen::Vector4d input_qvec = Eigen::Vector4d::Zero();
+    Eigen::Vector3d input_tvec = Eigen::Vector3d::Zero();
+    Camera input_camera;
+    size_t target_camera_num_reg_images = 0;
+    size_t abs_pose_min_num_inliers = 0;
+    std::vector<Eigen::Vector2d> input_points2D;
+    std::vector<Eigen::Vector3d> input_points3D;
+    Camera camera;
+    Eigen::Vector4d qvec = Eigen::Vector4d::Zero();
+    Eigen::Vector3d tvec = Eigen::Vector3d::Zero();
+    std::vector<ImagePoseCorrespondence> correspondences;
+    std::vector<char> inlier_mask;
+    size_t num_inliers = 0;
+    double min_focal_length_ratio = -1.0;
+    double max_focal_length_ratio = -1.0;
+    double max_extra_param = -1.0;
+    bool is_valid = false;
+  };
+
   // Create incremental mapper. The database cache must live for the entire
   // life-time of the incremental mapper.
   explicit IncrementalMapper(const DatabaseCache* database_cache);
@@ -239,9 +310,27 @@ class IncrementalMapper {
                                              const image_t image_id1,
                                              const image_t image_id2);
 
+  // Register one image from an explicit world-to-camera pose without visual
+  // support. This must run on the thread that called BeginReconstruction for
+  // the active session. The translation is copied exactly. Any finite
+  // quaternion whose mathematical Euclidean norm is greater than machine
+  // epsilon is accepted and normalized using scale-first arithmetic.
+  KnownPoseRegistrationResult RegisterImageFromKnownPose(
+      const image_t image_id,
+      const Eigen::Vector4d& qvec,
+      const Eigen::Vector3d& tvec);
+
   // Attempt to register image to the existing model. This requires that
   // a previous call to `RegisterInitialImagePair` was successful.
   bool RegisterNextImage(const Options& options, const image_t image_id);
+
+  bool EstimateImagePoseWithReferences(
+      const Options& options,
+      const image_t image_id,
+      const std::vector<image_t>& reference_image_ids,
+      ImagePoseEstimation* result);
+
+  bool CommitImageRegistration(const ImagePoseEstimation& result);
 
   // Register an image directly from its imported pose without PnP.
   bool RegisterNextImageFromPosePrior(const Options& options,
@@ -387,6 +476,13 @@ class IncrementalMapper {
 
   // Class that is responsible for incremental triangulation.
   std::unique_ptr<IncrementalTriangulator> triangulator_;
+
+  // Identity and lifetime of the active BeginReconstruction session. These
+  // fields only govern the explicitly session-bound APIs above; they do not
+  // make the mapper's legacy APIs thread-safe.
+  const uint64_t mapper_owner_id_;
+  std::atomic<uint64_t> reconstruction_generation_{0};
+  std::atomic<uint64_t> reconstruction_owner_thread_token_{0};
 
   // Number of images that are registered in at least on reconstruction.
   size_t num_total_reg_images_;

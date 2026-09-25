@@ -1304,6 +1304,15 @@ int SiftGPU::IsFullSupported()
 	return GlobalUtil::_GoodOpenGL > 0 &&  GlobalUtil::_FullSupported;
 }
 
+int SiftGPU::UsesCudaBackend() const
+{
+#if defined(CUDA_SIFTGPU_ENABLED)
+	return _initialized && dynamic_cast<const PyramidCU*>(_pyramid) != NULL;
+#else
+	return 0;
+#endif
+}
+
 void SiftGPU::SaveSIFT(const char * szFileName)
 {
 	_pyramid->SaveSIFT(szFileName);
@@ -1434,4 +1443,3 @@ ComboSiftGPU* CreateComboSiftGPU()
 {
 	return new ComboSiftGPU();
 }
-

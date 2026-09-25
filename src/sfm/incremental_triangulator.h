@@ -157,8 +157,23 @@ class IncrementalTriangulator {
   };
 
  private:
-  // Clear cache of bogus camera parameters and merge trials.
+  struct NormalizedPointCache {
+    std::vector<Eigen::Vector2d> values;
+    std::vector<bool> valid;
+  };
+
+  struct ImageGeometry {
+    EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+    Eigen::Matrix3x4d projection_matrix;
+    Eigen::Vector3d projection_center;
+  };
+
+  // Clear per-operation caches.
   void ClearCaches();
+
+  const Eigen::Vector2d& CachedImageToWorld(const CorrData& corr_data);
+  const ImageGeometry& CachedImageGeometry(const image_t image_id,
+                                           const Image& image);
 
   // Find (transitive) correspondences to other images.
   size_t Find(const Options& options, const image_t image_id,
@@ -191,6 +206,11 @@ class IncrementalTriangulator {
 
   // Cache for cameras with bogus parameters.
   std::unordered_map<camera_t, bool> camera_has_bogus_params_;
+
+  std::unordered_map<image_t, NormalizedPointCache>
+      normalized_point_cache_;
+
+  EIGEN_STL_UMAP(image_t, ImageGeometry) image_geometry_cache_;
 
   // Cache for tried track merges to avoid duplicate merge trials.
   std::unordered_map<point3D_t, std::unordered_set<point3D_t>> merge_trials_;

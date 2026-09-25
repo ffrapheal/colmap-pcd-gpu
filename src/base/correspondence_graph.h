@@ -42,12 +42,15 @@ namespace colmap {
 
 // Scene graph represents the graph of image to image and feature to feature
 // correspondences of a dataset. It should be accessed from the DatabaseCache.
+// Access is not internally synchronized, and references returned by lookup
+// methods must not be retained across graph mutations.
 class CorrespondenceGraph {
  public:
   struct Correspondence {
-    Correspondence()
+    Correspondence() noexcept
         : image_id(kInvalidImageId), point2D_idx(kInvalidPoint2DIdx) {}
-    Correspondence(const image_t image_id, const point2D_t point2D_idx)
+    Correspondence(const image_t image_id,
+                   const point2D_t point2D_idx) noexcept
         : image_id(image_id), point2D_idx(point2D_idx) {}
 
     // The identifier of the corresponding image.
@@ -55,6 +58,40 @@ class CorrespondenceGraph {
 
     // The index of the corresponding point in the corresponding image.
     point2D_t point2D_idx;
+  };
+
+  enum class AddImageStatus {
+    SUCCESS,
+    DUPLICATE_IMAGE,
+    INVALID_IMAGE_ID,
+  };
+
+  struct AddImageResult {
+    AddImageStatus status = AddImageStatus::SUCCESS;
+
+    bool IsSuccess() const { return status == AddImageStatus::SUCCESS; }
+  };
+
+  enum class AddCorrespondencesStatus {
+    SUCCESS,
+    SELF_MATCH,
+    IMAGE_NOT_FOUND,
+    DUPLICATE_IMAGE_PAIR,
+    NO_VALID_CORRESPONDENCES,
+  };
+
+  struct AddCorrespondencesResult {
+    AddCorrespondencesStatus status = AddCorrespondencesStatus::SUCCESS;
+    size_t num_input_matches = 0;
+    size_t num_added_matches = 0;
+    size_t num_rejected_matches = 0;
+    size_t num_duplicate_matches = 0;
+    size_t num_invalid_matches = 0;
+    bool observation_counts_recomputed = false;
+
+    bool IsSuccess() const {
+      return status == AddCorrespondencesStatus::SUCCESS;
+    }
   };
 
   CorrespondenceGraph();
@@ -94,12 +131,23 @@ class CorrespondenceGraph {
   // Add new image to the correspondence graph.
   void AddImage(const image_t image_id, const size_t num_points2D);
 
+  // Add a new image without terminating on duplicate or invalid identifiers.
+  AddImageResult TryAddImage(const image_t image_id,
+                             const size_t num_points2D);
+
   // Add correspondences between images. This function ignores invalid
   // correspondences where the point indices are out of bounds or duplicate
   // correspondences between the same image points. Whenever either of the two
   // cases occur this function prints a warning to the standard output.
+  // Repeated calls for the same image pair append previously unseen matches.
   void AddCorrespondences(const image_t image_id1, const image_t image_id2,
                           const FeatureMatches& matches);
+
+  // Add one verified image pair and immediately maintain all graph statistics.
+  // Image pairs are one-shot: reinjecting a pair is rejected without mutation.
+  AddCorrespondencesResult TryAddCorrespondences(
+      const image_t image_id1, const image_t image_id2,
+      const FeatureMatches& matches);
 
   // Find the correspondence of an image observation to all other images.
   inline const std::vector<Correspondence>& FindCorrespondences(
@@ -150,8 +198,18 @@ class CorrespondenceGraph {
     point2D_t num_correspondences = 0;
   };
 
+  enum class ExistingPairMode { APPEND, REJECT };
+
+  AddCorrespondencesResult AddCorrespondencesImpl(
+      const image_t image_id1, const image_t image_id2,
+      const FeatureMatches& matches,
+      const ExistingPairMode existing_pair_mode,
+      const bool initialize_observation_counts);
+  void RecomputeNumObservations();
+
   EIGEN_STL_UMAP(image_t, Image) images_;
   std::unordered_map<image_pair_t, ImagePair> image_pairs_;
+  bool observation_counts_are_current_ = false;
 };
 
 ////////////////////////////////////////////////////////////////////////////////
